@@ -855,3 +855,72 @@ Expected Vite warnings about third-party `"use client"` directives and large chu
 3. Verify `p.tags @> ARRAY['recruiter']` works unchanged.
 4. Visually verify frontmatter email, phone, website, LinkedIn, and file-extension URLs are clickable and carry the expected MIME `type`.
 5. Continue replacing textual PostgreSQL lowering with AST-to-IR translation as additional `page.*` operations are introduced.
+
+Fundamental Requirements — Status vs Gaps
+
+
+
+## Requirement Status Primary Gaps
+
+1. Existing Obsidian vault compatibility (open as-is, no silent rewrite)StrongBlock-reference fidelity is “where practical”; some edge-case link/heading/alias resolution and hierarchical YAML write discipline still need hardening. The Git-diff acceptance test is the right bar and is largely held.
+2. Markdown is authoritative (disposable .nephrite/ index)DoneIndex rebuild on major version bump is implemented; residual risk is only in accidental non-minimal writes during property/task edits.
+3. Native vault metadata indexStrongRich schema already covers files, properties (hierarchical), headings, blocks, links, tags, tasks, aliases, attachments, canvas nodes/edges, kanban boards/columns/cards, inline fields, footnotes, and pages / backlinks views. Gap is mostly completeness of incremental reconcile under heavy concurrent external changes (Obsidian Sync / other editors).
+4. PostgreSQL SQL as the query languagePartial / core workinglibpg_query gate + read-only enforcement + page-type lowering + many PG functions exist. Main gap: still uses textual/regex lowering for p.properties['…'], tags @>, ANY, &&, etc. AGENTS.md explicitly calls for replacing this with proper AST → IR lowering. Limited operators, no full window functions / complex array/JSON path surface yet. Dataview DQL compatibility covers the common TABLE/LIST/FROM/WHERE/SORT/LIMIT path but is not exhaustive.
+5. Tasks as a core facilityUsable partialIndexing of status, due/scheduled/start/done/created, recurrence, priority, tags; surgical checkbox edits; task dashboard with scoping. Gaps: fuller interactive editing UX, complete Obsidian Tasks syntax variants, richer grouping/views (by project, recurrence series, etc.), and tighter source-location navigation.
+6. Native template & automation engineEarly / limitedDeclarative .nephrite/automations.json (create/append/prepend/move/apply-template/open + lifecycle hooks) + safe Templater subset (tp.file.*, dates, frontmatter, prompts, includes, cursor). Gaps: no sandboxed execution of <%* JavaScript %>  (preserved with warning); no full user-defined JS functions or rich runtime; QuickAdd-style capture is only partially covered by the declarative layer.
+7. Excalidraw integrationDoneUpstream engine, vault files, embeds, editing, autosave, fonts bundled. Minor fidelity gaps possible with exotic Obsidian Excalidraw plugin files.
+8. Plugin architectureEarly v1Sandboxed iframe plugins under .nephrite/plugins/, manifest + permissions, limited host API (vault r/w, index.query, editor, commands, views). Gaps: no ES modules / package deps, narrow API surface, no settings UI or events model yet, no long-term stability guarantees, no Obsidian plugin compatibility (correctly non-goal for now).
+9. Git-friendly by designStrongHistory, restore, conflicts (ours/theirs), staging, upstream status, branches, patches. One explicit gap noted in code: full-file merge UI is not implemented.
+10. Open-source licensingDecidedAGPL-3.0-only. Consistent with the decision record.
+
+## MVP Phases — Remaining Work
+
+ - Phase 1 (Safe Vault Reader) — Largely complete (open, parse, index, search, basic editor/viewer, watcher).
+ - Phase 2 (Vault Database) — Complete and quite rich (see schema.sql + docs/vault-schema.md).
+ - Phase 3 (SQL) — Core path works; the AST/IR lowering rewrite and broader expression surface are the clear next engineering focus.
+ - Phase 4 (Dataview Compatibility) — Partial. Common DQL works; DataviewJS has a usable but incomplete page/collection API. TASK/CALENDAR and deeper JS features remain.
+ - Phase 5 (Tasks) — Functional dashboard + surgical edits; advanced views, recurrence editing, and full syntax parity still needed.
+ - Phase 6 (Templates & Automation) — Declarative + limited Templater only. Full native automation runtime + sandboxed JS is the largest product gap relative to the original vision.
+ - Phase 7 (Excalidraw) — Done.
+ - Phase 8 (Plugin API) — Scaffold exists; needs maturation before it can be considered a stable long-tail surface.
+
+## Additional Product Gaps Visible in the Worktree
+
+ - Rendering & latency stability — Large set of recent patches (2026-08-11 and earlier) around query cancellation/rendering, surgical preview refresh, page state, sidebar/kanban, input latency, window height drift, title identity, etc. Indicates the preview/query path is still being hardened.
+ - Kanban — Present with hooks, resize, find, etc., but the patch volume suggests it is not yet rock-solid.
+ - Hierarchical YAML / properties — Indexing improved in 0.2; full query ergonomics and minimal write-back still have room.
+ - Block links, section embeds, rename/update of links — “Where practical” language in the docs; not yet at full Obsidian fidelity.
+ - DataviewJS / Templater JS — Intentionally limited for safety; the product vision wants sandboxed execution eventually.
+ - Mobile — Explicit non-goal for initial release (architecture kept abstract).
+ - Full Obsidian plugin API / Sync / proprietary formats — Correctly out of scope.
+
+## Definition of Success (from AGENTS.md)
+
+A user with a substantial existing vault can already:
+
+Point Nephrite at it
+
+Browse/edit without damage
+
+Use SQL, tasks dashboard, Excalidraw, Git history, graph, canvas, basic templates
+
+…and return to Obsidian cleanly.
+
+What still falls short for “mature local-first knowledge system” users:
+
+ - Heavy DataviewJS or complex Templater scripts
+ - Deep Tasks plugin workflows
+ - Custom long-tail plugins that need richer host APIs
+ - Very large vaults under continuous external mutation (reconcile robustness)
+ - Pixel-perfect / 100 % syntax fidelity on every Obsidian edge case
+  
+## Highest-Leverage Gaps to Close Next
+
+ - Replace textual translate_page_sql with proper AST → IR lowering (explicitly called out in the 2026-08-09 reload context). This unlocks the rest of the SQL surface cleanly.
+ - Deepen the automation/Templater runtime (sandboxed JS + richer declarative actions).
+ - Task views + full syntax fidelity.
+ - Dataview DQL/JS completeness for the common power-user patterns.
+ - Plugin API surface expansion once the core abstractions stop moving.
+ - Continued preview/query/kanban hardening (the recent patch stream).
+
+The architecture and safety model are already aligned with the philosophy (“Markdown is storage. Everything else is a disposable interpretation”). The remaining work is mostly turning the solid foundations of v0.2 into the deeper, more complete product surfaces described in the original goals.
