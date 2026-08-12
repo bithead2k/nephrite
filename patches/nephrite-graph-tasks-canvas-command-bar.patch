@@ -1,0 +1,1721 @@
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 37c3d9b..2b50be5 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -729,12 +729,19 @@ fn graph_data(state: State<'_, AppState>) -> Result<GraphData, String> {
+     let connection = index.connection();
+     let mut node_statement = connection
+         .prepare(
+-            "SELECT path, COALESCE(NULLIF(title, ''), name, path)
++            "SELECT path, COALESCE(NULLIF(title, ''), name, path), tags
+              FROM pages ORDER BY path COLLATE NOCASE",
+         )
+         .map_err(|error| error.to_string())?;
+     let nodes = node_statement
+-        .query_map([], |row| Ok(GraphNode { path: row.get(0)?, title: row.get(1)? }))
++        .query_map([], |row| {
++            let tags_json: String = row.get(2)?;
++            Ok(GraphNode {
++                path: row.get(0)?,
++                title: row.get(1)?,
++                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
++            })
++        })
+         .map_err(|error| error.to_string())?
+         .collect::<std::result::Result<Vec<_>, _>>()
+         .map_err(|error| error.to_string())?;
+@@ -872,20 +879,22 @@ pub struct TaskRow {
+     pub status: String,
+     pub status_char: String,
+     pub text: String,
++    pub raw_line: String,
+     pub line: i64,
+     pub completed: bool,
+     pub due: Option<String>,
+     pub scheduled: Option<String>,
+     pub priority: Option<String>,
+     pub recurrence: Option<String>,
++    pub tags: Vec<String>,
+ }
+ 
+ #[tauri::command]
+ fn list_tasks(completed: Option<bool>, state: State<'_, AppState>) -> Result<Vec<TaskRow>, String> {
+     let guard = state.index.lock();
+     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+-    let sql = "SELECT path, task_id, status, status_char, text, line, completed,
+-                      due, scheduled, priority, recurrence
++    let sql = "SELECT path, task_id, status, status_char, text, raw_line, line, completed,
++                      due, scheduled, priority, recurrence, COALESCE(tags_json, '[]')
+                FROM tasks
+                WHERE (?1 IS NULL OR completed = ?1)
+                ORDER BY completed, COALESCE(due, '9999-12-31'), path COLLATE NOCASE, line";
+@@ -899,12 +908,14 @@ fn list_tasks(completed: Option<bool>, state: State<'_, AppState>) -> Result<Vec
+                 status: row.get(2)?,
+                 status_char: row.get(3)?,
+                 text: row.get(4)?,
+-                line: row.get(5)?,
+-                completed: row.get::<_, i64>(6)? != 0,
+-                due: row.get(7)?,
+-                scheduled: row.get(8)?,
+-                priority: row.get(9)?,
+-                recurrence: row.get(10)?,
++                raw_line: row.get(5)?,
++                line: row.get(6)?,
++                completed: row.get::<_, i64>(7)? != 0,
++                due: row.get(8)?,
++                scheduled: row.get(9)?,
++                priority: row.get(10)?,
++                recurrence: row.get(11)?,
++                tags: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+             })
+         })
+         .map_err(|e| e.to_string())?;
+@@ -951,6 +962,48 @@ fn set_task_completed(
+     index.index_path(&path).map_err(|e| e.to_string())
+ }
+ 
++/// Replace one indexed task line after checking that its source offsets and
++/// checkbox still identify the same task. The frontend uses this for due,
++/// scheduled, and priority edits while Markdown remains authoritative.
++#[tauri::command]
++fn replace_task_line(
++    path: String,
++    task_id: i64,
++    replacement: String,
++    state: State<'_, AppState>,
++) -> Result<(), String> {
++    if replacement.contains(['\r', '\n']) || replacement.len() > 16_384 {
++        return Err("A task replacement must be one reasonably sized line".into());
++    }
++    if !replacement.contains("[") || !replacement.contains("]") {
++        return Err("The replacement is no longer a Markdown task".into());
++    }
++    let mut guard = state.index.lock();
++    let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
++    let (start, end, indexed_line): (i64, i64, String) = index
++        .connection()
++        .query_row(
++            "SELECT start_offset, end_offset, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
++            rusqlite::params![path, task_id],
++            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
++        )
++        .map_err(|error| format!("Task is stale or missing: {error}"))?;
++    let absolute = vault_abs(index, &path)?;
++    let mut content = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
++    let from = usize::try_from(start).map_err(|_| "Invalid task offset".to_string())?;
++    let to = usize::try_from(end).map_err(|_| "Invalid task offset".to_string())?;
++    let current = content
++        .get(from..to)
++        .ok_or_else(|| "Task offsets are stale".to_string())?;
++    let eol = if current.ends_with("\r\n") { "\r\n" } else if current.ends_with('\n') { "\n" } else { "" };
++    if current.trim_end_matches(['\r', '\n']) != indexed_line {
++        return Err("Task changed on disk; refresh before editing its metadata".into());
++    }
++    content.replace_range(from..to, &format!("{replacement}{eol}"));
++    std::fs::write(&absolute, content.as_bytes()).map_err(|error| error.to_string())?;
++    index.index_path(&path).map_err(|error| error.to_string())
++}
++
+ /// Pages for Dataview-style queries. `source` examples: `"people"`, `"folder/sub"`, empty = all markdown.
+ #[tauri::command]
+ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<PageRow>, String> {
+@@ -2003,6 +2056,7 @@ pub struct SearchResult {
+ pub struct GraphNode {
+     pub path: String,
+     pub title: String,
++    pub tags: Vec<String>,
+ }
+ 
+ #[derive(Debug, Serialize)]
+@@ -2782,6 +2836,7 @@ pub fn run() {
+             query_vault_sql,
+             list_tasks,
+             set_task_completed,
++            replace_task_line,
+             create_folder,
+             create_file,
+             rename_path,
+diff --git a/tests/editor-performance.test.ts b/tests/editor-performance.test.ts
+index d48c323..607b1ce 100644
+--- a/tests/editor-performance.test.ts
++++ b/tests/editor-performance.test.ts
+@@ -24,10 +24,17 @@ import { canPersistSession } from "../ui/src/session-guard";
+ import { vaultChangeTouchesFileTree } from "../ui/src/vault-change";
+ import { previewPatchWindow } from "../ui/src/preview-patch";
+ import { parseVimrc } from "../ui/src/vimrc";
+-import { layoutGraph } from "../ui/src/graph-view";
+-import { parseCanvas, serializeCanvas } from "../ui/src/canvas-view";
++import { graphRelationships, layoutGraph, selectGraphData } from "../ui/src/graph-view";
++import { parseCanvas, resizedCanvasNodeSize, serializeCanvas } from "../ui/src/canvas-view";
+ import { resizedKanbanLaneWidth } from "../ui/src/kanban-resize";
+ import { captureLogicalWindowGeometry } from "../ui/src/window-state";
++import {
++  DEFAULT_TASK_VIEW,
++  groupTasks,
++  selectTasks,
++  updateTaskMetadataLine,
++} from "../ui/src/task-dashboard";
++import { filterCommands } from "../ui/src/command-bar";
+ import { findInKanbanLane, kanbanCardSearchText } from "../ui/src/kanban-find";
+ import {
+   bindScrollSync,
+@@ -87,7 +94,10 @@ test("vimrc compatibility evaluates conditionals, variables, execute, and comman
+ 
+ test("graph layout is deterministic and bounded", () => {
+   const graph = {
+-    nodes: [{ path: "A.md", title: "A" }, { path: "B.md", title: "B" }],
++    nodes: [
++      { path: "A.md", title: "A", tags: [] },
++      { path: "B.md", title: "B", tags: [] },
++    ],
+     edges: [{ source: "A.md", target: "B.md", embeds: false }],
+   };
+   const first = layoutGraph(graph, 500, 300);
+@@ -99,6 +109,49 @@ test("graph layout is deterministic and bounded", () => {
+   }
+ });
+ 
++test("local graph honors depth, direction, folders, tags, and explicit expansion", () => {
++  const graph = {
++    nodes: [
++      { path: "Projects/A.md", title: "A", tags: ["work"] },
++      { path: "Projects/B.md", title: "B", tags: ["work", "active"] },
++      { path: "Projects/C.md", title: "C", tags: ["work"] },
++      { path: "People/D.md", title: "D", tags: ["person"] },
++    ],
++    edges: [
++      { source: "Projects/A.md", target: "Projects/B.md", embeds: false },
++      { source: "Projects/B.md", target: "Projects/C.md", embeds: false },
++      { source: "People/D.md", target: "Projects/A.md", embeds: false },
++    ],
++  };
++  const outgoing = selectGraphData(graph, {
++    scope: "local", focus: "Projects/A.md", depth: 2, direction: "outgoing",
++  });
++  assert.deepEqual(new Set(outgoing.nodes.map((node) => node.path)), new Set([
++    "Projects/A.md", "Projects/B.md", "Projects/C.md",
++  ]));
++  const incoming = selectGraphData(graph, {
++    scope: "local", focus: "Projects/A.md", depth: 1, direction: "incoming",
++  });
++  assert.deepEqual(new Set(incoming.nodes.map((node) => node.path)), new Set([
++    "Projects/A.md", "People/D.md",
++  ]));
++  const filtered = selectGraphData(graph, {
++    scope: "global", depth: 1, direction: "both", folder: "Projects", tag: "active",
++  });
++  assert.deepEqual(filtered.nodes.map((node) => node.path), ["Projects/B.md"]);
++  const expanded = selectGraphData(graph, {
++    scope: "local", focus: "Projects/A.md", depth: 0, direction: "both",
++    expanded: new Set(["Projects/B.md"]),
++  });
++  assert.deepEqual(new Set(expanded.nodes.map((node) => node.path)), new Set([
++    "Projects/A.md", "Projects/B.md", "Projects/C.md",
++  ]));
++  assert.deepEqual(graphRelationships(graph, "Projects/A.md"), {
++    incoming: [{ source: "People/D.md", target: "Projects/A.md", embeds: false }],
++    outgoing: [{ source: "Projects/A.md", target: "Projects/B.md", embeds: false }],
++  });
++});
++
+ test("canvas parsing preserves Obsidian fields while serializing edits", () => {
+   const source = JSON.stringify({
+     nodes: [{ id: "n", type: "file", file: "A.md", x: 1, y: 2, width: 3, height: 4, subpath: "#Heading" }],
+@@ -113,6 +166,11 @@ test("canvas parsing preserves Obsidian fields while serializing edits", () => {
+   assert.equal(roundTrip.metadata.preserved, true);
+ });
+ 
++test("canvas card resizing respects zoom and minimum dimensions", () => {
++  assert.deepEqual(resizedCanvasNodeSize(300, 180, 100, 40, 2), { width: 350, height: 200 });
++  assert.deepEqual(resizedCanvasNodeSize(100, 60, -200, -100, 1), { width: 80, height: 48 });
++});
++
+ test("date and time shortcuts insert distinct local ISO components", () => {
+   const local = new Date(2026, 7, 11, 4, 5, 6);
+   assert.equal(formatTimestampPart("date", local), "2026-08-11");
+@@ -695,6 +753,42 @@ test("window persistence restores the same inner height without frame drift", as
+   assert.deepEqual(geometry, { x: 100, y: 50, width: 1200, height: 750 });
+ });
+ 
++test("task views filter, sort, group, and edit metadata without rewriting task text", () => {
++  const base = {
++    task_id: 1, status: "todo", status_char: " ", line: 1, completed: false,
++    scheduled: null, recurrence: null, tags: ["work"], priority: null,
++  };
++  const tasks = [
++    { ...base, path: "Work/A.md", text: "Later", raw_line: "- [ ] Later #work", due: "2026-08-20" },
++    { ...base, task_id: 2, path: "Work/B.md", text: "Today", raw_line: "- [ ] Today #work", due: "2026-08-12", priority: "high" },
++    { ...base, task_id: 3, path: "Home/C.md", text: "Done", raw_line: "- [x] Done", due: null, completed: true, tags: [] },
++  ];
++  const selected = selectTasks(tasks, {
++    ...DEFAULT_TASK_VIEW,
++    due: "today",
++    priority: "high",
++  }, new Date(2026, 7, 12, 12));
++  assert.deepEqual(selected.map((task) => task.text), ["Today"]);
++  assert.deepEqual([...groupTasks(tasks, "path").keys()], ["Work", "Home"]);
++  assert.equal(
++    updateTaskMetadataLine("- [ ] Today #work 🔁 every week 📅 2026-08-12 ^keep", {
++      due: "2026-08-15", scheduled: "2026-08-14", priority: "highest",
++    }),
++    "- [ ] Today #work 🔁 every week 🔺 ⏳ 2026-08-14 📅 2026-08-15 ^keep",
++  );
++});
++
++test("command bar ranks direct and fuzzy matches while preserving command order", () => {
++  const commands = [
++    { id: "tasks", title: "Open tasks", keywords: "todo agenda", run: () => {} },
++    { id: "graph", title: "Open graph", keywords: "links backlinks", run: () => {} },
++    { id: "note", title: "Open: People/Kirk.md", keywords: "note file", run: () => {} },
++  ];
++  assert.equal(filterCommands(commands, "graph")[0].id, "graph");
++  assert.equal(filterCommands(commands, "optsk")[0].id, "tasks");
++  assert.deepEqual(filterCommands(commands, "").map((command) => command.id), ["tasks", "graph", "note"]);
++});
++
+ test("YAML and query results share field-aware URI and MIME detection", () => {
+   assert.match(
+     formatQueryUri("person@internal", "work_email") || "",
+diff --git a/ui/src/canvas-view.ts b/ui/src/canvas-view.ts
+index 74f8dda..aa685d6 100644
+--- a/ui/src/canvas-view.ts
++++ b/ui/src/canvas-view.ts
+@@ -46,10 +46,24 @@ function id(prefix: string): string {
+   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+ }
+ 
++export function resizedCanvasNodeSize(
++  width: number,
++  height: number,
++  deltaX: number,
++  deltaY: number,
++  zoom = 1,
++) {
++  return {
++    width: Math.max(80, Math.round(width + deltaX / zoom)),
++    height: Math.max(48, Math.round(height + deltaY / zoom)),
++  };
++}
++
+ export class CanvasView {
+   private document: CanvasDocument | null = null;
+   private selected: string | null = null;
+   private connectingFrom: string | null = null;
++  private zoom = 1;
+   private readonly stage = document.createElement("div");
+   private readonly edges = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+ 
+@@ -67,7 +81,7 @@ export class CanvasView {
+     host.addEventListener("dblclick", (event) => {
+       if (event.target !== host && event.target !== this.stage) return;
+       const rect = this.stage.getBoundingClientRect();
+-      this.addText(event.clientX - rect.left, event.clientY - rect.top);
++      this.addText((event.clientX - rect.left) / this.zoom, (event.clientY - rect.top) / this.zoom);
+     });
+     host.addEventListener("keydown", (event) => {
+       if (event.key === "Escape" && this.connectingFrom) {
+@@ -79,7 +93,23 @@ export class CanvasView {
+         event.preventDefault();
+         this.deleteSelected();
+       }
++      if (this.selected && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
++        event.preventDefault();
++        const node = this.document?.nodes.find((candidate) => candidate.id === this.selected);
++        if (!node) return;
++        const step = event.shiftKey ? 20 : 2;
++        if (event.key === "ArrowLeft") node.x -= step;
++        if (event.key === "ArrowRight") node.x += step;
++        if (event.key === "ArrowUp") node.y -= step;
++        if (event.key === "ArrowDown") node.y += step;
++        this.changed();
++      }
+     });
++    host.addEventListener("wheel", (event) => {
++      if (!event.ctrlKey) return;
++      event.preventDefault();
++      this.changeZoom(event.deltaY < 0 ? 0.1 : -0.1);
++    }, { passive: false });
+   }
+ 
+   open(source: string) {
+@@ -108,10 +138,45 @@ export class CanvasView {
+ 
+   addFile(path: string, x = 100, y = 100) {
+     if (!this.document) return;
+-    this.document.nodes.push({ id: id("node"), type: "file", file: path, x, y, width: 280, height: 80 });
++    const node: CanvasNode = { id: id("node"), type: "file", file: path, x, y, width: 280, height: 80 };
++    this.document.nodes.push(node);
++    this.selected = node.id;
++    this.changed();
++  }
++
++  addLink(url: string, label = url, x = 120, y = 120) {
++    if (!this.document) return;
++    const node: CanvasNode = { id: id("node"), type: "link", url, label, x, y, width: 300, height: 90 };
++    this.document.nodes.push(node);
++    this.selected = node.id;
++    this.changed();
++  }
++
++  addGroup(label: string, x = 60, y = 60) {
++    if (!this.document) return;
++    const node: CanvasNode = { id: id("node"), type: "group", label, x, y, width: 520, height: 320 };
++    this.document.nodes.unshift(node);
++    this.selected = node.id;
+     this.changed();
+   }
+ 
++  setSelectedColor(color: string) {
++    const node = this.document?.nodes.find((candidate) => candidate.id === this.selected);
++    if (!node || !/^#[0-9a-f]{6}$/i.test(color)) return;
++    node.color = color;
++    this.changed();
++  }
++
++  changeZoom(delta: number) {
++    this.zoom = Math.max(0.4, Math.min(2.5, Math.round((this.zoom + delta) * 10) / 10));
++    this.stage.style.zoom = String(this.zoom);
++  }
++
++  resetZoom() {
++    this.zoom = 1;
++    this.stage.style.zoom = "1";
++  }
++
+   deleteSelected() {
+     if (!this.document || !this.selected) return;
+     const selected = this.selected;
+@@ -204,12 +269,13 @@ export class CanvasView {
+     element.style.width = `${Math.max(80, node.width)}px`;
+     element.style.height = `${Math.max(48, node.height)}px`;
+     if (node.color) element.dataset.color = node.color;
++    if (node.color?.startsWith("#")) element.style.borderColor = node.color;
+     const header = document.createElement("header");
+     header.textContent = node.type === "group" ? node.label || "Group" : node.type;
+     const content = document.createElement("div");
+     content.className = "canvas-node-content";
+     content.textContent = node.type === "file" ? node.file || "Missing file" :
+-      node.type === "link" ? node.url || "Missing URL" : node.text || "";
++      node.type === "link" ? node.label || node.url || "Missing URL" : node.text || "";
+     if (node.type === "text") {
+       content.addEventListener("dblclick", (event) => {
+         event.stopPropagation();
+@@ -230,7 +296,13 @@ export class CanvasView {
+       content.classList.add("canvas-node-link");
+       content.addEventListener("dblclick", () => this.onOpenUrl(node.url!));
+     }
+-    element.append(header, content);
++    const resize = document.createElement("button");
++    resize.type = "button";
++    resize.className = "canvas-node-resize";
++    resize.title = "Resize card";
++    resize.setAttribute("aria-label", "Resize card");
++    resize.addEventListener("pointerdown", (event) => this.startResize(event, node, element));
++    element.append(header, content, resize);
+     element.addEventListener("pointerdown", (event) => this.startDrag(event, node, element));
+     element.addEventListener("click", () => {
+       if (this.document && this.connectingFrom && this.connectingFrom !== node.id) {
+@@ -253,15 +325,15 @@ export class CanvasView {
+   }
+ 
+   private startDrag(event: PointerEvent, node: CanvasNode, element: HTMLElement) {
+-    if ((event.target as HTMLElement).isContentEditable) return;
++    if ((event.target as HTMLElement).isContentEditable || (event.target as HTMLElement).closest(".canvas-node-resize")) return;
+     const startX = event.clientX;
+     const startY = event.clientY;
+     const x = node.x;
+     const y = node.y;
+     element.setPointerCapture(event.pointerId);
+     const move = (next: PointerEvent) => {
+-      node.x = Math.round(x + next.clientX - startX);
+-      node.y = Math.round(y + next.clientY - startY);
++      node.x = Math.round(x + (next.clientX - startX) / this.zoom);
++      node.y = Math.round(y + (next.clientY - startY) / this.zoom);
+       element.style.left = `${node.x}px`;
+       element.style.top = `${node.y}px`;
+       if (this.document) this.renderEdges(new Map(this.document.nodes.map((item) => [item.id, item])), this.stage.clientWidth, this.stage.clientHeight);
+@@ -274,4 +346,36 @@ export class CanvasView {
+     element.addEventListener("pointermove", move);
+     element.addEventListener("pointerup", end);
+   }
++
++  private startResize(event: PointerEvent, node: CanvasNode, element: HTMLElement) {
++    event.preventDefault();
++    event.stopPropagation();
++    const startX = event.clientX;
++    const startY = event.clientY;
++    const width = node.width;
++    const height = node.height;
++    const handle = event.currentTarget as HTMLElement;
++    handle.setPointerCapture(event.pointerId);
++    const move = (next: PointerEvent) => {
++      const size = resizedCanvasNodeSize(
++        width,
++        height,
++        next.clientX - startX,
++        next.clientY - startY,
++        this.zoom,
++      );
++      node.width = size.width;
++      node.height = size.height;
++      element.style.width = `${node.width}px`;
++      element.style.height = `${node.height}px`;
++      if (this.document) this.renderEdges(new Map(this.document.nodes.map((item) => [item.id, item])), this.stage.clientWidth, this.stage.clientHeight);
++    };
++    const end = () => {
++      handle.removeEventListener("pointermove", move);
++      handle.removeEventListener("pointerup", end);
++      if (this.document) this.onChange(serializeCanvas(this.document));
++    };
++    handle.addEventListener("pointermove", move);
++    handle.addEventListener("pointerup", end);
++  }
+ }
+diff --git a/ui/src/command-bar.ts b/ui/src/command-bar.ts
+new file mode 100644
+index 0000000..adb5e58
+--- /dev/null
++++ b/ui/src/command-bar.ts
+@@ -0,0 +1,98 @@
++export type AppCommand = {
++  id: string;
++  title: string;
++  keywords?: string;
++  shortcut?: string;
++  run: () => void | Promise<void>;
++};
++
++function commandScore(command: AppCommand, query: string): number {
++  if (!query) return 1;
++  const haystack = `${command.title} ${command.keywords || ""}`.toLowerCase();
++  if (haystack.startsWith(query)) return 1000 - haystack.length;
++  const direct = haystack.indexOf(query);
++  if (direct >= 0) return 700 - direct;
++  let cursor = 0;
++  let gaps = 0;
++  for (const character of query) {
++    const found = haystack.indexOf(character, cursor);
++    if (found < 0) return -1;
++    gaps += found - cursor;
++    cursor = found + 1;
++  }
++  return 400 - gaps;
++}
++
++export function filterCommands(commands: AppCommand[], rawQuery: string): AppCommand[] {
++  const query = rawQuery.trim().toLowerCase();
++  return commands
++    .map((command, index) => ({ command, index, score: commandScore(command, query) }))
++    .filter((candidate) => candidate.score >= 0)
++    .sort((left, right) => right.score - left.score || left.index - right.index)
++    .map((candidate) => candidate.command);
++}
++
++export function renderCommandBar(
++  host: HTMLElement,
++  commands: AppCommand[],
++  close: () => void,
++) {
++  host.replaceChildren();
++  host.classList.add("command-bar");
++  const input = document.createElement("input");
++  input.type = "search";
++  input.className = "command-bar-input";
++  input.placeholder = "Type a command or note name…";
++  input.autocomplete = "off";
++  const list = document.createElement("div");
++  list.className = "command-bar-results";
++  host.append(input, list);
++  let matches = commands;
++  let active = 0;
++
++  const run = (command: AppCommand) => {
++    close();
++    void Promise.resolve(command.run()).catch((error) => window.alert(String(error)));
++  };
++  const draw = () => {
++    matches = filterCommands(commands, input.value).slice(0, 80);
++    active = Math.max(0, Math.min(active, matches.length - 1));
++    list.replaceChildren();
++    for (const [index, command] of matches.entries()) {
++      const button = document.createElement("button");
++      button.type = "button";
++      button.className = `command-bar-result${index === active ? " active" : ""}`;
++      button.dataset.index = String(index);
++      const title = document.createElement("span");
++      title.textContent = command.title;
++      const shortcut = document.createElement("kbd");
++      shortcut.textContent = command.shortcut || "";
++      button.append(title, shortcut);
++      button.addEventListener("mousemove", () => {
++        active = index;
++        list.querySelector(".active")?.classList.remove("active");
++        button.classList.add("active");
++      });
++      button.addEventListener("click", () => run(command));
++      list.appendChild(button);
++    }
++    if (!matches.length) list.innerHTML = '<div class="feature-empty">No matching command.</div>';
++  };
++  input.addEventListener("input", () => { active = 0; draw(); });
++  input.addEventListener("keydown", (event) => {
++    if (event.key === "Escape") {
++      event.preventDefault();
++      close();
++    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
++      event.preventDefault();
++      if (matches.length) active = (active + (event.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length;
++      draw();
++      list.querySelector(`[data-index="${active}"]`)?.scrollIntoView({ block: "nearest" });
++    } else if (event.key === "Enter" && matches[active]) {
++      event.preventDefault();
++      run(matches[active]);
++    }
++  });
++  draw();
++  requestAnimationFrame(() => input.focus());
++}
+diff --git a/ui/src/graph-view.ts b/ui/src/graph-view.ts
+index 56de182..5cc2c2d 100644
+--- a/ui/src/graph-view.ts
++++ b/ui/src/graph-view.ts
+@@ -2,6 +2,102 @@ import type { GraphData, GraphNode } from "./types";
+ 
+ type Point = { x: number; y: number; vx: number; vy: number };
+ 
++export type GraphDirection = "both" | "incoming" | "outgoing";
++
++export type GraphFilterOptions = {
++  scope: "global" | "local";
++  focus?: string | null;
++  depth: number;
++  direction: GraphDirection;
++  query?: string;
++  folder?: string;
++  tag?: string;
++  expanded?: ReadonlySet<string>;
++  nodeLimit?: number;
++  edgeLimit?: number;
++};
++
++export function graphRelationships(data: GraphData, path: string) {
++  return {
++    incoming: data.edges.filter((edge) => edge.target === path),
++    outgoing: data.edges.filter((edge) => edge.source === path),
++  };
++}
++
++function neighboringPaths(
++  data: GraphData,
++  path: string,
++  direction: GraphDirection,
++): string[] {
++  const neighbors: string[] = [];
++  for (const edge of data.edges) {
++    if (direction !== "incoming" && edge.source === path) neighbors.push(edge.target);
++    if (direction !== "outgoing" && edge.target === path) neighbors.push(edge.source);
++  }
++  return neighbors;
++}
++
++export function selectGraphData(data: GraphData, options: GraphFilterOptions): GraphData {
++  const nodeByPath = new Map(data.nodes.map((node) => [node.path, node]));
++  const query = options.query?.trim().toLowerCase() ?? "";
++  const folder = options.folder?.replace(/\/$/, "") ?? "";
++  const tag = options.tag?.trim().toLowerCase() ?? "";
++  const matchesFilters = (path: string) => {
++    const node = nodeByPath.get(path);
++    if (!node) return false;
++    if (query && !`${node.title} ${node.path} ${node.tags.join(" ")}`.toLowerCase().includes(query)) {
++      return false;
++    }
++    if (folder && path !== folder && !path.startsWith(`${folder}/`)) return false;
++    if (tag && !node.tags.some((candidate) => candidate.toLowerCase() === tag)) return false;
++    return true;
++  };
++
++  const included = new Set<string>();
++  if (options.scope === "local" && options.focus && nodeByPath.has(options.focus)) {
++    included.add(options.focus);
++    let frontier = new Set([options.focus]);
++    for (let level = 0; level < Math.max(0, options.depth); level++) {
++      const next = new Set<string>();
++      for (const path of frontier) {
++        for (const neighbor of neighboringPaths(data, path, options.direction)) {
++          if (!included.has(neighbor) && matchesFilters(neighbor)) next.add(neighbor);
++        }
++      }
++      for (const path of next) included.add(path);
++      frontier = next;
++    }
++  } else {
++    for (const node of data.nodes) if (matchesFilters(node.path)) included.add(node.path);
++  }
++
++  for (const path of options.expanded ?? []) {
++    if (!nodeByPath.has(path)) continue;
++    included.add(path);
++    for (const neighbor of neighboringPaths(data, path, "both")) {
++      if (matchesFilters(neighbor)) included.add(neighbor);
++    }
++  }
++
++  const degree = new Map<string, number>();
++  for (const edge of data.edges) {
++    degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
++    degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
++  }
++  const nodes = data.nodes
++    .filter((node) => included.has(node.path))
++    .sort((left, right) =>
++      Number(right.path === options.focus) - Number(left.path === options.focus)
++      || (degree.get(right.path) ?? 0) - (degree.get(left.path) ?? 0)
++      || left.path.localeCompare(right.path))
++    .slice(0, options.nodeLimit ?? 350);
++  const paths = new Set(nodes.map((node) => node.path));
++  const edges = data.edges
++    .filter((edge) => paths.has(edge.source) && paths.has(edge.target))
++    .slice(0, options.edgeLimit ?? 1000);
++  return { nodes, edges };
++}
++
+ function seededPosition(key: string, width: number, height: number): Point {
+   let hash = 2166136261;
+   for (const character of key) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+@@ -81,45 +177,123 @@ export function renderGraph(
+   controls.className = "graph-controls";
+   const search = document.createElement("input");
+   search.type = "search";
+-  search.placeholder = "Filter graph nodes…";
++  search.placeholder = "Filter titles, paths, or tags…";
+   search.autocomplete = "off";
++  const scope = graphSelect(["global", "local"], initialFocus ? "local" : "global", "Graph scope");
++  const depth = graphSelect(["1", "2", "3"], "1", "Local graph depth");
++  const direction = graphSelect(["both", "incoming", "outgoing"], "both", "Link direction");
++  const folders = [...new Set(data.nodes.map((node) => node.path.split("/").slice(0, -1).join("/")))]
++    .filter(Boolean).sort((left, right) => left.localeCompare(right));
++  const folder = graphSelect(["", ...folders], "", "Folder filter", "All folders");
++  const tags = [...new Set(data.nodes.flatMap((node) => node.tags))]
++    .sort((left, right) => left.localeCompare(right));
++  const tag = graphSelect(["", ...tags], "", "Tag filter", "All tags");
++  const fit = document.createElement("button");
++  fit.type = "button";
++  fit.textContent = "Fit";
++  fit.title = "Reset graph pan and zoom";
+   const summary = document.createElement("span");
+-  controls.append(search, summary);
++  controls.append(scope, depth, direction, folder, tag, search, fit, summary);
++  const content = document.createElement("div");
++  content.className = "graph-content";
+   const viewport = document.createElement("div");
+   viewport.className = "graph-viewport";
+   const svg = svgElement("svg");
+   svg.setAttribute("viewBox", "0 0 1100 680");
+   svg.classList.add("graph-svg");
+   viewport.appendChild(svg);
+-  host.append(controls, viewport);
++  const inspector = document.createElement("aside");
++  inspector.className = "graph-inspector";
++  content.append(viewport, inspector);
++  host.append(controls, content);
+ 
+-  const draw = () => {
+-    const query = search.value.trim().toLowerCase();
+-    const matching = query
+-      ? new Set(data.nodes.filter((node) => `${node.title} ${node.path}`.toLowerCase().includes(query)).map((node) => node.path))
+-      : null;
+-    const included = matching
+-      ? new Set(data.edges.flatMap((edge) => matching.has(edge.source) || matching.has(edge.target) ? [edge.source, edge.target] : []))
+-      : new Set(data.nodes.map((node) => node.path));
+-    for (const path of matching ?? []) included.add(path);
+-    const degree = new Map<string, number>();
+-    for (const edge of data.edges) {
+-      degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
+-      degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
++  let focusPath = initialFocus ?? null;
++  let selectedPath = initialFocus ?? null;
++  const expanded = new Set<string>();
++  let panX = 0;
++  let panY = 0;
++  let zoom = 1;
++  let scene: SVGGElement | null = null;
++
++  const applyTransform = () => {
++    scene?.setAttribute("transform", `translate(${panX} ${panY}) scale(${zoom})`);
++  };
++
++  const drawInspector = () => {
++    inspector.replaceChildren();
++    if (!selectedPath) {
++      inspector.innerHTML = '<p class="feature-help">Select a note to inspect its links.</p>';
++      return;
++    }
++    const node = data.nodes.find((candidate) => candidate.path === selectedPath);
++    if (!node) return;
++    const heading = document.createElement("h3");
++    heading.textContent = graphTitle(node);
++    const path = document.createElement("code");
++    path.textContent = node.path;
++    const tagList = document.createElement("div");
++    tagList.className = "graph-inspector-tags";
++    for (const value of node.tags) {
++      const button = document.createElement("button");
++      button.type = "button";
++      button.textContent = `#${value}`;
++      button.addEventListener("click", () => {
++        tag.value = value;
++        draw();
++      });
++      tagList.appendChild(button);
+     }
+-    const nodes = data.nodes
+-      .filter((node) => included.has(node.path))
+-      .sort((left, right) =>
+-        Number(right.path === initialFocus) - Number(left.path === initialFocus) ||
+-        (degree.get(right.path) ?? 0) - (degree.get(left.path) ?? 0) ||
+-        left.path.localeCompare(right.path)
+-      )
+-      .slice(0, 350);
+-    const paths = new Set(nodes.map((node) => node.path));
+-    const edges = data.edges.filter((edge) => paths.has(edge.source) && paths.has(edge.target)).slice(0, 1000);
+-    const visible: GraphData = { nodes, edges };
++    const actions = document.createElement("div");
++    actions.className = "graph-inspector-actions";
++    const open = document.createElement("button");
++    open.type = "button";
++    open.textContent = "Open note";
++    open.addEventListener("click", () => onOpen(node.path));
++    const center = document.createElement("button");
++    center.type = "button";
++    center.textContent = "Local graph here";
++    center.addEventListener("click", () => {
++      focusPath = node.path;
++      scope.value = "local";
++      draw();
++    });
++    const expand = document.createElement("button");
++    expand.type = "button";
++    expand.textContent = expanded.has(node.path) ? "Collapse neighbors" : "Expand neighbors";
++    expand.addEventListener("click", () => {
++      if (expanded.has(node.path)) expanded.delete(node.path);
++      else expanded.add(node.path);
++      draw();
++    });
++    actions.append(open, center, expand);
++    inspector.append(heading, path, tagList, actions);
++    const relationships = graphRelationships(data, node.path);
++    appendRelationshipList(inspector, "Incoming", relationships.incoming.map((edge) => edge.source), data, (next) => {
++      selectedPath = next;
++      drawInspector();
++    }, onOpen);
++    appendRelationshipList(inspector, "Outgoing", relationships.outgoing.map((edge) => edge.target), data, (next) => {
++      selectedPath = next;
++      drawInspector();
++    }, onOpen);
++  };
++
++  const draw = () => {
++    const visible = selectGraphData(data, {
++      scope: scope.value as "global" | "local",
++      focus: focusPath,
++      depth: Number(depth.value),
++      direction: direction.value as GraphDirection,
++      query: search.value,
++      folder: folder.value,
++      tag: tag.value,
++      expanded,
++    });
++    const { nodes, edges } = visible;
+     const points = layoutGraph(visible);
+     svg.replaceChildren();
++    scene = svgElement("g");
++    scene.classList.add("graph-scene");
+     const edgeLayer = svgElement("g");
+     edgeLayer.classList.add("graph-edges");
+     for (const edge of edges) {
+@@ -133,14 +307,15 @@ export function renderGraph(
+       if (edge.embeds) line.classList.add("embed");
+       edgeLayer.appendChild(line);
+     }
+-    svg.appendChild(edgeLayer);
++    scene.appendChild(edgeLayer);
+     const nodeLayer = svgElement("g");
+     nodeLayer.classList.add("graph-nodes");
+     for (const node of nodes) {
+       const p = points.get(node.path)!;
+       const group = svgElement("g");
+       group.setAttribute("transform", `translate(${p.x} ${p.y})`);
+-      group.classList.toggle("focused", node.path === initialFocus);
++      group.classList.toggle("focused", node.path === focusPath);
++      group.classList.toggle("selected", node.path === selectedPath);
+       group.setAttribute("tabindex", "0");
+       group.setAttribute("role", "button");
+       const circle = svgElement("circle");
+@@ -152,19 +327,115 @@ export function renderGraph(
+       label.setAttribute("y", "-10");
+       label.textContent = node.title;
+       group.append(circle, title, label);
+-      group.addEventListener("click", () => onOpen(node.path));
++      group.addEventListener("click", (event) => {
++        event.stopPropagation();
++        selectedPath = node.path;
++        draw();
++      });
++      group.addEventListener("dblclick", () => onOpen(node.path));
+       group.addEventListener("keydown", (event) => {
+-        if (event.key === "Enter" || event.key === " ") onOpen(node.path);
++        if (event.key === "Enter") onOpen(node.path);
++        if (event.key === " ") {
++          event.preventDefault();
++          selectedPath = node.path;
++          draw();
++        }
+       });
+       nodeLayer.appendChild(group);
+     }
+-    svg.appendChild(nodeLayer);
+-    summary.textContent = `${nodes.length} notes · ${edges.length} links${data.nodes.length > 350 ? " · first 350 shown" : ""}`;
++    scene.appendChild(nodeLayer);
++    svg.appendChild(scene);
++    applyTransform();
++    summary.textContent = `${nodes.length} notes · ${edges.length} links${nodes.length === 350 ? " · limit reached" : ""}`;
++    depth.disabled = scope.value !== "local";
++    direction.disabled = scope.value !== "local";
++    drawInspector();
+   };
++
++  let drag: { x: number; y: number; panX: number; panY: number } | null = null;
++  svg.addEventListener("pointerdown", (event) => {
++    if ((event.target as Element).closest(".graph-nodes")) return;
++    drag = { x: event.clientX, y: event.clientY, panX, panY };
++    svg.setPointerCapture(event.pointerId);
++  });
++  svg.addEventListener("pointermove", (event) => {
++    if (!drag) return;
++    const rect = svg.getBoundingClientRect();
++    panX = drag.panX + (event.clientX - drag.x) * 1100 / rect.width;
++    panY = drag.panY + (event.clientY - drag.y) * 680 / rect.height;
++    applyTransform();
++  });
++  const stopDrag = () => { drag = null; };
++  svg.addEventListener("pointerup", stopDrag);
++  svg.addEventListener("pointercancel", stopDrag);
++  svg.addEventListener("wheel", (event) => {
++    event.preventDefault();
++    const rect = svg.getBoundingClientRect();
++    const x = (event.clientX - rect.left) * 1100 / rect.width;
++    const y = (event.clientY - rect.top) * 680 / rect.height;
++    const next = Math.max(0.35, Math.min(4, zoom * (event.deltaY < 0 ? 1.12 : 0.89)));
++    panX = x - (x - panX) * next / zoom;
++    panY = y - (y - panY) * next / zoom;
++    zoom = next;
++    applyTransform();
++  }, { passive: false });
++  fit.addEventListener("click", () => {
++    panX = 0;
++    panY = 0;
++    zoom = 1;
++    applyTransform();
++  });
+   search.addEventListener("input", draw);
++  for (const control of [scope, depth, direction, folder, tag]) control.addEventListener("change", draw);
+   draw();
+ }
+ 
++function graphSelect(
++  values: string[],
++  selected: string,
++  label: string,
++  emptyLabel?: string,
++): HTMLSelectElement {
++  const select = document.createElement("select");
++  select.className = "graph-select";
++  select.title = label;
++  select.setAttribute("aria-label", label);
++  for (const value of values) {
++    const option = document.createElement("option");
++    option.value = value;
++    option.textContent = value || emptyLabel || "All";
++    option.selected = value === selected;
++    select.appendChild(option);
++  }
++  return select;
++}
++
++function appendRelationshipList(
++  inspector: HTMLElement,
++  title: string,
++  paths: string[],
++  data: GraphData,
++  onSelect: (path: string) => void,
++  onOpen: (path: string) => void,
++) {
++  const heading = document.createElement("h4");
++  heading.textContent = `${title} (${paths.length})`;
++  const list = document.createElement("div");
++  list.className = "graph-relationship-list";
++  for (const path of paths.sort((left, right) => left.localeCompare(right))) {
++    const node = data.nodes.find((candidate) => candidate.path === path);
++    const button = document.createElement("button");
++    button.type = "button";
++    button.textContent = node ? graphTitle(node) : path;
++    button.title = `${path} · double-click to open`;
++    button.addEventListener("click", () => onSelect(path));
++    button.addEventListener("dblclick", () => onOpen(path));
++    list.appendChild(button);
++  }
++  if (!paths.length) list.textContent = "None";
++  inspector.append(heading, list);
++}
++
+ export function graphTitle(node: GraphNode): string {
+   return node.title || node.path.replace(/\.md$/i, "").split("/").pop() || node.path;
+ }
+diff --git a/ui/src/main.ts b/ui/src/main.ts
+index 3491f64..8c27c31 100644
+--- a/ui/src/main.ts
++++ b/ui/src/main.ts
+@@ -81,6 +81,14 @@ import { bindQueryUriLinks } from "./query-uri";
+ import { vaultChangeTouchesFileTree } from "./vault-change";
+ import { CanvasView, serializeCanvas } from "./canvas-view";
+ import { renderGraph } from "./graph-view";
++import { renderCommandBar, type AppCommand } from "./command-bar";
++import {
++  DEFAULT_TASK_VIEW,
++  groupTasks,
++  selectTasks,
++  updateTaskMetadataLine,
++  type TaskView,
++} from "./task-dashboard";
+ import { findInKanbanLane, normalizePageFindQuery } from "./kanban-find";
+ import type {
+   FileEntry,
+@@ -108,6 +116,7 @@ const PROPERTIES_FOLD_KEY_PREFIX = "nephrite.propertiesFold.v1:";
+ const PAGE_VIEW_KEY_PREFIX = "nephrite.pageView.v1:";
+ const EDITOR_FOLD_KEY_PREFIX = "nephrite.editorFolds.v1:";
+ const KANBAN_WIDTH_KEY_PREFIX = "nephrite.kanbanWidths.v1:";
++const TASK_VIEWS_KEY = "nephrite.taskViews.v1";
+ const SIDEBAR_COLLAPSED_KEY = "nephrite.sidebarCollapsed";
+ const AUTOSAVE_DELAY_MS = 800;
+ // A sub-half-second gap is normal thinking/typing cadence, not a completed edit.
+@@ -446,6 +455,7 @@ async function renderShell() {
+       <div class="actions">
+         <button type="button" id="btn-today" title="Jump to today's journal" disabled>Today</button>
+         <button type="button" id="btn-save" disabled title="Save (Ctrl/Cmd+S)">Save</button>
++        <button type="button" id="btn-command" title="Command bar (Ctrl+P)">Command</button>
+         <div class="seg" role="group" aria-label="View mode">
+           <button type="button" data-mode="source" class="seg-btn" title="Source only">Source</button>
+           <button type="button" data-mode="split" class="seg-btn" title="Edit + preview">Split</button>
+@@ -539,9 +549,15 @@ async function renderShell() {
+             <div class="canvas-toolbar">
+               <button type="button" id="canvas-add-text">+ Text</button>
+               <button type="button" id="canvas-add-file">+ Note</button>
++              <button type="button" id="canvas-add-link">+ Link</button>
++              <button type="button" id="canvas-add-group">+ Group</button>
+               <button type="button" id="canvas-connect">Connect</button>
+               <button type="button" id="canvas-delete">Delete selected</button>
+-              <span>Double-click empty space to add text · drag cards to move · Connect then click target</span>
++              <input type="color" id="canvas-color" value="#5ecf9a" title="Selected card color" aria-label="Selected card color" />
++              <button type="button" id="canvas-zoom-out" title="Zoom out">−</button>
++              <button type="button" id="canvas-zoom-reset" title="Reset zoom">100%</button>
++              <button type="button" id="canvas-zoom-in" title="Zoom in">+</button>
++              <span>Double-click empty space to add text · drag and resize cards · Connect then click target</span>
+             </div>
+             <div id="canvas-host" tabindex="0"></div>
+           </div>
+@@ -592,12 +608,35 @@ async function renderShell() {
+     const path = window.prompt("Vault-relative note path", currentPath?.replace(/\.canvas$/i, ".md") ?? "");
+     if (path?.trim()) canvasView?.addFile(path.trim());
+   });
++  $("canvas-add-link").addEventListener("click", () => {
++    const url = window.prompt("Link URL", "https://");
++    if (!url?.trim()) return;
++    const label = window.prompt("Card label", url.trim()) || url.trim();
++    canvasView?.addLink(url.trim(), label);
++  });
++  $("canvas-add-group").addEventListener("click", () => {
++    const label = window.prompt("Group label", "Group")?.trim();
++    if (label) canvasView?.addGroup(label);
++  });
+   $("canvas-delete").addEventListener("click", () => canvasView?.deleteSelected());
+   $("canvas-connect").addEventListener("click", () => {
+     if (!canvasView?.beginConnect()) setTransientStatus("Select a canvas node first", "#e9ad55");
+   });
++  $("canvas-color").addEventListener("input", (event) => {
++    canvasView?.setSelectedColor((event.target as HTMLInputElement).value);
++  });
++  $("canvas-zoom-out").addEventListener("click", () => canvasView?.changeZoom(-0.1));
++  $("canvas-zoom-reset").addEventListener("click", () => canvasView?.resetZoom());
++  $("canvas-zoom-in").addEventListener("click", () => canvasView?.changeZoom(0.1));
+   $("btn-template").addEventListener("click", () => void showTemplatePanel());
++  $("btn-command").addEventListener("click", showCommandBar);
+   document.addEventListener("keydown", (event) => {
++    if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === "p") {
++      event.preventDefault();
++      event.stopPropagation();
++      showCommandBar();
++      return;
++    }
+     if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === "f") {
+       event.preventDefault();
+       event.stopPropagation();
+@@ -2647,6 +2686,43 @@ async function showGraphPanel() {
+   }
+ }
+ 
++function showCommandBar() {
++  const body = openFeaturePanel("Command bar");
++  const commands: AppCommand[] = [
++    { id: "save", title: "Save current file", keywords: "write", shortcut: "Ctrl+S", run: () => saveFile(false) },
++    { id: "mode-source", title: "View: Source", keywords: "editor", run: () => setViewMode("source") },
++    { id: "mode-split", title: "View: Split", keywords: "editor preview", run: () => setViewMode("split") },
++    { id: "mode-preview", title: "View: Preview", keywords: "render", run: () => setViewMode("preview") },
++    { id: "search", title: "Search vault", keywords: "find", shortcut: "Ctrl+Shift+F", run: showSearchPanel },
++    { id: "graph", title: "Open graph", keywords: "links backlinks local", run: showGraphPanel },
++    { id: "tasks", title: "Open tasks", keywords: "todo agenda", run: showTasksPanel },
++    { id: "bookmarks", title: "Open bookmarks", run: showBookmarksPanel },
++    { id: "git", title: "Open Git history", keywords: "versions source control", run: showGitPanel },
++    { id: "templates", title: "Apply template", keywords: "templater automation", shortcut: "Ctrl+Y", run: showTemplatePanel },
++    { id: "today", title: "Open today's journal", keywords: "daily note", run: openToday },
++    { id: "canvas", title: "Create canvas", run: createCanvas },
++    { id: "drawing", title: "Create Excalidraw drawing", keywords: "draw", run: createDrawing },
++    { id: "sidebar", title: sidebarCollapsed ? "Show file sidebar" : "Hide file sidebar", keywords: "files", run: () => setSidebarCollapsed(!sidebarCollapsed) },
++    { id: "vim", title: vimOn ? "Disable Vim mode" : "Enable Vim mode", run: () => {
++      vimOn = !vimOn;
++      localStorage.setItem(VIM_KEY, vimOn ? "1" : "0");
++      ($("vim-toggle") as HTMLInputElement).checked = vimOn;
++      editor?.setVim(vimOn);
++      updateVimPowerline();
++    } },
++    { id: "preferences", title: "Open preferences", keywords: "settings", run: togglePreferences },
++    ...mdFilesAll
++      .filter((file) => file.file_kind === "markdown")
++      .map((file): AppCommand => ({
++        id: `open:${file.path}`,
++        title: `Open: ${file.path}`,
++        keywords: `note file ${file.name}`,
++        run: () => openNote(file.path),
++      })),
++  ];
++  renderCommandBar(body, commands, closeFeaturePanel);
++}
++
+ async function createDrawing() {
+   const initialFolder = currentPath ? parentDir(currentPath) : "";
+   const entered = promptName("New Excalidraw drawing", "Untitled.excalidraw");
+@@ -2807,57 +2883,214 @@ async function renderTemplateForCurrent(source: string, targetPath: string, sele
+ 
+ async function showTasksPanel() {
+   const body = openFeaturePanel("Tasks");
+-  body.innerHTML = `<p class="feature-help">Open tasks across the vault. Checking one edits its Markdown source directly.</p><div class="feature-loading">Loading…</div>`;
++  body.innerHTML = `<div class="feature-loading">Loading indexed tasks…</div>`;
+   try {
+     if (dirty) await saveFile(true);
+-    const tasks = await invoke<TaskRow[]>("list_tasks", { completed: false });
++    const tasks = await invoke<TaskRow[]>("list_tasks", { completed: null });
++    let savedViews: TaskView[] = [];
++    try {
++      const parsed = JSON.parse(localStorage.getItem(TASK_VIEWS_KEY) || "[]");
++      if (Array.isArray(parsed)) savedViews = parsed;
++    } catch { /* discard malformed local UI state */ }
++    let view: TaskView = { ...DEFAULT_TASK_VIEW };
++    body.replaceChildren();
++    const controls = document.createElement("div");
++    controls.className = "task-dashboard-controls";
++    const saved = taskSelect(["", ...savedViews.map((candidate) => candidate.name)], "", "Saved view", "Saved views");
++    const completion = taskSelect(["open", "completed", "all"], view.completion, "Completion");
++    const due = taskSelect(["all", "overdue", "today", "week", "none"], view.due, "Due date");
++    const priority = taskSelect(["", "highest", "high", "medium", "low", "lowest"], "", "Priority", "All priorities");
++    const sort = taskSelect(["due", "scheduled", "priority", "path"], view.sort, "Sort tasks");
++    const group = taskSelect(["none", "due", "priority", "path"], view.group, "Group tasks");
++    const pathFilter = document.createElement("input");
++    pathFilter.type = "search";
++    pathFilter.placeholder = "Path…";
++    pathFilter.setAttribute("aria-label", "Filter task path");
++    const query = document.createElement("input");
++    query.type = "search";
++    query.placeholder = "Task text or tag…";
++    query.setAttribute("aria-label", "Filter task text or tag");
++    const saveView = document.createElement("button");
++    saveView.type = "button";
++    saveView.textContent = "Save view";
++    const deleteView = document.createElement("button");
++    deleteView.type = "button";
++    deleteView.textContent = "Delete view";
++    deleteView.disabled = true;
++    const summary = document.createElement("span");
++    controls.append(saved, completion, due, priority, sort, group, pathFilter, query, saveView, deleteView, summary);
+     const list = document.createElement("div");
+     list.className = "task-dashboard";
+-    if (!tasks.length) list.innerHTML = `<div class="feature-empty">No open tasks.</div>`;
+-    for (const task of tasks) {
+-      const row = document.createElement("div");
+-      row.className = "task-dashboard-row";
+-      const checkbox = document.createElement("input");
+-      checkbox.type = "checkbox";
+-      checkbox.checked = task.completed;
+-      checkbox.title = "Write task status to Markdown";
+-      checkbox.addEventListener("change", () => void (async () => {
+-        checkbox.disabled = true;
+-        try {
+-          await invoke("set_task_completed", {
+-            path: task.path,
+-            taskId: task.task_id,
+-            completed: checkbox.checked,
+-          });
+-          if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
+-          row.remove();
+-        } catch (error) {
+-          checkbox.checked = !checkbox.checked;
+-          checkbox.disabled = false;
+-          alert(String(error));
++    body.append(controls, list);
++
++    const readControls = () => {
++      view = {
++        ...view,
++        completion: completion.value as TaskView["completion"],
++        due: due.value as TaskView["due"],
++        priority: priority.value,
++        sort: sort.value as TaskView["sort"],
++        group: group.value as TaskView["group"],
++        path: pathFilter.value,
++        query: query.value,
++      };
++    };
++    const writeControls = () => {
++      completion.value = view.completion;
++      due.value = view.due;
++      priority.value = view.priority;
++      sort.value = view.sort;
++      group.value = view.group;
++      pathFilter.value = view.path;
++      query.value = view.query;
++    };
++    const persistViews = () => {
++      localStorage.setItem(TASK_VIEWS_KEY, JSON.stringify(savedViews));
++      saved.replaceChildren(...["", ...savedViews.map((candidate) => candidate.name)].map((name) => {
++        const option = document.createElement("option");
++        option.value = name;
++        option.textContent = name || "Saved views";
++        return option;
++      }));
++    };
++    const render = () => {
++      readControls();
++      const selected = selectTasks(tasks, view);
++      const groups = groupTasks(selected, view.group);
++      list.replaceChildren();
++      summary.textContent = `${selected.length} of ${tasks.length}`;
++      if (!selected.length) list.innerHTML = `<div class="feature-empty">No tasks match this view.</div>`;
++      for (const [label, rows] of groups) {
++        if (view.group !== "none") {
++          const heading = document.createElement("h3");
++          heading.className = "task-dashboard-group";
++          heading.textContent = `${label} (${rows.length})`;
++          list.appendChild(heading);
+         }
+-      })());
+-      const text = document.createElement("button");
+-      text.type = "button";
+-      text.className = "task-dashboard-text";
+-      text.textContent = task.text;
+-      text.addEventListener("click", () => void (async () => {
+-        closeFeaturePanel();
+-        await openNote(task.path);
+-        editor?.goToLine(task.line);
+-      })());
+-      const source = document.createElement("span");
+-      source.className = "task-dashboard-source";
+-      source.textContent = `${task.path}:${task.line}`;
+-      row.append(checkbox, text, source);
+-      list.appendChild(row);
+-    }
+-    body.querySelector(".feature-loading")?.replaceWith(list);
++        for (const task of rows) list.appendChild(renderTaskDashboardRow(task, render));
++      }
++    };
++    for (const control of [completion, due, priority, sort, group]) control.addEventListener("change", render);
++    pathFilter.addEventListener("input", render);
++    query.addEventListener("input", render);
++    saved.addEventListener("change", () => {
++      const selected = savedViews.find((candidate) => candidate.name === saved.value);
++      if (!selected) return;
++      view = { ...selected };
++      writeControls();
++      deleteView.disabled = false;
++      render();
++    });
++    saveView.addEventListener("click", () => {
++      readControls();
++      const name = window.prompt("Saved task view name", view.name || "Task view")?.trim();
++      if (!name) return;
++      view.name = name;
++      const existing = savedViews.findIndex((candidate) => candidate.name === name);
++      if (existing >= 0) savedViews[existing] = { ...view };
++      else savedViews.push({ ...view });
++      persistViews();
++      saved.value = name;
++      deleteView.disabled = false;
++    });
++    deleteView.addEventListener("click", () => {
++      if (!saved.value) return;
++      savedViews = savedViews.filter((candidate) => candidate.name !== saved.value);
++      persistViews();
++      deleteView.disabled = true;
++    });
++    render();
+   } catch (error) {
+     body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+   }
+ }
+ 
++function taskSelect(values: string[], selected: string, label: string, emptyLabel?: string) {
++  const select = document.createElement("select");
++  select.className = "feature-select task-dashboard-select";
++  select.setAttribute("aria-label", label);
++  select.title = label;
++  for (const value of values) {
++    const option = document.createElement("option");
++    option.value = value;
++    option.textContent = value || emptyLabel || "All";
++    option.selected = value === selected;
++    select.appendChild(option);
++  }
++  return select;
++}
++
++function renderTaskDashboardRow(task: TaskRow, rerender: () => void) {
++  const row = document.createElement("div");
++  row.className = "task-dashboard-row";
++  const checkbox = document.createElement("input");
++  checkbox.type = "checkbox";
++  checkbox.checked = task.completed;
++  checkbox.title = "Write task status to Markdown";
++  checkbox.addEventListener("change", () => void (async () => {
++    checkbox.disabled = true;
++    try {
++      await invoke("set_task_completed", { path: task.path, taskId: task.task_id, completed: checkbox.checked });
++      task.completed = checkbox.checked;
++      if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
++      rerender();
++    } catch (error) {
++      checkbox.checked = !checkbox.checked;
++      checkbox.disabled = false;
++      alert(String(error));
++    }
++  })());
++  const text = document.createElement("button");
++  text.type = "button";
++  text.className = "task-dashboard-text";
++  text.textContent = task.text;
++  text.addEventListener("click", () => void (async () => {
++    closeFeaturePanel();
++    await openNote(task.path);
++    editor?.goToLine(task.line);
++  })());
++  const metadata = document.createElement("div");
++  metadata.className = "task-dashboard-metadata";
++  const scheduled = document.createElement("input");
++  scheduled.type = "date";
++  scheduled.value = task.scheduled || "";
++  scheduled.title = "Scheduled date";
++  const dueDate = document.createElement("input");
++  dueDate.type = "date";
++  dueDate.value = task.due || "";
++  dueDate.title = "Due date";
++  const priority = taskSelect(["", "highest", "high", "medium", "low", "lowest"], task.priority || "", "Task priority", "No priority");
++  const update = async () => {
++    const replacement = updateTaskMetadataLine(task.raw_line, {
++      due: dueDate.value || null,
++      scheduled: scheduled.value || null,
++      priority: priority.value || null,
++    });
++    for (const control of [scheduled, dueDate, priority]) control.disabled = true;
++    try {
++      await invoke("replace_task_line", { path: task.path, taskId: task.task_id, replacement });
++      task.raw_line = replacement;
++      task.due = dueDate.value || null;
++      task.scheduled = scheduled.value || null;
++      task.priority = priority.value || null;
++      if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
++      rerender();
++    } catch (error) {
++      for (const control of [scheduled, dueDate, priority]) control.disabled = false;
++      alert(String(error));
++    }
++  };
++  scheduled.addEventListener("change", () => void update());
++  dueDate.addEventListener("change", () => void update());
++  priority.addEventListener("change", () => void update());
++  metadata.append(scheduled, dueDate, priority);
++  const source = document.createElement("span");
++  source.className = "task-dashboard-source";
++  source.textContent = `${task.path}:${task.line}`;
++  row.append(checkbox, text, metadata, source);
++  return row;
++}
++
+ async function showGitPanel() {
+   const body = openFeaturePanel("Git");
+   body.innerHTML = `<div class="feature-loading">Reading repository…</div>`;
+diff --git a/ui/src/styles.css b/ui/src/styles.css
+index d16326c..980dbf3 100644
+--- a/ui/src/styles.css
++++ b/ui/src/styles.css
+@@ -644,6 +644,14 @@ button:disabled {
+   color: var(--muted);
+   font-size: 0.72rem;
+ }
++.canvas-toolbar input[type="color"] {
++  width: 2rem;
++  height: 1.75rem;
++  padding: 0.1rem;
++  border: 1px solid var(--border);
++  border-radius: 4px;
++  background: var(--bg);
++}
+ 
+ .canvas-host {
+   position: relative;
+@@ -682,6 +690,19 @@ button:disabled {
+ .canvas-node-content { overflow: auto; padding: 0.55rem; white-space: pre-wrap; user-select: text; }
+ .canvas-node-content[contenteditable="true"] { outline: 1px solid var(--accent); background: #0e151e; }
+ .canvas-node-link { color: var(--link); cursor: pointer; }
++.canvas-node-resize {
++  position: absolute;
++  right: 0;
++  bottom: 0;
++  width: 1rem;
++  height: 1rem;
++  padding: 0;
++  border: 0;
++  border-radius: 0;
++  background: linear-gradient(135deg, transparent 45%, #7890a8 46% 56%, transparent 57% 67%, #7890a8 68% 78%, transparent 79%);
++  cursor: nwse-resize;
++  touch-action: none;
++}
+ 
+ .excalidraw-host {
+   grid-column: 1 / -1;
+@@ -1474,11 +1495,13 @@ body.resizing-panes .cm-editor {
+ .graph-controls,
+ .vault-search-controls {
+   display: flex;
++  flex-wrap: wrap;
+   align-items: center;
+   gap: 0.6rem;
+   padding: 0.65rem;
+ }
+ .graph-controls input,
++.graph-select,
+ .vault-search-controls input {
+   min-width: 0;
+   flex: 1;
+@@ -1489,16 +1512,58 @@ body.resizing-panes .cm-editor {
+   color: var(--text);
+   font: 0.82rem var(--mono);
+ }
++.graph-select,
++.graph-controls button,
++.graph-inspector button {
++  border: 1px solid #53677e;
++  border-radius: 5px;
++  padding: 0.42rem 0.55rem;
++  background: #111a25;
++  color: var(--text);
++  font: 0.74rem var(--mono);
++}
++.graph-select:disabled { opacity: 0.45; }
++.graph-controls button,
++.graph-inspector button { cursor: pointer; }
++.graph-controls button:hover,
++.graph-inspector button:hover { border-color: var(--accent); color: #eafff4; }
+ .graph-controls span,
+ .vault-search-controls span { color: var(--muted); font-size: 0.74rem; white-space: nowrap; }
+-.graph-viewport { height: min(680px, 72vh); border-top: 1px solid var(--border); background: #090e14; }
++.graph-content {
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) minmax(190px, 250px);
++  height: min(680px, 72vh);
++  border-top: 1px solid var(--border);
++}
++.graph-viewport { min-width: 0; min-height: 0; overflow: hidden; background: #090e14; }
+ .graph-svg { width: 100%; height: 100%; }
++.graph-svg:active { cursor: grabbing; }
+ .graph-edges line { stroke: #34465a; stroke-width: 1; opacity: 0.72; }
+ .graph-edges line.embed { stroke: var(--embed); stroke-dasharray: 4 3; }
+ .graph-nodes g { cursor: pointer; outline: none; }
+ .graph-nodes circle { fill: #447d65; stroke: #7ce3b0; stroke-width: 1.2; }
+ .graph-nodes g.focused circle { fill: #b285dc; stroke: #e0c1ff; stroke-width: 2.5; }
++.graph-nodes g.selected circle { stroke: #fff1a8; stroke-width: 3; }
+ .graph-nodes text { fill: #dce7f2; font: 11px var(--font); text-anchor: middle; paint-order: stroke; stroke: #090e14; stroke-width: 3px; }
++.graph-inspector {
++  min-width: 0;
++  overflow: auto;
++  padding: 0.75rem;
++  border-left: 1px solid var(--border);
++  background: #0d141e;
++}
++.graph-inspector h3 { margin: 0 0 0.25rem; color: #dff8ec; }
++.graph-inspector h4 { margin: 0.8rem 0 0.35rem; color: #bcd1e7; font-size: 0.74rem; }
++.graph-inspector > code { display: block; overflow-wrap: anywhere; color: var(--muted); font-size: 0.67rem; }
++.graph-inspector-actions,
++.graph-inspector-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.65rem; }
++.graph-inspector-tags button { padding: 0.18rem 0.35rem; color: #9ee7bd; font-size: 0.65rem; }
++.graph-relationship-list { display: grid; gap: 0.25rem; color: var(--muted); font-size: 0.72rem; }
++.graph-relationship-list button { overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
++@media (max-width: 820px) {
++  .graph-content { grid-template-columns: minmax(0, 1fr); }
++  .graph-inspector { display: none; }
++}
+ 
+ .vault-search-results { display: grid; gap: 0.3rem; }
+ .vault-search-result {
+@@ -1522,6 +1587,38 @@ body.resizing-panes .cm-editor {
+ 
+ .feature-error { color: #ff9c9c; }
+ 
++.command-bar { padding: 0; }
++.command-bar-input {
++  width: 100%;
++  border: 0;
++  border-bottom: 1px solid var(--border);
++  padding: 0.8rem 0.9rem;
++  background: #0b1119;
++  color: var(--text);
++  font: 0.9rem var(--mono);
++  outline: none;
++}
++.command-bar-results {
++  display: grid;
++  max-height: min(32rem, 62vh);
++  overflow: auto;
++}
++.command-bar-result {
++  display: flex;
++  justify-content: space-between;
++  gap: 1rem;
++  width: 100%;
++  border: 0;
++  border-bottom: 1px solid #263241;
++  border-radius: 0;
++  padding: 0.5rem 0.75rem;
++  background: transparent;
++  color: var(--text);
++  text-align: left;
++}
++.command-bar-result.active { background: #1e4b3b; color: #fff; }
++.command-bar-result kbd { color: var(--muted); font: 0.68rem var(--mono); }
++
+ .feature-actions,
+ .git-commit-form {
+   display: flex;
+@@ -1583,15 +1680,66 @@ body.resizing-panes .cm-editor {
+   gap: 0.3rem;
+ }
+ 
++.task-dashboard-controls {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 0.45rem;
++  align-items: center;
++  margin-bottom: 0.7rem;
++  padding-bottom: 0.7rem;
++  border-bottom: 1px solid var(--border);
++}
++.task-dashboard-controls input,
++.task-dashboard-controls button {
++  min-width: 0;
++  border: 1px solid #53677e;
++  border-radius: 5px;
++  padding: 0.42rem 0.55rem;
++  background: #0b1119;
++  color: var(--text);
++  font: 0.76rem var(--mono);
++}
++.task-dashboard-controls input { flex: 1 1 10rem; }
++.task-dashboard-controls button { cursor: pointer; }
++.task-dashboard-controls > span { margin-left: auto; color: var(--muted); font: 0.7rem var(--mono); }
++.task-dashboard-select { flex: 0 1 auto; }
++.task-dashboard-group {
++  position: sticky;
++  top: 0;
++  z-index: 1;
++  margin: 0.5rem 0 0.2rem;
++  padding: 0.35rem 0.45rem;
++  background: #152231;
++  color: #bcd1e7;
++  font-size: 0.76rem;
++}
++
+ .task-dashboard-row {
+   display: grid;
+-  grid-template-columns: auto minmax(0, 1fr) auto;
++  grid-template-columns: auto minmax(12rem, 1fr) auto auto;
+   align-items: center;
+   gap: 0.55rem;
+   padding: 0.38rem 0.45rem;
+   border-bottom: 1px solid #263241;
+ }
+ 
++.task-dashboard-metadata { display: flex; gap: 0.3rem; align-items: center; }
++.task-dashboard-metadata input,
++.task-dashboard-metadata select {
++  width: auto;
++  border: 1px solid #40536a;
++  border-radius: 4px;
++  padding: 0.25rem 0.35rem;
++  background: #0b1119;
++  color: var(--text);
++  font: 0.68rem var(--mono);
++}
++@media (max-width: 900px) {
++  .task-dashboard-row { grid-template-columns: auto minmax(0, 1fr); }
++  .task-dashboard-metadata,
++  .task-dashboard-source { grid-column: 2; }
++}
++
+ .task-dashboard-text {
+   border: 0;
+   padding: 0;
+diff --git a/ui/src/task-dashboard.ts b/ui/src/task-dashboard.ts
+new file mode 100644
+index 0000000..3b0df70
+--- /dev/null
++++ b/ui/src/task-dashboard.ts
+@@ -0,0 +1,107 @@
++import type { TaskRow } from "./types";
++
++export type TaskView = {
++  name: string;
++  completion: "open" | "completed" | "all";
++  due: "all" | "overdue" | "today" | "week" | "none";
++  priority: string;
++  path: string;
++  query: string;
++  sort: "due" | "scheduled" | "priority" | "path";
++  group: "none" | "due" | "priority" | "path";
++};
++
++export const DEFAULT_TASK_VIEW: TaskView = {
++  name: "Open tasks",
++  completion: "open",
++  due: "all",
++  priority: "",
++  path: "",
++  query: "",
++  sort: "due",
++  group: "none",
++};
++
++function localIsoDate(date = new Date()): string {
++  const year = date.getFullYear();
++  const month = String(date.getMonth() + 1).padStart(2, "0");
++  const day = String(date.getDate()).padStart(2, "0");
++  return `${year}-${month}-${day}`;
++}
++
++const PRIORITY_ORDER: Record<string, number> = {
++  highest: 0, high: 1, medium: 2, low: 3, lowest: 4,
++};
++
++export function selectTasks(tasks: TaskRow[], view: TaskView, now = new Date()): TaskRow[] {
++  const today = localIsoDate(now);
++  const week = new Date(now);
++  week.setDate(week.getDate() + 7);
++  const weekEnd = localIsoDate(week);
++  const query = view.query.trim().toLowerCase();
++  const path = view.path.trim().toLowerCase();
++  const selected = tasks.filter((task) => {
++    if (view.completion === "open" && task.completed) return false;
++    if (view.completion === "completed" && !task.completed) return false;
++    if (view.priority && task.priority !== view.priority) return false;
++    if (path && !task.path.toLowerCase().includes(path)) return false;
++    if (query && !`${task.text} ${task.path} ${task.tags.join(" ")}`.toLowerCase().includes(query)) return false;
++    if (view.due === "overdue" && (!task.due || task.due >= today)) return false;
++    if (view.due === "today" && task.due !== today) return false;
++    if (view.due === "week" && (!task.due || task.due < today || task.due > weekEnd)) return false;
++    if (view.due === "none" && task.due) return false;
++    return true;
++  });
++  const dateKey = (value: string | null) => value || "9999-12-31";
++  return selected.sort((left, right) => {
++    if (view.sort === "priority") {
++      return (PRIORITY_ORDER[left.priority || ""] ?? 9) - (PRIORITY_ORDER[right.priority || ""] ?? 9)
++        || dateKey(left.due).localeCompare(dateKey(right.due));
++    }
++    if (view.sort === "scheduled") {
++      return dateKey(left.scheduled).localeCompare(dateKey(right.scheduled))
++        || dateKey(left.due).localeCompare(dateKey(right.due));
++    }
++    if (view.sort === "path") return left.path.localeCompare(right.path) || left.line - right.line;
++    return dateKey(left.due).localeCompare(dateKey(right.due))
++      || (PRIORITY_ORDER[left.priority || ""] ?? 9) - (PRIORITY_ORDER[right.priority || ""] ?? 9)
++      || left.path.localeCompare(right.path);
++  });
++}
++
++export function groupTasks(tasks: TaskRow[], group: TaskView["group"]): Map<string, TaskRow[]> {
++  const groups = new Map<string, TaskRow[]>();
++  for (const task of tasks) {
++    const key = group === "due" ? task.due || "No due date"
++      : group === "priority" ? task.priority || "No priority"
++      : group === "path" ? task.path.split("/").slice(0, -1).join("/") || "Vault root"
++      : "Tasks";
++    const rows = groups.get(key) ?? [];
++    rows.push(task);
++    groups.set(key, rows);
++  }
++  return groups;
++}
++
++const PRIORITY_MARKERS: Record<string, string> = {
++  highest: "🔺", high: "⏫", medium: "🔼", low: "🔽", lowest: "⏬",
++};
++
++export function updateTaskMetadataLine(
++  rawLine: string,
++  metadata: { due: string | null; scheduled: string | null; priority: string | null },
++): string {
++  const block = rawLine.match(/(\s+\^[A-Za-z0-9-]+\s*)$/)?.[1] ?? "";
++  let line = block ? rawLine.slice(0, -block.length) : rawLine;
++  line = line
++    .replace(/\s*📅\s*\d{4}-\d{2}-\d{2}/gu, "")
++    .replace(/\s*⏳\s*\d{4}-\d{2}-\d{2}/gu, "")
++    .replace(/\s*(?:🔺|⏫|🔼|🔽|⏬)/gu, "")
++    .trimEnd();
++  const markers = [
++    metadata.priority ? PRIORITY_MARKERS[metadata.priority] : "",
++    metadata.scheduled ? `⏳ ${metadata.scheduled}` : "",
++    metadata.due ? `📅 ${metadata.due}` : "",
++  ].filter(Boolean);
++  return `${line}${markers.length ? ` ${markers.join(" ")}` : ""}${block}`;
++}
+diff --git a/ui/src/types.ts b/ui/src/types.ts
+index 5265b56..4dde5db 100644
+--- a/ui/src/types.ts
++++ b/ui/src/types.ts
+@@ -63,12 +63,14 @@ export type TaskRow = {
+   status: string;
+   status_char: string;
+   text: string;
++  raw_line: string;
+   line: number;
+   completed: boolean;
+   due: string | null;
+   scheduled: string | null;
+   priority: string | null;
+   recurrence: string | null;
++  tags: string[];
+ };
+ 
+ export type GitEntry = {
+@@ -129,6 +131,7 @@ export type SearchResult = {
+ export type GraphNode = {
+   path: string;
+   title: string;
++  tags: string[];
+ };
+ 
+ export type GraphEdge = {

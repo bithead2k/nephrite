@@ -6,13 +6,38 @@ import {
 
 const WINDOW_STATE_KEY = "nephrite.windowState.v1";
 
-type SavedWindowState = {
+export type SavedWindowState = {
   x: number;
   y: number;
   width: number;
   height: number;
   maximized: boolean;
 };
+
+type WindowGeometryReader = {
+  outerPosition(): Promise<{ x: number; y: number }>;
+  innerSize(): Promise<{ width: number; height: number }>;
+  scaleFactor(): Promise<number>;
+};
+
+export async function captureLogicalWindowGeometry(
+  window: WindowGeometryReader,
+): Promise<Pick<SavedWindowState, "x" | "y" | "width" | "height">> {
+  // Tauri's setSize() restores the inner (client-area) size. Persist that same
+  // measurement so the OS title bar and borders are not added again on every
+  // restart. Position remains the outer window's desktop coordinate.
+  const [position, size, scale] = await Promise.all([
+    window.outerPosition(),
+    window.innerSize(),
+    window.scaleFactor(),
+  ]);
+  return {
+    x: position.x / scale,
+    y: position.y / scale,
+    width: size.width / scale,
+    height: size.height / scale,
+  };
+}
 
 function validState(value: unknown): value is SavedWindowState {
   if (!value || typeof value !== "object") return false;
@@ -51,16 +76,9 @@ export async function installWindowStatePersistence(): Promise<void> {
           }
           return;
         }
-        const [position, size] = await Promise.all([
-          window.outerPosition(),
-          window.outerSize(),
-        ]);
-        const scale = await window.scaleFactor();
+        const geometry = await captureLogicalWindowGeometry(window);
         localStorage.setItem(WINDOW_STATE_KEY, JSON.stringify({
-          x: position.x / scale,
-          y: position.y / scale,
-          width: size.width / scale,
-          height: size.height / scale,
+          ...geometry,
           maximized: false,
         } satisfies SavedWindowState));
       } catch (error) {
@@ -73,4 +91,3 @@ export async function installWindowStatePersistence(): Promise<void> {
   await window.onResized(save);
   save();
 }
-

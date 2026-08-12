@@ -1,0 +1,115 @@
+diff --git a/src-tauri/capabilities/default.json b/src-tauri/capabilities/default.json
+index 42e1283..6634e65 100644
+--- a/src-tauri/capabilities/default.json
++++ b/src-tauri/capabilities/default.json
+@@ -7,6 +7,7 @@
+     "core:default",
+     "core:window:allow-set-size",
+     "core:window:allow-set-position",
++    "core:window:allow-inner-size",
+     "core:window:allow-outer-size",
+     "core:window:allow-outer-position",
+     "core:window:allow-scale-factor",
+diff --git a/tests/editor-performance.test.ts b/tests/editor-performance.test.ts
+index 4c48908..d48c323 100644
+--- a/tests/editor-performance.test.ts
++++ b/tests/editor-performance.test.ts
+@@ -27,6 +27,7 @@ import { parseVimrc } from "../ui/src/vimrc";
+ import { layoutGraph } from "../ui/src/graph-view";
+ import { parseCanvas, serializeCanvas } from "../ui/src/canvas-view";
+ import { resizedKanbanLaneWidth } from "../ui/src/kanban-resize";
++import { captureLogicalWindowGeometry } from "../ui/src/window-state";
+ import { findInKanbanLane, kanbanCardSearchText } from "../ui/src/kanban-find";
+ import {
+   bindScrollSync,
+@@ -679,6 +680,21 @@ test("Kanban lane resizing responds continuously from the first pixel", () => {
+   );
+ });
+ 
++test("window persistence restores the same inner height without frame drift", async () => {
++  let innerSizeReads = 0;
++  const geometry = await captureLogicalWindowGeometry({
++    outerPosition: async () => ({ x: 200, y: 100 }),
++    innerSize: async () => {
++      innerSizeReads += 1;
++      return { width: 2400, height: 1500 };
++    },
++    scaleFactor: async () => 2,
++  });
++
++  assert.equal(innerSizeReads, 1);
++  assert.deepEqual(geometry, { x: 100, y: 50, width: 1200, height: 750 });
++});
++
+ test("YAML and query results share field-aware URI and MIME detection", () => {
+   assert.match(
+     formatQueryUri("person@internal", "work_email") || "",
+diff --git a/ui/src/window-state.ts b/ui/src/window-state.ts
+index ae53c60..6861f85 100644
+--- a/ui/src/window-state.ts
++++ b/ui/src/window-state.ts
+@@ -6,7 +6,7 @@ import {
+ 
+ const WINDOW_STATE_KEY = "nephrite.windowState.v1";
+ 
+-type SavedWindowState = {
++export type SavedWindowState = {
+   x: number;
+   y: number;
+   width: number;
+@@ -14,6 +14,31 @@ type SavedWindowState = {
+   maximized: boolean;
+ };
+ 
++type WindowGeometryReader = {
++  outerPosition(): Promise<{ x: number; y: number }>;
++  innerSize(): Promise<{ width: number; height: number }>;
++  scaleFactor(): Promise<number>;
++};
++
++export async function captureLogicalWindowGeometry(
++  window: WindowGeometryReader,
++): Promise<Pick<SavedWindowState, "x" | "y" | "width" | "height">> {
++  // Tauri's setSize() restores the inner (client-area) size. Persist that same
++  // measurement so the OS title bar and borders are not added again on every
++  // restart. Position remains the outer window's desktop coordinate.
++  const [position, size, scale] = await Promise.all([
++    window.outerPosition(),
++    window.innerSize(),
++    window.scaleFactor(),
++  ]);
++  return {
++    x: position.x / scale,
++    y: position.y / scale,
++    width: size.width / scale,
++    height: size.height / scale,
++  };
++}
++
+ function validState(value: unknown): value is SavedWindowState {
+   if (!value || typeof value !== "object") return false;
+   const state = value as Partial<SavedWindowState>;
+@@ -51,16 +76,9 @@ export async function installWindowStatePersistence(): Promise<void> {
+           }
+           return;
+         }
+-        const [position, size] = await Promise.all([
+-          window.outerPosition(),
+-          window.outerSize(),
+-        ]);
+-        const scale = await window.scaleFactor();
++        const geometry = await captureLogicalWindowGeometry(window);
+         localStorage.setItem(WINDOW_STATE_KEY, JSON.stringify({
+-          x: position.x / scale,
+-          y: position.y / scale,
+-          width: size.width / scale,
+-          height: size.height / scale,
++          ...geometry,
+           maximized: false,
+         } satisfies SavedWindowState));
+       } catch (error) {
+@@ -73,4 +91,3 @@ export async function installWindowStatePersistence(): Promise<void> {
+   await window.onResized(save);
+   save();
+ }
+-

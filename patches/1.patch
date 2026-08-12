@@ -1,0 +1,736 @@
+diff --git a/crates/nephrite-index/src/lib.rs b/crates/nephrite-index/src/lib.rs
+index 35e1c5b..2c8576e 100644
+--- a/crates/nephrite-index/src/lib.rs
++++ b/crates/nephrite-index/src/lib.rs
+@@ -35,6 +35,10 @@ use pathutil::{
+ };
+ 
+ const SCHEMA_SQL: &str = include_str!("schema.sql");
++// Bump when unchanged Markdown files must be reparsed to populate corrected or
++// newly supported facts. This is an internal cache revision, not a product or
++// file-format version.
++const MARKDOWN_PARSE_VERSION: i64 = 2;
+ 
+ pub struct VaultIndex {
+     vault_root: PathBuf,
+@@ -226,22 +230,23 @@ impl VaultIndex {
+         let disk = self.list_vault_files()?;
+         progress(ProgressPhase::Scan, disk.len(), disk.len(), None);
+ 
+-        // Map path -> (mtime, size) from index
+-        let mut index_meta: HashMap<String, (i64, i64)> = HashMap::new();
++        // Map path -> (mtime, size, parser revision) from index.
++        let mut index_meta: HashMap<String, (i64, i64, i64)> = HashMap::new();
+         {
+             let mut stmt = self
+                 .conn
+-                .prepare("SELECT path, mtime_ms, size_bytes FROM files")?;
++                .prepare("SELECT path, mtime_ms, size_bytes, parse_version FROM files")?;
+             let rows = stmt.query_map([], |r| {
+                 Ok((
+                     r.get::<_, String>(0)?,
+                     r.get::<_, i64>(1)?,
+                     r.get::<_, i64>(2)?,
++                    r.get::<_, i64>(3)?,
+                 ))
+             })?;
+             for row in rows {
+-                let (p, m, s) = row?;
+-                index_meta.insert(p, (m, s));
++                let (p, m, s, parse_version) = row?;
++                index_meta.insert(p, (m, s, parse_version));
+             }
+         }
+ 
+@@ -263,8 +268,15 @@ impl VaultIndex {
+                     .extension()
+                     .and_then(|extension| extension.to_str())
+                     .is_some_and(|extension| extension.eq_ignore_ascii_case("canvas"));
++            let (_, extension) = stem_ext(name_of(rel));
++            let expected_parse_version = parse_version_for_kind(FK::from_extension(&extension));
+             match index_meta.get(rel) {
+-                Some((im, is)) if *im == *mtime_ms && *is == *size_bytes && !canvas_backfill => {
++                Some((im, is, parse_version))
++                    if *im == *mtime_ms
++                        && *is == *size_bytes
++                        && *parse_version == expected_parse_version
++                        && !canvas_backfill =>
++                {
+                     stats.unchanged += 1;
+                 }
+                 _ => {
+@@ -432,7 +444,7 @@ impl VaultIndex {
+                 mtime_ms,
+                 size_bytes,
+                 content_hash,
+-                PROJECT_VERSION.major as i64,
++                parse_version_for_kind(kind),
+                 Option::<String>::None,
+                 indexed_at,
+             ],
+@@ -492,6 +504,20 @@ impl VaultIndex {
+                     ],
+                 )?;
+             }
++            for block in &facts.blocks {
++                tx.execute(
++                    "INSERT OR REPLACE INTO blocks(
++                        path, block_id, start_offset, end_offset, start_line
++                    ) VALUES (?1,?2,?3,?4,?5)",
++                    params![
++                        rel,
++                        block.block_id,
++                        block.start_offset,
++                        block.end_offset,
++                        block.start_line,
++                    ],
++                )?;
++            }
+             for l in &facts.links {
+                 tx.execute(
+                     "INSERT INTO links(
+@@ -558,6 +584,38 @@ impl VaultIndex {
+                     ],
+                 )?;
+             }
++            for field in &facts.inline_fields {
++                tx.execute(
++                    "INSERT INTO inline_fields(
++                        path, field_id, key, value_text, value_type, value_json, line, start_offset
++                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
++                    params![
++                        rel,
++                        field.field_id,
++                        field.key,
++                        field.value_text,
++                        field.value_type,
++                        field.value_json,
++                        field.line,
++                        field.start_offset,
++                    ],
++                )?;
++            }
++            for footnote in &facts.footnotes {
++                tx.execute(
++                    "INSERT INTO footnotes(
++                        path, footnote_id, kind, text, start_offset, line
++                    ) VALUES (?1,?2,?3,?4,?5,?6)",
++                    params![
++                        rel,
++                        footnote.footnote_id,
++                        footnote.kind,
++                        footnote.text,
++                        footnote.start_offset,
++                        footnote.line,
++                    ],
++                )?;
++            }
+ 
+             let tag_str: String = facts
+                 .tags
+@@ -739,7 +797,17 @@ impl VaultIndex {
+     /// Count rows helper for tests / CLI.
+     pub fn count(&self, table: &str) -> Result<i64> {
+         // only allow known tables
+-        let allowed = ["files", "links", "tasks", "tags", "headings", "properties"];
++        let allowed = [
++            "files",
++            "links",
++            "tasks",
++            "tags",
++            "headings",
++            "properties",
++            "blocks",
++            "inline_fields",
++            "footnotes",
++        ];
+         if !allowed.contains(&table) {
+             return Ok(0);
+         }
+@@ -792,6 +860,14 @@ fn now_ms() -> i64 {
+         .unwrap_or(0)
+ }
+ 
++fn parse_version_for_kind(kind: FK) -> i64 {
++    if kind == FK::Markdown {
++        MARKDOWN_PARSE_VERSION
++    } else {
++        PROJECT_VERSION.major as i64
++    }
++}
++
+ fn mtime_to_ms(t: Option<SystemTime>) -> i64 {
+     t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+         .map(|d| d.as_millis() as i64)
+@@ -873,6 +949,34 @@ Link to [[Other]]
+         assert!(PROJECT_VERSION.requires_rebuild(Version::new(PROJECT_VERSION.major + 1, 0)));
+     }
+ 
++    #[test]
++    fn parser_revision_reindexes_unchanged_markdown_without_full_rebuild() {
++        let dir = tempfile::tempdir().unwrap();
++        let vault = dir.path();
++        fs::write(vault.join("Note.md"), "Field:: value\n").unwrap();
++
++        let (index, _) = VaultIndex::open(vault).unwrap();
++        index
++            .connection()
++            .execute("UPDATE files SET parse_version = 1 WHERE path = 'Note.md'", [])
++            .unwrap();
++        drop(index);
++
++        let (reopened, stats) = VaultIndex::open(vault).unwrap();
++        assert!(!stats.full_rebuild);
++        assert_eq!(stats.updated, 1);
++        assert_eq!(reopened.count("inline_fields").unwrap(), 1);
++        let parse_version: i64 = reopened
++            .connection()
++            .query_row(
++                "SELECT parse_version FROM files WHERE path = 'Note.md'",
++                [],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert_eq!(parse_version, MARKDOWN_PARSE_VERSION);
++    }
++
+     #[test]
+     fn external_change_detected_on_open() {
+         let dir = tempfile::tempdir().unwrap();
+@@ -917,6 +1021,43 @@ Link to [[Other]]
+         );
+     }
+ 
++    #[test]
++    fn indexes_blocks_inline_fields_and_footnotes() {
++        let dir = tempfile::tempdir().unwrap();
++        let vault = dir.path();
++        fs::write(
++            vault.join("Facts.md"),
++            "Status:: active\nCost:: 42\nSee [^source]. ^result\n\n[^source]: Evidence\n",
++        )
++        .unwrap();
++
++        let (index, _) = VaultIndex::open(vault).unwrap();
++        assert_eq!(index.count("blocks").unwrap(), 1);
++        assert_eq!(index.count("inline_fields").unwrap(), 2);
++        assert_eq!(index.count("footnotes").unwrap(), 2);
++
++        let (value_type, value_text): (String, String) = index
++            .connection()
++            .query_row(
++                "SELECT value_type, value_text FROM inline_fields WHERE path = 'Facts.md' AND key = 'Cost'",
++                [],
++                |row| Ok((row.get(0)?, row.get(1)?)),
++            )
++            .unwrap();
++        assert_eq!(value_type, "number");
++        assert_eq!(value_text, "42");
++
++        let definition: String = index
++            .connection()
++            .query_row(
++                "SELECT text FROM footnotes WHERE path = 'Facts.md' AND footnote_id = 'source' AND kind = 'def'",
++                [],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert_eq!(definition, "Evidence");
++    }
++
+     #[test]
+     fn indexes_canvas_nodes_edges_and_searchable_text() {
+         let dir = tempfile::tempdir().unwrap();
+diff --git a/crates/nephrite-index/src/parse/markdown.rs b/crates/nephrite-index/src/parse/markdown.rs
+index c82e5cc..4bdeee1 100644
+--- a/crates/nephrite-index/src/parse/markdown.rs
++++ b/crates/nephrite-index/src/parse/markdown.rs
+@@ -1,4 +1,4 @@
+-//! Phase-I Markdown fact extraction (regex/line based).
++//! Source-position-preserving Markdown fact extraction for the disposable index.
+ //! Not a write-back AST. Offsets are UTF-8 byte offsets.
+ 
+ use std::collections::BTreeMap;
+@@ -12,10 +12,41 @@ pub struct MarkdownFacts {
+     pub links: Vec<LinkFact>,
+     pub tags: Vec<TagFact>,
+     pub tasks: Vec<TaskFact>,
++    pub blocks: Vec<BlockFact>,
++    pub inline_fields: Vec<InlineFieldFact>,
++    pub footnotes: Vec<FootnoteFact>,
+     pub body_for_fts: String,
+     pub heading_texts_for_fts: String,
+ }
+ 
++#[derive(Debug, Clone)]
++pub struct BlockFact {
++    pub block_id: String,
++    pub start_offset: i64,
++    pub end_offset: Option<i64>,
++    pub start_line: i64,
++}
++
++#[derive(Debug, Clone)]
++pub struct InlineFieldFact {
++    pub field_id: i64,
++    pub key: String,
++    pub value_text: Option<String>,
++    pub value_type: String,
++    pub value_json: Option<String>,
++    pub line: i64,
++    pub start_offset: i64,
++}
++
++#[derive(Debug, Clone)]
++pub struct FootnoteFact {
++    pub footnote_id: String,
++    pub kind: String,
++    pub text: Option<String>,
++    pub start_offset: i64,
++    pub line: i64,
++}
++
+ #[derive(Debug, Clone)]
+ pub struct PropertyLeaf {
+     pub prop_path: String,
+@@ -104,7 +135,12 @@ pub fn parse_markdown(content: &str) -> MarkdownFacts {
+     }
+ 
+     let body_start = fm_end;
+-    parse_body(body, body_start, &mut facts);
++    let lines_before_body = content[..body_start]
++        .as_bytes()
++        .iter()
++        .filter(|byte| **byte == b'\n')
++        .count() as i64;
++    parse_body(body, body_start, lines_before_body, &mut facts);
+     facts
+ }
+ 
+@@ -159,14 +195,22 @@ fn line_spans(s: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
+     })
+ }
+ 
+-fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
++fn parse_body(
++    body: &str,
++    body_start: usize,
++    lines_before_body: i64,
++    facts: &mut MarkdownFacts,
++) {
+     let mut heading_id = 0i64;
+     let mut link_id = 0i64;
+     let mut task_id = 0i64;
+-    let mut line_no = 0i64;
++    let mut field_id = 0i64;
++    let mut line_no = lines_before_body;
+     let mut fts_body = String::new();
+     let mut fts_headings = String::new();
+     let mut open_headings: Vec<(i64, i64)> = Vec::new(); // (heading_id, level)
++    let mut fence: Option<(u8, usize)> = None;
++    let mut previous_content_span: Option<(i64, i64, i64)> = None;
+ 
+     for (rel_off, line_with_nl) in line_spans(body) {
+         line_no += 1;
+@@ -174,6 +218,24 @@ fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
+         let line = line_with_nl.trim_end_matches(['\r', '\n']);
+         let line_end = abs + line_with_nl.len() as i64;
+ 
++        if update_fence_state(line, &mut fence) {
++            fts_body.push_str(line);
++            fts_body.push('\n');
++            continue;
++        }
++        if fence.is_some() {
++            fts_body.push_str(line);
++            fts_body.push('\n');
++            continue;
++        }
++
++        extract_footnotes(line, abs, line_no, facts);
++        extract_inline_fields(line, abs, line_no, &mut field_id, facts);
++        if let Some(block) = extract_block_id(line, abs, line_end, line_no, previous_content_span)
++        {
++            facts.blocks.push(block);
++        }
++
+         // Headings
+         if let Some((level, text)) = parse_heading(line) {
+             // close previous same-or-shallower
+@@ -204,6 +266,7 @@ fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
+             fts_body.push_str(&text);
+             fts_body.push('\n');
+             extract_tags_and_links(line, abs, line_no, &mut link_id, facts);
++            previous_content_span = Some((abs, line_end, line_no));
+             continue;
+         }
+ 
+@@ -216,12 +279,18 @@ fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
+             fts_body.push('\n');
+             extract_tags_and_links(line, abs, line_no, &mut link_id, facts);
+             facts.tasks.push(t);
++            previous_content_span = Some((abs, line_end, line_no));
+             continue;
+         }
+ 
+         fts_body.push_str(line);
+         fts_body.push('\n');
+         extract_tags_and_links(line, abs, line_no, &mut link_id, facts);
++        if line.trim().is_empty() {
++            previous_content_span = None;
++        } else if !is_standalone_block_id(line) {
++            previous_content_span = Some((abs, line_end, line_no));
++        }
+     }
+ 
+     // close remaining headings at EOF
+@@ -236,6 +305,248 @@ fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
+     facts.heading_texts_for_fts = fts_headings;
+ }
+ 
++/// Track CommonMark fenced code blocks. Metadata-looking text inside a fence is
++/// source code, not a heading, task, field, block ID, footnote, tag, or link.
++fn update_fence_state(line: &str, fence: &mut Option<(u8, usize)>) -> bool {
++    let indent = line.as_bytes().iter().take_while(|byte| **byte == b' ').count();
++    if indent > 3 {
++        return false;
++    }
++    let rest = &line[indent..];
++    let Some(marker) = rest.as_bytes().first().copied() else {
++        return false;
++    };
++    if marker != b'`' && marker != b'~' {
++        return false;
++    }
++    let length = rest.as_bytes().iter().take_while(|byte| **byte == marker).count();
++    if length < 3 {
++        return false;
++    }
++
++    match *fence {
++        None => {
++            *fence = Some((marker, length));
++            true
++        }
++        Some((open_marker, open_length))
++            if marker == open_marker
++                && length >= open_length
++                && rest[length..].trim().is_empty() =>
++        {
++            *fence = None;
++            true
++        }
++        Some(_) => false,
++    }
++}
++
++fn is_block_id_char(byte: u8) -> bool {
++    byte.is_ascii_alphanumeric() || byte == b'-'
++}
++
++fn block_id_suffix(line: &str) -> Option<(usize, &str)> {
++    let trimmed = line.trim_end();
++    let caret = trimmed.rfind('^')?;
++    if caret > 0 && !trimmed.as_bytes()[caret - 1].is_ascii_whitespace() {
++        return None;
++    }
++    let id = &trimmed[caret + 1..];
++    (!id.is_empty() && id.as_bytes().iter().all(|byte| is_block_id_char(*byte)))
++        .then_some((caret, id))
++}
++
++fn is_standalone_block_id(line: &str) -> bool {
++    block_id_suffix(line)
++        .map(|(caret, _)| line[..caret].trim().is_empty())
++        .unwrap_or(false)
++}
++
++fn extract_block_id(
++    line: &str,
++    line_start: i64,
++    line_end: i64,
++    line_no: i64,
++    previous_content_span: Option<(i64, i64, i64)>,
++) -> Option<BlockFact> {
++    let (caret, block_id) = block_id_suffix(line)?;
++    let standalone = line[..caret].trim().is_empty();
++    let (start_offset, end_offset, start_line) = if standalone {
++        previous_content_span.unwrap_or((line_start, line_end, line_no))
++    } else {
++        (line_start, line_end, line_no)
++    };
++    Some(BlockFact {
++        block_id: block_id.to_string(),
++        start_offset,
++        end_offset: Some(end_offset),
++        start_line,
++    })
++}
++
++fn parse_inline_scalar(value: &str) -> (String, Option<String>, Option<String>) {
++    let value = value.trim();
++    let parsed = parse_scalar(value);
++    match &parsed {
++        YamlVal::Null => ("null".into(), None, Some("null".into())),
++        YamlVal::Bool(value) => (
++            "boolean".into(),
++            Some(value.to_string()),
++            Some(value.to_string()),
++        ),
++        YamlVal::Num(value) => (
++            "number".into(),
++            Some(value.to_string()),
++            Some(value.to_string()),
++        ),
++        YamlVal::Str(value) => {
++            let value_type = if value.starts_with("[[") { "link" } else { "string" };
++            let json = serde_json::to_string(value).ok();
++            (value_type.into(), Some(value.clone()), json)
++        }
++        YamlVal::Map(_) | YamlVal::Arr(_) => {
++            let json = yaml_to_json(&parsed);
++            ("json".into(), Some(value.to_string()), Some(json))
++        }
++    }
++}
++
++fn valid_inline_field_key(key: &str) -> bool {
++    let key = key.trim();
++    !key.is_empty()
++        && key.len() <= 256
++        && !key
++            .chars()
++            .any(|character| matches!(character, '[' | ']' | '\n' | '\r'))
++        && key.chars().any(|character| character.is_alphanumeric())
++}
++
++fn push_inline_field(
++    key: &str,
++    value: &str,
++    line: i64,
++    start_offset: i64,
++    field_id: &mut i64,
++    facts: &mut MarkdownFacts,
++) {
++    let key = key.trim();
++    if !valid_inline_field_key(key) {
++        return;
++    }
++    let (value_type, value_text, value_json) = parse_inline_scalar(value);
++    *field_id += 1;
++    facts.inline_fields.push(InlineFieldFact {
++        field_id: *field_id,
++        key: key.to_string(),
++        value_text,
++        value_type,
++        value_json,
++        line,
++        start_offset,
++    });
++}
++
++fn extract_inline_fields(
++    line: &str,
++    line_start: i64,
++    line_no: i64,
++    field_id: &mut i64,
++    facts: &mut MarkdownFacts,
++) {
++    // Bracketed Dataview fields can occur amid ordinary prose.
++    let mut cursor = 0usize;
++    while let Some(open_rel) = line[cursor..].find('[') {
++        let open = cursor + open_rel;
++        let Some(close_rel) = line[open + 1..].find(']') else {
++            break;
++        };
++        let close = open + 1 + close_rel;
++        let inner = &line[open + 1..close];
++        if !inner.starts_with('^') {
++            if let Some((key, value)) = inner.split_once("::") {
++                push_inline_field(
++                    key,
++                    value,
++                    line_no,
++                    line_start + open as i64,
++                    field_id,
++                    facts,
++                );
++            }
++        }
++        cursor = close + 1;
++    }
++
++    // A full-line field is the other canonical Dataview spelling. Avoid
++    // treating prose containing `::` as metadata.
++    let indent = line.len() - line.trim_start().len();
++    let trimmed = line.trim_start();
++    if !trimmed.starts_with('[') {
++        if let Some((key, value)) = trimmed.split_once("::") {
++            if valid_inline_field_key(key) {
++                push_inline_field(
++                    key,
++                    value,
++                    line_no,
++                    line_start + indent as i64,
++                    field_id,
++                    facts,
++                );
++            }
++        }
++    }
++}
++
++fn valid_footnote_id(id: &str) -> bool {
++    !id.is_empty()
++        && id.len() <= 256
++        && !id.chars().any(|character| character.is_whitespace() || character == ']')
++}
++
++fn extract_footnotes(line: &str, line_start: i64, line_no: i64, facts: &mut MarkdownFacts) {
++    let mut definition_span = None;
++    let trimmed = line.trim_start();
++    let indent = line.len() - trimmed.len();
++    if indent <= 3 && trimmed.starts_with("[^") {
++        if let Some(close) = trimmed.find("]:") {
++            let id = &trimmed[2..close];
++            if valid_footnote_id(id) {
++                facts.footnotes.push(FootnoteFact {
++                    footnote_id: id.to_string(),
++                    kind: "def".into(),
++                    text: Some(trimmed[close + 2..].trim_start().to_string()),
++                    start_offset: line_start + indent as i64,
++                    line: line_no,
++                });
++                definition_span = Some((indent, indent + close + 2));
++            }
++        }
++    }
++
++    let mut cursor = 0usize;
++    while let Some(open_rel) = line[cursor..].find("[^") {
++        let open = cursor + open_rel;
++        let Some(close_rel) = line[open + 2..].find(']') else {
++            break;
++        };
++        let close = open + 2 + close_rel;
++        let id = &line[open + 2..close];
++        let is_definition = definition_span
++            .map(|(start, end)| open >= start && close + 1 <= end)
++            .unwrap_or(false);
++        if !is_definition && valid_footnote_id(id) {
++            facts.footnotes.push(FootnoteFact {
++                footnote_id: id.to_string(),
++                kind: "ref".into(),
++                text: None,
++                start_offset: line_start + open as i64,
++                line: line_no,
++            });
++        }
++        cursor = close + 1;
++    }
++}
++
+ fn parse_heading(line: &str) -> Option<(i64, String)> {
+     let trimmed = line.trim_start();
+     if !trimmed.starts_with('#') {
+@@ -843,6 +1154,14 @@ See ![[Other#Section]] and [[Note|alias]].
+         let f = parse_markdown(md);
+         assert!(f.frontmatter_raw.is_some());
+         assert!(f.headings.iter().any(|h| h.text == "Hello"));
++        assert_eq!(
++            f.headings
++                .iter()
++                .find(|heading| heading.text == "Hello")
++                .unwrap()
++                .start_line,
++            9
++        );
+         assert!(f
+             .links
+             .iter()
+@@ -876,4 +1195,60 @@ See ![[Other#Section]] and [[Note|alias]].
+         assert_eq!(task.due.as_deref(), Some("2026-08-12"));
+         assert_eq!(task.tags_json.as_deref(), Some("[\"admin\"]"));
+     }
++
++    #[test]
++    fn extracts_phase_two_facts_and_ignores_fenced_examples() {
++        let markdown = r#"# Metadata
++
++Project owner:: Kirk
++Estimate:: 12.5
++Reviewed:: true
++The [status:: active] item cites [^source]. ^item-1
++
++A paragraph with a block marker on the next line.
++^paragraph-2
++
++[^source]: Primary reference
++
++```markdown
++Fake:: field
++[^fake]: definition
++- [ ] fake task #fake ^fake-block
++```
++"#;
++
++        let facts = parse_markdown(markdown);
++        assert_eq!(facts.blocks.len(), 2);
++        assert_eq!(facts.blocks[0].block_id, "item-1");
++        assert_eq!(facts.blocks[1].block_id, "paragraph-2");
++        assert_eq!(facts.inline_fields.len(), 4);
++        assert!(facts.inline_fields.iter().any(|field| {
++            field.key == "Estimate"
++                && field.value_type == "number"
++                && field.value_text.as_deref() == Some("12.5")
++        }));
++        assert!(facts.inline_fields.iter().any(|field| {
++            field.key == "Reviewed"
++                && field.value_type == "boolean"
++                && field.value_text.as_deref() == Some("true")
++        }));
++        assert_eq!(
++            facts
++                .footnotes
++                .iter()
++                .filter(|footnote| footnote.footnote_id == "source")
++                .count(),
++            2
++        );
++        assert!(!facts
++            .inline_fields
++            .iter()
++            .any(|field| field.key == "Fake"));
++        assert!(!facts
++            .footnotes
++            .iter()
++            .any(|footnote| footnote.footnote_id == "fake"));
++        assert!(facts.tasks.is_empty());
++        assert!(!facts.tags.iter().any(|tag| tag.tag == "fake"));
++    }
+ }
+diff --git a/crates/nephrite-index/src/parse/mod.rs b/crates/nephrite-index/src/parse/mod.rs
+index b1dcc8f..dabf5c5 100644
+--- a/crates/nephrite-index/src/parse/mod.rs
++++ b/crates/nephrite-index/src/parse/mod.rs
+@@ -1,6 +1,6 @@
+ //! File parsers that produce indexable facts.
+-//! Markdown extraction is intentionally simple for Phase I; CM6/Lezer will own
+-//! the editor-facing parse surface, and this module will deepen or share logic.
++//! CM6/Lezer owns the editor-facing parse surface; this module extracts the
++//! source-positioned facts shared by every vault feature.
+ 
+ mod markdown;
+ 
+diff --git a/crates/nephrite-index/src/schema.sql b/crates/nephrite-index/src/schema.sql
+index 7ed3158..d9144bb 100644
+--- a/crates/nephrite-index/src/schema.sql
++++ b/crates/nephrite-index/src/schema.sql
+@@ -156,6 +156,7 @@ CREATE TABLE IF NOT EXISTS inline_fields (
+ );
+ 
+ CREATE INDEX IF NOT EXISTS idx_inline_fields_key ON inline_fields(key);
++CREATE INDEX IF NOT EXISTS idx_inline_fields_path_key ON inline_fields(path, key);
+ 
+ CREATE TABLE IF NOT EXISTS footnotes (
+     path         TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,

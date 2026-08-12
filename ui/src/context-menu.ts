@@ -1,4 +1,4 @@
-export type CtxKind = "file" | "folder" | "empty";
+export type CtxKind = "file" | "tab" | "folder" | "empty";
 
 export type CtxTarget = {
   kind: CtxKind;
@@ -14,6 +14,7 @@ export type CtxAction =
   | "merge-file"
   | "version-history"
   | "open-default-app"
+  | "close-tab"
   // folder create
   | "new-note"
   | "new-folder"
@@ -80,8 +81,17 @@ function fileItems(): MenuItem[] {
   ];
 }
 
+function tabItems(): MenuItem[] {
+  return [
+    { type: "item", id: "close-tab", label: "Close tab" },
+    { type: "sep" },
+    ...fileItems().slice(4),
+  ];
+}
+
 function itemsFor(target: CtxTarget): MenuItem[] {
   if (target.kind === "file") return fileItems();
+  if (target.kind === "tab") return tabItems();
   // folder + empty (vault root)
   const items = folderItems();
   if (target.kind === "empty") {

@@ -319,7 +319,6 @@ impl VaultIndex {
             DELETE FROM footnotes;
             DELETE FROM inline_fields;
             DELETE FROM file_frontmatter;
-            DELETE FROM attachment_metadata;
             DELETE FROM properties;
             DELETE FROM tasks;
             DELETE FROM tags;
@@ -391,15 +390,14 @@ impl VaultIndex {
         let parent = parent_of(&rel);
         let indexed_at = now_ms();
 
-        let text_attachment = is_text_attachment(&extension) && size_bytes <= 8 * 1024 * 1024;
-        let content = if matches!(kind, FK::Markdown | FK::Canvas) || text_attachment {
+        let content = if matches!(kind, FK::Markdown | FK::Canvas) {
             markdown_content
                 .map(str::to_owned)
                 .unwrap_or_else(|| fs::read_to_string(&abs).unwrap_or_default())
         } else {
             String::new()
         };
-        let content_hash = if matches!(kind, FK::Markdown | FK::Canvas) || text_attachment {
+        let content_hash = if matches!(kind, FK::Markdown | FK::Canvas) {
             Some(hash_str(&content))
         } else {
             None
@@ -439,15 +437,6 @@ impl VaultIndex {
                 indexed_at,
             ],
         )?;
-
-        if !matches!(kind, FK::Markdown | FK::Canvas | FK::Excalidraw) {
-            let (mime_type, width, height) = attachment_metadata(&abs, &extension);
-            tx.execute(
-                "INSERT INTO attachment_metadata(path, mime_type, width, height, text_indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![rel, mime_type, width, height, if text_attachment { 1 } else { 0 }],
-            )?;
-        }
 
         if kind == FK::Markdown {
             let facts = parse_markdown(&content);
@@ -631,11 +620,6 @@ impl VaultIndex {
                 "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,'',?3, '')",
                 params![rel, search_title, canvas_text.join(" ")],
             )?;
-        } else if !matches!(kind, FK::Excalidraw) {
-            tx.execute(
-                "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,'',?3,'')",
-                params![rel, search_title, content],
-            )?;
         }
 
         tx.commit()?;
@@ -717,16 +701,12 @@ impl VaultIndex {
         {
             let mut stmt = self
                 .conn
-                .prepare("SELECT path, stem FROM files")?;
+                .prepare("SELECT path, stem FROM files WHERE file_kind = 'markdown'")?;
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (path, stem) = row?;
                 by_stem.entry(stem).or_default().push(path.clone());
-                by_stem.entry(path.clone()).or_default().push(path.clone());
-                if let Some(name) = path.rsplit('/').next() {
-                    by_stem.entry(name.to_string()).or_default().push(path.clone());
-                }
                 if let Some(no_ext) = path.strip_suffix(".md") {
                     by_stem.entry(no_ext.to_string()).or_default().push(path);
                 }
@@ -824,131 +804,10 @@ fn hash_str(s: &str) -> String {
     hex::encode(h.finalize())
 }
 
-fn is_text_attachment(extension: &str) -> bool {
-    matches!(
-        extension,
-        "txt" | "text" | "csv" | "tsv" | "json" | "jsonl" | "xml" | "html" |
-        "htm" | "css" | "js" | "ts" | "toml" | "ini" | "conf" | "log" | "sql" |
-        "sh" | "py" | "rs" | "go" | "java" | "c" | "h" | "cpp" | "hpp"
-    )
-}
-
-fn attachment_metadata(path: &Path, extension: &str) -> (String, Option<i64>, Option<i64>) {
-    let mime = mime_for_extension(extension).to_string();
-    let dimensions = if mime.starts_with("image/") {
-        fs::read(path).ok().and_then(|bytes| image_dimensions(&bytes, extension))
-    } else {
-        None
-    };
-    (mime, dimensions.map(|value| value.0), dimensions.map(|value| value.1))
-}
-
-fn mime_for_extension(extension: &str) -> &'static str {
-    match extension {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "bmp" => "image/bmp",
-        "ico" => "image/x-icon",
-        "pdf" => "application/pdf",
-        "txt" | "text" | "log" => "text/plain",
-        "csv" => "text/csv",
-        "tsv" => "text/tab-separated-values",
-        "json" | "jsonl" => "application/json",
-        "xml" => "application/xml",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "js" => "text/javascript",
-        "ts" => "text/typescript",
-        "sql" => "application/sql",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
-        "m4a" => "audio/mp4",
-        "flac" => "audio/flac",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "mkv" => "video/x-matroska",
-        "zip" => "application/zip",
-        "gz" => "application/gzip",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        _ => "application/octet-stream",
-    }
-}
-
-fn image_dimensions(bytes: &[u8], extension: &str) -> Option<(i64, i64)> {
-    let pair = match extension {
-        "png" if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" => {
-            Some((u32::from_be_bytes(bytes[16..20].try_into().ok()?), u32::from_be_bytes(bytes[20..24].try_into().ok()?)))
-        }
-        "gif" if bytes.len() >= 10 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") => {
-            Some((u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32, u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32))
-        }
-        "bmp" if bytes.len() >= 26 && &bytes[..2] == b"BM" => {
-            Some((u32::from_le_bytes(bytes[18..22].try_into().ok()?), u32::from_le_bytes(bytes[22..26].try_into().ok()?)))
-        }
-        "webp" if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" && &bytes[12..16] == b"VP8X" => {
-            let width = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
-            let height = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
-            Some((width, height))
-        }
-        "jpg" | "jpeg" => jpeg_dimensions(bytes),
-        _ => None,
-    }?;
-    (pair.0 > 0 && pair.1 > 0).then_some((pair.0 as i64, pair.1 as i64))
-}
-
-fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 4 || bytes[..2] != [0xff, 0xd8] {
-        return None;
-    }
-    let mut offset = 2usize;
-    while offset + 4 <= bytes.len() {
-        while offset < bytes.len() && bytes[offset] == 0xff {
-            offset += 1;
-        }
-        let marker = *bytes.get(offset)?;
-        offset += 1;
-        if matches!(marker, 0xd8 | 0xd9) {
-            continue;
-        }
-        let length = u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
-        if length < 2 || offset + length > bytes.len() {
-            return None;
-        }
-        if matches!(marker, 0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf) && length >= 7 {
-            let height = u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().ok()?) as u32;
-            let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32;
-            return Some((width, height));
-        }
-        offset += length;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-
-    #[test]
-    fn reads_basic_raster_dimensions_without_decoding_pixels() {
-        let mut png = vec![0u8; 24];
-        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
-        png[16..20].copy_from_slice(&640u32.to_be_bytes());
-        png[20..24].copy_from_slice(&480u32.to_be_bytes());
-        assert_eq!(image_dimensions(&png, "png"), Some((640, 480)));
-
-        let mut gif = b"GIF89a".to_vec();
-        gif.extend_from_slice(&320u16.to_le_bytes());
-        gif.extend_from_slice(&200u16.to_le_bytes());
-        assert_eq!(image_dimensions(&gif, "gif"), Some((320, 200)));
-    }
 
     #[test]
     fn open_reconcile_indexes_markdown() {

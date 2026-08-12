@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
-import { Text } from "@codemirror/state";
+import { EditorState, Text } from "@codemirror/state";
 import { frontmatterFoldRange } from "../ui/src/editor";
 import { DeferredDocumentWork, type TimerHandle } from "../ui/src/edit-scheduler";
 import { frontmatterForDecorations } from "../ui/src/yaml-booleans";
@@ -24,9 +24,42 @@ import { canPersistSession } from "../ui/src/session-guard";
 import { vaultChangeTouchesFileTree } from "../ui/src/vault-change";
 import { previewPatchWindow } from "../ui/src/preview-patch";
 import { parseVimrc } from "../ui/src/vimrc";
-import { layoutGraph } from "../ui/src/graph-view";
-import { parseCanvas, serializeCanvas } from "../ui/src/canvas-view";
+import { graphRelationships, layoutGraph, selectGraphData } from "../ui/src/graph-view";
+import {
+  canvasNodeAnchor,
+  duplicateCanvasSelection,
+  parseCanvas,
+  resizedCanvasNodeSize,
+  serializeCanvas,
+} from "../ui/src/canvas-view";
 import { resizedKanbanLaneWidth } from "../ui/src/kanban-resize";
+import { captureLogicalWindowGeometry } from "../ui/src/window-state";
+import { livePreviewSourceLines } from "../ui/src/live-preview";
+import {
+  attachmentCategory,
+  formatAttachmentBytes,
+  selectAttachments,
+} from "../ui/src/attachment-inventory";
+import {
+  DEFAULT_TASK_VIEW,
+  normalizeTaskScope,
+  groupTasks,
+  selectTasks,
+  taskScopeIsActive,
+  updateTaskMetadataLine,
+} from "../ui/src/task-dashboard";
+import { filterCommands } from "../ui/src/command-bar";
+import { normalizeShortcut } from "../ui/src/shortcuts";
+import {
+  automationVariables,
+  expandAutomationText,
+  validateAutomationConfig,
+} from "../ui/src/automation";
+import {
+  permissionForPluginMethod,
+  validatePluginDescriptor,
+  type PluginDescriptor,
+} from "../ui/src/plugin-host";
 import { findInKanbanLane, kanbanCardSearchText } from "../ui/src/kanban-find";
 import {
   bindScrollSync,
@@ -86,7 +119,10 @@ test("vimrc compatibility evaluates conditionals, variables, execute, and comman
 
 test("graph layout is deterministic and bounded", () => {
   const graph = {
-    nodes: [{ path: "A.md", title: "A" }, { path: "B.md", title: "B" }],
+    nodes: [
+      { path: "A.md", title: "A", tags: [] },
+      { path: "B.md", title: "B", tags: [] },
+    ],
     edges: [{ source: "A.md", target: "B.md", embeds: false }],
   };
   const first = layoutGraph(graph, 500, 300);
@@ -96,6 +132,49 @@ test("graph layout is deterministic and bounded", () => {
     assert.ok(point.x >= 18 && point.x <= 482);
     assert.ok(point.y >= 18 && point.y <= 282);
   }
+});
+
+test("local graph honors depth, direction, folders, tags, and explicit expansion", () => {
+  const graph = {
+    nodes: [
+      { path: "Projects/A.md", title: "A", tags: ["work"] },
+      { path: "Projects/B.md", title: "B", tags: ["work", "active"] },
+      { path: "Projects/C.md", title: "C", tags: ["work"] },
+      { path: "People/D.md", title: "D", tags: ["person"] },
+    ],
+    edges: [
+      { source: "Projects/A.md", target: "Projects/B.md", embeds: false },
+      { source: "Projects/B.md", target: "Projects/C.md", embeds: false },
+      { source: "People/D.md", target: "Projects/A.md", embeds: false },
+    ],
+  };
+  const outgoing = selectGraphData(graph, {
+    scope: "local", focus: "Projects/A.md", depth: 2, direction: "outgoing",
+  });
+  assert.deepEqual(new Set(outgoing.nodes.map((node) => node.path)), new Set([
+    "Projects/A.md", "Projects/B.md", "Projects/C.md",
+  ]));
+  const incoming = selectGraphData(graph, {
+    scope: "local", focus: "Projects/A.md", depth: 1, direction: "incoming",
+  });
+  assert.deepEqual(new Set(incoming.nodes.map((node) => node.path)), new Set([
+    "Projects/A.md", "People/D.md",
+  ]));
+  const filtered = selectGraphData(graph, {
+    scope: "global", depth: 1, direction: "both", folder: "Projects", tag: "active",
+  });
+  assert.deepEqual(filtered.nodes.map((node) => node.path), ["Projects/B.md"]);
+  const expanded = selectGraphData(graph, {
+    scope: "local", focus: "Projects/A.md", depth: 0, direction: "both",
+    expanded: new Set(["Projects/B.md"]),
+  });
+  assert.deepEqual(new Set(expanded.nodes.map((node) => node.path)), new Set([
+    "Projects/A.md", "Projects/B.md", "Projects/C.md",
+  ]));
+  assert.deepEqual(graphRelationships(graph, "Projects/A.md"), {
+    incoming: [{ source: "People/D.md", target: "Projects/A.md", embeds: false }],
+    outgoing: [{ source: "Projects/A.md", target: "Projects/B.md", embeds: false }],
+  });
 });
 
 test("canvas parsing preserves Obsidian fields while serializing edits", () => {
@@ -110,6 +189,35 @@ test("canvas parsing preserves Obsidian fields while serializing edits", () => {
   assert.equal(roundTrip.nodes[0].subpath, "#Heading");
   assert.equal(roundTrip.nodes[0].x, 42);
   assert.equal(roundTrip.metadata.preserved, true);
+});
+
+test("canvas card resizing respects zoom and minimum dimensions", () => {
+  assert.deepEqual(resizedCanvasNodeSize(300, 180, 100, 40, 2), { width: 350, height: 200 });
+  assert.deepEqual(resizedCanvasNodeSize(100, 60, -200, -100, 1), { width: 80, height: 48 });
+});
+
+test("canvas selection duplication preserves internal edges and offsets nodes", () => {
+  const document = parseCanvas(JSON.stringify({
+    nodes: [
+      { id: "a", type: "text", x: 10, y: 20, width: 100, height: 60, text: "A" },
+      { id: "b", type: "text", x: 200, y: 20, width: 100, height: 60, text: "B" },
+      { id: "c", type: "text", x: 400, y: 20, width: 100, height: 60, text: "C" },
+    ],
+    edges: [
+      { id: "ab", fromNode: "a", toNode: "b", fromSide: "right", label: "kept" },
+      { id: "bc", fromNode: "b", toNode: "c", label: "excluded" },
+    ],
+  }));
+  const duplicated = duplicateCanvasSelection(document, new Set(["a", "b"]), 40);
+  assert.equal(duplicated.nodes.length, 2);
+  assert.equal(duplicated.edges.length, 1);
+  assert.equal(duplicated.edges[0].label, "kept");
+  assert.equal(duplicated.nodes[0].x, 50);
+  assert.ok(duplicated.selected.has(duplicated.nodes[1].id));
+  assert.deepEqual(
+    canvasNodeAnchor(document.nodes[0], "right", { x: 500, y: 20 }),
+    { x: 110, y: 50 },
+  );
 });
 
 test("date and time shortcuts insert distinct local ISO components", () => {
@@ -369,6 +477,29 @@ test("YAML frontmatter exposes a source fold without consuming the Markdown body
   assert.deepEqual(range, { from: 3, to: 33 });
   assert.equal(doc.sliceString(range!.to), "---\n# Body");
   assert.equal(frontmatterFoldRange(Text.of(["# Body", "---"])), null);
+});
+
+test("live preview leaves every selected line as editable source", () => {
+  const state = EditorState.create({
+    doc: "# Heading\n**rendered**\nselection spans\nthree lines",
+    selection: { anchor: 12, head: 39 },
+  });
+  assert.deepEqual([...livePreviewSourceLines(state)], [2, 3, 4]);
+});
+
+test("attachment inventory filters orphans and sorts by size", () => {
+  const rows = [
+    { path: "media/photo.png", name: "photo.png", file_kind: "image", mime_type: "image/png", size_bytes: 4000, width: 100, height: 80, reference_count: 2, orphaned: false, text_indexed: false },
+    { path: "exports/data.csv", name: "data.csv", file_kind: "other", mime_type: "text/csv", size_bytes: 8000, width: null, height: null, reference_count: 0, orphaned: true, text_indexed: true },
+  ];
+  assert.equal(attachmentCategory(rows[1].mime_type), "document");
+  assert.equal(formatAttachmentBytes(2048), "2.0 KiB");
+  assert.deepEqual(selectAttachments(rows, {
+    query: "data",
+    kind: "all",
+    orphanedOnly: true,
+    sort: "size",
+  }).map((row) => row.path), ["exports/data.csv"]);
 });
 
 class FakeScroller extends EventTarget {
@@ -676,6 +807,127 @@ test("Kanban lane resizing responds continuously from the first pixel", () => {
     resizedKanbanLaneWidth({ startWidth: 590, pointerDelta: 30 }),
     600,
     "the maximum width remains enforced",
+  );
+});
+
+test("window persistence restores the same inner height without frame drift", async () => {
+  let innerSizeReads = 0;
+  const geometry = await captureLogicalWindowGeometry({
+    outerPosition: async () => ({ x: 200, y: 100 }),
+    innerSize: async () => {
+      innerSizeReads += 1;
+      return { width: 2400, height: 1500 };
+    },
+    scaleFactor: async () => 2,
+  });
+
+  assert.equal(innerSizeReads, 1);
+  assert.deepEqual(geometry, { x: 100, y: 50, width: 1200, height: 750 });
+});
+
+test("task views filter, sort, group, and edit metadata without rewriting task text", () => {
+  const base = {
+    task_id: 1, status: "todo", status_char: " ", line: 1, completed: false,
+    scheduled: null, recurrence: null, tags: ["work"], priority: null,
+  };
+  const tasks = [
+    { ...base, path: "Work/A.md", text: "Later", raw_line: "- [ ] Later #work", due: "2026-08-20" },
+    { ...base, task_id: 2, path: "Work/B.md", text: "Today", raw_line: "- [ ] Today #work", due: "2026-08-12", priority: "high" },
+    { ...base, task_id: 3, path: "Home/C.md", text: "Done", raw_line: "- [x] Done", due: null, completed: true, status_char: "x", tags: [] },
+  ];
+  const selected = selectTasks(tasks, {
+    ...DEFAULT_TASK_VIEW,
+    due: "today",
+    priority: "high",
+  }, new Date(2026, 7, 12, 12));
+  assert.deepEqual(selected.map((task) => task.text), ["Today"]);
+  assert.deepEqual([...groupTasks(tasks, "path").keys()], ["Work", "Home"]);
+  assert.deepEqual(
+    [...groupTasks(tasks, "agenda", new Date(2026, 7, 12, 12)).keys()],
+    ["5 · Later", "2 · Today", "6 · No due date"],
+  );
+  assert.deepEqual(selectTasks(tasks, {
+    ...DEFAULT_TASK_VIEW,
+    completion: "all",
+    status: "x",
+  }).map((task) => task.text), ["Done"]);
+  assert.equal(
+    updateTaskMetadataLine("- [ ] Today #work 🔁 every week 📅 2026-08-12 ^keep", {
+      due: "2026-08-15", scheduled: "2026-08-14", priority: "highest",
+    }),
+    "- [ ] Today #work 🔁 every week 🔺 ⏳ 2026-08-14 📅 2026-08-15 ^keep",
+  );
+});
+
+test("task scope normalizes folders, tags, and opt-in frontmatter property", () => {
+  const scope = normalizeTaskScope({
+    folders: ["/Projects/", "Projects", " Work "],
+    tags: ["#task", "task", "todo"],
+    property: " tasks ",
+  });
+  assert.deepEqual(scope, { folders: ["Projects", "Work"], tags: ["task", "todo"], property: "tasks" });
+  assert.equal(taskScopeIsActive(scope), true);
+  assert.equal(taskScopeIsActive(normalizeTaskScope(null)), false);
+});
+
+test("command bar ranks direct and fuzzy matches while preserving command order", () => {
+  const commands = [
+    { id: "tasks", title: "Open tasks", keywords: "todo agenda", run: () => {} },
+    { id: "graph", title: "Open graph", keywords: "links backlinks", run: () => {} },
+    { id: "note", title: "Open: People/Kirk.md", keywords: "note file", run: () => {} },
+  ];
+  assert.equal(filterCommands(commands, "graph")[0].id, "graph");
+  assert.equal(filterCommands(commands, "optsk")[0].id, "tasks");
+  assert.deepEqual(filterCommands(commands, "").map((command) => command.id), ["tasks", "graph", "note"]);
+});
+
+test("shortcut assignments normalize cross-platform modifier aliases", () => {
+  assert.equal(normalizeShortcut("control + shift + f"), "Ctrl+Shift+F");
+  assert.equal(normalizeShortcut("cmd+p"), "Meta+P");
+  assert.equal(normalizeShortcut("mod + alt + k"), "Mod+Alt+K");
+});
+
+test("native automations validate macros and expand prompts, functions, dates, and active-note fields", () => {
+  const config = validateAutomationConfig({
+    version: 1,
+    functions: { line: "- {{date:YYYY-MM-DD}} {{value}} @ {{active.title}}" },
+    commands: [{
+      id: "capture",
+      name: "Capture",
+      prompts: [{ name: "value", label: "Text" }],
+      actions: [{ type: "append", path: "Inbox.md", content: "{{function:line}}\n" }],
+    }],
+    lifecycle: { onVaultOpen: [] },
+  });
+  const variables = { ...automationVariables("Projects/Nephrite.md", "selected"), value: "Ship it" };
+  assert.equal(config.commands[0].id, "capture");
+  assert.equal(
+    expandAutomationText("{{function:line}}", variables, config.functions, new Date(2026, 7, 12, 9, 30)),
+    "- 2026-08-12 Ship it @ Nephrite",
+  );
+  assert.throws(() => validateAutomationConfig({ ...config, lifecycle: { onNoteOpen: ["missing"] } }), /unknown command/);
+});
+
+test("plugin descriptors require a compatible API and methods map to explicit permissions", () => {
+  const plugin: PluginDescriptor = {
+    id: "daily.capture",
+    name: "Daily Capture",
+    version: "1.2.0",
+    description: "",
+    permissions: ["vault.read", "workspace.commands"],
+    api_version: 1,
+    min_app_version: null,
+    source: "nephrite.onLoad(() => {});",
+  };
+  assert.equal(validatePluginDescriptor(plugin), null);
+  assert.equal(permissionForPluginMethod("vault.read"), "vault.read");
+  assert.equal(permissionForPluginMethod("workspace.registerCommand"), "workspace.commands");
+  assert.equal(permissionForPluginMethod("host.secret"), null);
+  assert.match(validatePluginDescriptor({ ...plugin, api_version: 2 }) || "", /plugin API 2/);
+  assert.match(validatePluginDescriptor({ ...plugin, id: "../escape" }) || "", /Invalid plugin id/);
+  assert.match(
+    validatePluginDescriptor({ ...plugin, permissions: ["vault.read", "vault.read"] }) || "",
+    /Duplicate/,
   );
 });
 

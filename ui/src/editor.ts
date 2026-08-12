@@ -45,6 +45,7 @@ import { formatTimestampPart, type TimestampPart } from "./timestamp-shortcuts";
 import { wikilinkPlugin, wikilinkAt } from "./wikilinks";
 import { sectionBreakPlugin } from "./section-breaks";
 import { yamlBooleanPlugin } from "./yaml-booleans";
+import { livePreviewPlugin } from "./live-preview";
 import { parseVimrc, type ParsedVimrc } from "./vimrc";
 import { wikilinkCompletionSource } from "./wikilink-completion";
 import type { FileEntry, UserVimrc } from "./types";
@@ -81,6 +82,7 @@ export function frontmatterFoldRange(
 export class NephriteEditor {
   readonly view: EditorView;
   private vimCompartment = new Compartment();
+  private livePreviewCompartment = new Compartment();
   private vimOn = false;
   private suppressDirty = false;
   private callbacks: EditorCallbacks;
@@ -156,6 +158,7 @@ export class NephriteEditor {
       : [];
     return [
       this.vimCompartment.of(this.vimOn ? vim({ status: config.showStatus }) : []),
+      this.livePreviewCompartment.of([]),
       this.mswinKeymapExtension(),
       this.vimrcAbbreviationExtension(),
       EditorState.tabSize.of(config.tabSize),
@@ -559,6 +562,13 @@ export class NephriteEditor {
       ),
     });
     if (on) this.applyVimrcCommands();
+  }
+
+  setLivePreview(on: boolean) {
+    this.view.dispatch({
+      effects: this.livePreviewCompartment.reconfigure(on ? livePreviewPlugin : []),
+    });
+    this.view.dom.classList.toggle("cm-live-preview", on);
   }
 
   openFind() {

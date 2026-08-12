@@ -81,6 +81,30 @@ import { bindQueryUriLinks } from "./query-uri";
 import { vaultChangeTouchesFileTree } from "./vault-change";
 import { CanvasView, serializeCanvas } from "./canvas-view";
 import { renderGraph } from "./graph-view";
+import { renderCommandBar, type AppCommand } from "./command-bar";
+import {
+  PluginManager,
+  type PluginDescriptor,
+  type PluginViewResult,
+} from "./plugin-host";
+import {
+  DEFAULT_TASK_VIEW,
+  DEFAULT_TASK_SCOPE,
+  groupTasks,
+  normalizeTaskScope,
+  selectTasks,
+  taskScopeIsActive,
+  updateTaskMetadataLine,
+  type TaskView,
+} from "./task-dashboard";
+import { ShortcutRegistry, shortcutFromEvent } from "./shortcuts";
+import {
+  automationVariables,
+  expandAutomationText,
+  validateAutomationConfig,
+  type AutomationAction,
+  type AutomationConfig,
+} from "./automation";
 import { findInKanbanLane, normalizePageFindQuery } from "./kanban-find";
 import type {
   FileEntry,
@@ -99,6 +123,7 @@ import type {
   VaultOpenPlan,
   VaultOpenProgress,
   ViewMode,
+  TaskScope,
 } from "./types";
 import "./styles.css";
 
@@ -108,6 +133,8 @@ const PROPERTIES_FOLD_KEY_PREFIX = "nephrite.propertiesFold.v1:";
 const PAGE_VIEW_KEY_PREFIX = "nephrite.pageView.v1:";
 const EDITOR_FOLD_KEY_PREFIX = "nephrite.editorFolds.v1:";
 const KANBAN_WIDTH_KEY_PREFIX = "nephrite.kanbanWidths.v1:";
+const TASK_VIEWS_KEY = "nephrite.taskViews.v1";
+const TASK_SCOPE_KEY = "nephrite.taskScope.v1";
 const SIDEBAR_COLLAPSED_KEY = "nephrite.sidebarCollapsed";
 const AUTOSAVE_DELAY_MS = 800;
 // A sub-half-second gap is normal thinking/typing cadence, not a completed edit.
@@ -131,6 +158,12 @@ type SessionState = {
 let editor: NephriteEditor | null = null;
 let excalidrawView: import("./excalidraw-view").ExcalidrawView | null = null;
 let canvasView: CanvasView | null = null;
+let pluginManager: PluginManager | null = null;
+const shortcuts = new ShortcutRegistry();
+let taskScope: TaskScope = loadTaskScope();
+let vaultFilesAll: FileEntry[] = [];
+let automationConfig: AutomationConfig | null = null;
+let automationRunning = new Set<string>();
 let currentPath: string | null = null;
 let currentFileKind = "markdown";
 let drawingContent = "";
@@ -390,9 +423,27 @@ async function restoreSession(vaultRoot: string) {
 }
 
 function normalizeMode(raw: string | null): ViewMode {
-  if (raw === "live") return "split"; // old "live" was broken reading-only
-  if (raw === "source" || raw === "preview" || raw === "split") return raw;
-  return "split";
+  if (raw === "source" || raw === "live" || raw === "preview" || raw === "split") return raw;
+  return "live";
+}
+
+function loadTaskScope(): TaskScope {
+  try {
+    return normalizeTaskScope(JSON.parse(localStorage.getItem(TASK_SCOPE_KEY) || "{}"));
+  } catch {
+    return { ...DEFAULT_TASK_SCOPE };
+  }
+}
+
+function saveTaskScopePreferences() {
+  taskScope = normalizeTaskScope({
+    folders: ($("task-scope-folders") as HTMLInputElement).value.split(","),
+    tags: ($("task-scope-tags") as HTMLInputElement).value.split(","),
+    property: ($("task-scope-property") as HTMLInputElement).value.replace(/[^A-Za-z0-9_.-]/g, ""),
+  });
+  localStorage.setItem(TASK_SCOPE_KEY, JSON.stringify(taskScope));
+  ($("task-scope-property") as HTMLInputElement).value = taskScope.property;
+  setTransientStatus(taskScopeIsActive(taskScope) ? "Task scope saved" : "Task scope cleared; all checkboxes included", "#5ecf9a");
 }
 
 /** Folder paths the user has explicitly expanded. Empty = everything rolled up. */
@@ -446,8 +497,10 @@ async function renderShell() {
       <div class="actions">
         <button type="button" id="btn-today" title="Jump to today's journal" disabled>Today</button>
         <button type="button" id="btn-save" disabled title="Save (Ctrl/Cmd+S)">Save</button>
+        <button type="button" id="btn-command" title="Command bar (Ctrl+P)">Command</button>
         <div class="seg" role="group" aria-label="View mode">
           <button type="button" data-mode="source" class="seg-btn" title="Source only">Source</button>
+          <button type="button" data-mode="live" class="seg-btn" title="Live preview editor">Live</button>
           <button type="button" data-mode="split" class="seg-btn" title="Edit + preview">Split</button>
           <button type="button" data-mode="preview" class="seg-btn" title="Preview only">Preview</button>
         </div>
@@ -487,6 +540,26 @@ async function renderShell() {
               <input type="checkbox" id="external-browser-toggle" ${externalLinksInBrowser ? "checked" : ""} />
               <span>Open external links in browser</span>
             </label>
+            <section class="preferences-section">
+              <strong>Task scope</strong>
+              <small>Only checkboxes matching at least one configured rule appear in Tasks. Leave all fields empty to include every checkbox.</small>
+              <input type="text" id="task-scope-folders" placeholder="Folders: Projects, Work" />
+              <input type="text" id="task-scope-tags" placeholder="Tags: task, todo" />
+              <input type="text" id="task-scope-property" placeholder="Frontmatter property: tasks" />
+              <button type="button" id="task-scope-save">Save task scope</button>
+            </section>
+            <section class="preferences-section">
+              <strong>Plugins</strong>
+              <div id="preferences-plugins" class="preferences-plugins"></div>
+              <button type="button" id="preferences-plugin-reload">Reload plugins</button>
+            </section>
+            <section class="preferences-section">
+              <strong>Automation</strong>
+              <small id="preferences-automation-status">No automation configuration loaded.</small>
+              <button type="button" id="preferences-automation-reload">Reload .nephrite/automations.json</button>
+              <button type="button" id="preferences-automation-create">Create example configuration</button>
+            </section>
+            <button type="button" id="preferences-hotkeys" class="preferences-action"><span>Keyboard shortcuts…</span></button>
             <button type="button" id="btn-refresh" class="preferences-action" disabled>${activityIcon("refresh")}<span>Rescan Vault</span></button>
           </div>
         </section>
@@ -539,9 +612,19 @@ async function renderShell() {
             <div class="canvas-toolbar">
               <button type="button" id="canvas-add-text">+ Text</button>
               <button type="button" id="canvas-add-file">+ Note</button>
+              <button type="button" id="canvas-add-link">+ Link</button>
+              <button type="button" id="canvas-add-group">+ Group</button>
               <button type="button" id="canvas-connect">Connect</button>
+              <button type="button" id="canvas-edit-edge">Edit edge</button>
+              <button type="button" id="canvas-copy">Copy</button>
+              <button type="button" id="canvas-paste">Paste</button>
+              <button type="button" id="canvas-duplicate">Duplicate</button>
               <button type="button" id="canvas-delete">Delete selected</button>
-              <span>Double-click empty space to add text · drag cards to move · Connect then click target</span>
+              <input type="color" id="canvas-color" value="#5ecf9a" title="Selected card color" aria-label="Selected card color" />
+              <button type="button" id="canvas-zoom-out" title="Zoom out">−</button>
+              <button type="button" id="canvas-zoom-reset" title="Reset zoom">100%</button>
+              <button type="button" id="canvas-zoom-in" title="Zoom in">+</button>
+              <span>Double-click empty space to add text · drag and resize cards · Connect then click target</span>
             </div>
             <div id="canvas-host" tabindex="0"></div>
           </div>
@@ -592,47 +675,44 @@ async function renderShell() {
     const path = window.prompt("Vault-relative note path", currentPath?.replace(/\.canvas$/i, ".md") ?? "");
     if (path?.trim()) canvasView?.addFile(path.trim());
   });
+  $("canvas-add-link").addEventListener("click", () => {
+    const url = window.prompt("Link URL", "https://");
+    if (!url?.trim()) return;
+    const label = window.prompt("Card label", url.trim()) || url.trim();
+    canvasView?.addLink(url.trim(), label);
+  });
+  $("canvas-add-group").addEventListener("click", () => {
+    const label = window.prompt("Group label", "Group")?.trim();
+    if (label) canvasView?.addGroup(label);
+  });
   $("canvas-delete").addEventListener("click", () => canvasView?.deleteSelected());
+  $("canvas-edit-edge").addEventListener("click", () => {
+    if (!canvasView?.editSelectedEdge()) setTransientStatus("Select a canvas edge first", "#e9ad55");
+  });
+  $("canvas-copy").addEventListener("click", () => canvasView?.copySelection());
+  $("canvas-paste").addEventListener("click", () => canvasView?.pasteCopied());
+  $("canvas-duplicate").addEventListener("click", () => canvasView?.duplicateSelected());
   $("canvas-connect").addEventListener("click", () => {
     if (!canvasView?.beginConnect()) setTransientStatus("Select a canvas node first", "#e9ad55");
   });
+  $("canvas-color").addEventListener("input", (event) => {
+    canvasView?.setSelectedColor((event.target as HTMLInputElement).value);
+  });
+  $("canvas-zoom-out").addEventListener("click", () => canvasView?.changeZoom(-0.1));
+  $("canvas-zoom-reset").addEventListener("click", () => canvasView?.resetZoom());
+  $("canvas-zoom-in").addEventListener("click", () => canvasView?.changeZoom(0.1));
   $("btn-template").addEventListener("click", () => void showTemplatePanel());
+  $("btn-command").addEventListener("click", showCommandBar);
   document.addEventListener("keydown", (event) => {
-    if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === "f") {
-      event.preventDefault();
-      event.stopPropagation();
-      const boardVisible = !$("kanban").classList.contains("hidden");
-      if (boardVisible && kanbanBoard) {
-        openKanbanFind();
-      } else if (editor) {
-        if (viewMode === "preview") {
-          setViewMode("split");
-          requestAnimationFrame(() => editor?.openFind());
-        } else {
-          editor.openFind();
-        }
-      }
-      return;
-    }
-    if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === "f") {
-      event.preventDefault();
-      void showSearchPanel();
-      return;
-    }
-    if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
-    const key = event.key.toLowerCase();
-    if (key === "o") {
-      event.preventDefault();
-      event.stopPropagation();
-      $("btn-file-search").click();
-      return;
-    }
-    if (key !== "y") return;
-    if (!$("feature-panel").classList.contains("hidden")) return;
-    if (!currentPath || currentFileKind !== "markdown" || !editor) return;
+    if (event.defaultPrevented) return;
+    const commands = commandCatalog(false);
+    const id = shortcuts.match(event, commands.map((command) => command.id));
+    if (!id) return;
+    const command = commands.find((candidate) => candidate.id === id);
+    if (!command) return;
     event.preventDefault();
     event.stopPropagation();
-    void showTemplatePanel();
+    void Promise.resolve(command.run()).catch((error) => alert(String(error)));
   }, true);
   document.addEventListener("keydown", recordEditorInputTiming, true);
   $("activity-tasks").addEventListener("click", () => void showTasksPanel());
@@ -640,6 +720,14 @@ async function renderShell() {
   $("activity-git").addEventListener("click", () => void showGitPanel());
   $("activity-query-log").addEventListener("click", showQueryLogPanel);
   $("btn-preferences").addEventListener("click", togglePreferences);
+  ($("task-scope-folders") as HTMLInputElement).value = taskScope.folders.join(", ");
+  ($("task-scope-tags") as HTMLInputElement).value = taskScope.tags.join(", ");
+  ($("task-scope-property") as HTMLInputElement).value = taskScope.property;
+  $("task-scope-save").addEventListener("click", saveTaskScopePreferences);
+  $("preferences-plugin-reload").addEventListener("click", () => void reloadPlugins().then(renderPreferencesPlugins));
+  $("preferences-automation-reload").addEventListener("click", () => void reloadAutomations(true));
+  $("preferences-automation-create").addEventListener("click", () => void createExampleAutomationConfig());
+  $("preferences-hotkeys").addEventListener("click", showHotkeysPanel);
   $("preferences-close").addEventListener("click", closePreferences);
   $("feature-close").addEventListener("click", closeFeaturePanel);
   $("feature-panel").addEventListener("mousedown", (event) => {
@@ -720,6 +808,31 @@ async function renderShell() {
   });
   vimPowerline = new VimPowerlineClient();
   await initEditor();
+  pluginManager = new PluginManager({
+    listFiles: () => mdFilesAll,
+    readFile: async (path) => (await invoke<OpenFile>("read_file", { path })).content,
+    writeFile: async (path, content) => {
+      if (path === currentPath && dirty) throw new Error("Save or discard current edits before a plugin writes this file");
+      await invoke("write_file", { path, content });
+      if (path === currentPath) await openNote(path, { skipDirtyPrompt: true });
+      await refreshTree();
+    },
+    queryIndex: (sql) => invoke("query_vault_sql", { sql }),
+    editorState: () => ({
+      path: currentPath,
+      content: currentFileKind === "markdown" ? editor?.getDoc() ?? "" : "",
+      selection: currentFileKind === "markdown" ? editor?.getSelection() ?? "" : "",
+    }),
+    replaceSelection: (content) => {
+      if (currentFileKind !== "markdown" || !editor) throw new Error("No Markdown editor is active");
+      editor.replaceSelection(content);
+    },
+    openPath: (path) => openNote(path),
+    showView: showPluginView,
+    executeShell: (command, args) => invoke("shell_command", {
+      command: [command, ...args].map(shellArgument).join(" "), cwd: null, timeoutMs: 60_000,
+    }),
+  }, renderPreferencesPlugins);
   canvasView = new CanvasView(
     $("canvas-host"),
     (source) => {
@@ -829,6 +942,7 @@ function togglePreferences() {
   $("btn-preferences").classList.toggle("active", opening);
   if (opening) {
     if (!$("feature-panel").classList.contains("hidden")) closeFeaturePanel();
+    renderPreferencesPlugins();
     (popover.querySelector("button, input") as HTMLElement | null)?.focus();
   }
 }
@@ -850,7 +964,7 @@ function setViewMode(mode: ViewMode) {
   }
   syncModeButtons();
   applyViewMode();
-  if (mode !== "source" && editor) {
+  if ((mode === "split" || mode === "preview") && editor) {
     schedulePreview(editor.getDoc());
   } else {
     previewRevision++;
@@ -873,6 +987,7 @@ function syncModeButtons() {
 function applyViewMode() {
   const panes = $("panes");
   panes.className = `panes mode-${viewMode}`;
+  editor?.setLivePreview(viewMode === "live");
   applyPaneSplit();
 }
 
@@ -976,7 +1091,7 @@ function schedulePreviewRead(read: () => string) {
   const revision = ++previewRevision;
   previewWork.cancel();
   previewRenderer.cancel();
-  if (viewMode === "source") return;
+  if (viewMode === "source" || viewMode === "live") return;
   previewWork.schedule(read, (text) => {
     void renderRightPane(text, revision);
   });
@@ -1275,7 +1390,8 @@ async function renderDynamicPreview(
 }
 
 function isPreviewRevisionCurrent(path: string, revision: number): boolean {
-  return revision === previewRevision && currentPath === path && viewMode !== "source";
+  return revision === previewRevision && currentPath === path &&
+    (viewMode === "split" || viewMode === "preview");
 }
 
 function renderKanbanBoard(board: KanbanBoard) {
@@ -1926,8 +2042,11 @@ async function openVaultPath(path: string) {
   updateChrome();
   renderTabBar();
   await refreshTree();
+  await reloadPlugins(info.root);
+  await reloadAutomations();
   // Restore tabs + active note + right pane from last session for this vault.
   await restoreSession(path);
+  await runAutomationLifecycle("onVaultOpen");
 }
 
 function showIndexProgress(action: string) {
@@ -1945,7 +2064,8 @@ function hideIndexProgress() {
 
 async function refreshTree() {
   const files = await invoke<FileEntry[]>("list_files");
-  mdFilesAll = files
+  vaultFilesAll = files.sort((a, b) => a.path.localeCompare(b.path));
+  mdFilesAll = vaultFilesAll
     .filter((f) => f.file_kind === "markdown" || f.file_kind === "excalidraw" || f.file_kind === "canvas")
     .sort((a, b) => a.path.localeCompare(b.path));
   editor?.setCompletionFiles(mdFilesAll);
@@ -1999,6 +2119,19 @@ async function selectFileFilterMatch(path: string) {
 
   await openNote(path);
   focusActiveDocumentPane();
+}
+
+async function openVaultEntry(path: string) {
+  const entry = vaultFilesAll.find((file) => file.path === path);
+  if (!entry || isDocumentEntry(entry)) {
+    await openNote(path);
+  } else {
+    await invoke("open_with_default_app", { path });
+  }
+}
+
+function isDocumentEntry(entry: FileEntry): boolean {
+  return ["markdown", "excalidraw", "canvas"].includes(entry.file_kind);
 }
 
 function focusActiveDocumentPane() {
@@ -2104,7 +2237,8 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
     } else {
       await openNote(currentPath, { skipDirtyPrompt: true });
     }
-  } else if (currentPath && currentFileKind === "markdown" && viewMode !== "source") {
+  } else if (currentPath && currentFileKind === "markdown" &&
+      (viewMode === "split" || viewMode === "preview")) {
     // SQL and Dataview results may depend on any page in the vault.
     // Do not invalidate a query already rendering. External scripts can update
     // the vault continuously; cancelling on every watcher event can otherwise
@@ -2134,7 +2268,7 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
 }
 
 function rebuildVisibleTree() {
-  mdFiles = visibleFiles(mdFilesAll, showDotfiles);
+  mdFiles = visibleFiles(vaultFilesAll, showDotfiles);
   treeRoot = buildTree(mdFiles);
   renderTree();
 }
@@ -2188,7 +2322,7 @@ function renderNode(node: TreeNode, depth: number, revealForFilter: boolean): HT
     btn.textContent = node.name.replace(/\.md$/i, "");
     btn.title = node.path;
     btn.dataset.path = node.path;
-    btn.addEventListener("click", () => void openNote(node.path));
+    btn.addEventListener("click", () => void openVaultEntry(node.path));
     bindCtx(btn, { kind: "file", path: node.path });
     return btn;
   }
@@ -2322,6 +2456,7 @@ async function openNote(
   renderTabBar();
   if (currentFileKind === "markdown") schedulePreview(file.content);
   saveSession();
+  await runAutomationLifecycle("onNoteOpen");
 }
 
 function showDrawingWorkspace(active: boolean) {
@@ -2441,6 +2576,7 @@ async function performSave(automatic: boolean) {
   );
   if (unchanged) dirty = false;
   updateChrome();
+  await runAutomationLifecycle("onNoteSave");
   if (!automatic) setTransientStatus(`Saved ${path}`, "#5ecf9a");
   if (!unchanged) scheduleAutosave();
   if (automatic) return;
@@ -2647,6 +2783,353 @@ async function showGraphPanel() {
   }
 }
 
+function shellArgument(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+async function reloadPlugins(vaultRoot?: string) {
+  if (!pluginManager || !vaultOpen) return;
+  const root = vaultRoot ?? localStorage.getItem(LAST_VAULT_KEY) ?? "vault";
+  try {
+    const descriptors = await invoke<PluginDescriptor[]>("list_plugins");
+    await pluginManager.load(descriptors, root);
+    renderPreferencesPlugins();
+  } catch (error) {
+    setTransientStatus(`Plugin loader: ${String(error)}`, "#e9ad55");
+  }
+}
+
+const AUTOMATION_CONFIG_PATH = ".nephrite/automations.json";
+
+async function reloadAutomations(report = false) {
+  automationConfig = null;
+  try {
+    const file = await invoke<OpenFile>("read_file", { path: AUTOMATION_CONFIG_PATH });
+    automationConfig = validateAutomationConfig(JSON.parse(file.content));
+    for (const command of automationConfig.commands) {
+      if (command.shortcut && !shortcuts.get(`automation:${command.id}`)) {
+        shortcuts.set(`automation:${command.id}`, command.shortcut);
+      }
+    }
+    if (report) setTransientStatus(`Loaded ${automationConfig.commands.length} automation commands`, "#5ecf9a");
+  } catch (error) {
+    if (report) setTransientStatus(`Automation configuration: ${String(error)}`, "#e9ad55");
+  }
+  renderAutomationPreferences();
+}
+
+function renderAutomationPreferences() {
+  const status = document.getElementById("preferences-automation-status");
+  if (!status) return;
+  status.textContent = automationConfig
+    ? `${automationConfig.commands.length} named command${automationConfig.commands.length === 1 ? "" : "s"} loaded.`
+    : `No valid ${AUTOMATION_CONFIG_PATH} found.`;
+}
+
+async function createExampleAutomationConfig() {
+  if (!vaultOpen) return;
+  const example: AutomationConfig = {
+    version: 1,
+    functions: { captureLine: "- {{time}} {{value}}" },
+    commands: [{
+      id: "quick-capture",
+      name: "Quick capture to inbox",
+      description: "Prompt for text and append it to Inbox.md",
+      shortcut: "Mod+Shift+C",
+      prompts: [{ name: "value", label: "Capture" }],
+      actions: [
+        { type: "append", path: "Inbox.md", content: "{{function:captureLine}}\n" },
+        { type: "open", path: "Inbox.md" },
+      ],
+    }],
+    lifecycle: {},
+  };
+  try {
+    await invoke("create_file", { path: AUTOMATION_CONFIG_PATH, content: `${JSON.stringify(example, null, 2)}\n` });
+    await reloadAutomations(true);
+  } catch (error) {
+    setTransientStatus(String(error), "#e9ad55");
+  }
+}
+
+async function runAutomationLifecycle(event: "onVaultOpen" | "onNoteOpen" | "onNoteSave") {
+  const ids = automationConfig?.lifecycle?.[event] ?? [];
+  for (const id of ids) await executeAutomation(id, true).catch((error) => console.error(`[automation] ${event}:${id}`, error));
+}
+
+async function executeAutomation(id: string, lifecycle = false) {
+  const command = automationConfig?.commands.find((candidate) => candidate.id === id);
+  if (!command) throw new Error(`Unknown automation command: ${id}`);
+  if (automationRunning.has(id)) throw new Error(`Recursive automation command: ${id}`);
+  automationRunning.add(id);
+  try {
+    const variables: Record<string, string> = automationVariables(
+      currentPath,
+      currentFileKind === "markdown" ? editor?.getSelection() ?? "" : "",
+    );
+    for (const prompt of command.prompts ?? []) {
+      if (lifecycle) throw new Error(`Lifecycle automation ${id} cannot display prompts`);
+      const fallback = expandAutomationText(prompt.default ?? "", variables, automationConfig?.functions);
+      const value = window.prompt(prompt.label, fallback);
+      if (value == null) return;
+      variables[prompt.name] = value;
+    }
+    for (const action of command.actions) await executeAutomationAction(action, variables);
+    await refreshTree();
+    setTransientStatus(`Automation complete: ${command.name}`, "#5ecf9a");
+  } finally {
+    automationRunning.delete(id);
+  }
+}
+
+async function executeAutomationAction(action: AutomationAction, variables: Record<string, string>) {
+  const expand = (value: string) => expandAutomationText(value, variables, automationConfig?.functions);
+  if (action.type === "notice") {
+    setTransientStatus(expand(action.message), "#5ecf9a");
+    return;
+  }
+  if (action.type === "open") {
+    await openVaultEntry(expand(action.path));
+    return;
+  }
+  if (action.type === "move" || action.type === "rename") {
+    const from = expand(action.from || variables["active.path"] || "");
+    if (!from) throw new Error(`${action.type} needs an active file or explicit source`);
+    const to = expand(action.to);
+    await invoke("rename_path", { from, to });
+    remapOpenPaths(from, to);
+    variables["active.path"] = to;
+    return;
+  }
+  if (action.type === "apply-template") {
+    if (!currentPath || currentFileKind !== "markdown" || !editor) throw new Error("No active Markdown note for template application");
+    const templatePath = expand(action.template);
+    const template = await invoke<OpenFile>("read_file", { path: templatePath });
+    const result = await renderTemplateForCurrent(template.content, currentPath);
+    const application = planTemplateApplication(editor.getDoc(), editor.getSelectionRange(), result.text, result.cursor);
+    editor.applyChanges(application.changes, application.cursor);
+    return;
+  }
+  if (action.type !== "create" && action.type !== "append" && action.type !== "prepend") {
+    throw new Error(`Unsupported automation action: ${String((action as { type?: string }).type)}`);
+  }
+  const path = expand(action.path);
+  const rawContent = typeof action.content === "string" ? action.content : null;
+  const templatePath = action.template ? expand(action.template) : null;
+  const source = templatePath
+    ? (await invoke<OpenFile>("read_file", { path: templatePath })).content
+    : expand(rawContent ?? "");
+  const existing = action.type === "create" ? "" : await readAutomationTarget(path);
+  const rendered = templatePath
+    ? (await renderTemplater(source, automationTemplateContext(path, existing, variables))).text
+    : source;
+  if (action.type === "create") {
+    await invoke("create_file", { path, content: rendered });
+    if (action.open) await openNote(path);
+  } else {
+    const content = action.type === "append" ? `${existing}${rendered}` : `${rendered}${existing}`;
+    await invoke("write_file", { path, content });
+    if (currentPath === path) await openNote(path, { skipDirtyPrompt: true });
+  }
+}
+
+async function readAutomationTarget(path: string): Promise<string> {
+  try {
+    return (await invoke<OpenFile>("read_file", { path })).content;
+  } catch {
+    return "";
+  }
+}
+
+function automationTemplateContext(path: string, content: string, variables: Record<string, string>) {
+  return {
+    path,
+    content,
+    selection: variables.selection ?? "",
+    readFile: async (requested: string) => (await invoke<OpenFile>("read_file", { path: requested })).content,
+    prompt: async (message: string, defaultValue?: string) => window.prompt(message, defaultValue ?? ""),
+  };
+}
+
+function remapOpenPaths(from: string, to: string) {
+  remapBookmarks(from, to, false);
+  if (currentPath === from) currentPath = to;
+  if (rightPath === from) rightPath = to;
+  openTabs = openTabs.map((path) => path === from ? to : path);
+  renderTabBar();
+  saveSession();
+}
+
+function renderPreferencesPlugins() {
+  const host = document.getElementById("preferences-plugins");
+  if (!host) return;
+  host.replaceChildren();
+  const statuses = pluginManager?.statuses() ?? [];
+  if (!vaultOpen) {
+    host.textContent = "Open a vault to load plugins.";
+    return;
+  }
+  if (!statuses.length) {
+    host.textContent = "No plugins installed.";
+    return;
+  }
+  for (const plugin of statuses) {
+    const label = document.createElement("label");
+    label.className = "preferences-plugin";
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.checked = plugin.enabled;
+    const name = document.createElement("span");
+    name.textContent = `${plugin.name} ${plugin.version}`;
+    const state = document.createElement("small");
+    state.textContent = plugin.error || (plugin.loaded ? "Loaded" : plugin.enabled ? "Starting" : "Disabled");
+    toggle.addEventListener("change", () => void pluginManager?.setEnabled(plugin.id, toggle.checked).then(renderPreferencesPlugins));
+    label.append(toggle, name, state);
+    host.appendChild(label);
+  }
+}
+
+function showPluginView(title: string, result: PluginViewResult) {
+  const body = openFeaturePanel(title);
+  const normalized = typeof result === "string" ? { type: "text" as const, content: result } : result ?? {};
+  const content = String(normalized.content ?? "");
+  if (normalized.type === "markdown") {
+    body.classList.add("markdown-preview");
+    body.innerHTML = renderPreview(escapeHtml(content));
+    hydrateTableOfContents(body);
+  } else {
+    const pre = document.createElement("pre");
+    pre.className = "plugin-view-text";
+    pre.textContent = content;
+    body.appendChild(pre);
+  }
+}
+
+function showCommandBar() {
+  const body = openFeaturePanel("Command bar");
+  renderCommandBar(body, commandCatalog(true), closeFeaturePanel);
+}
+
+function openFindCommand() {
+  const boardVisible = !$("kanban").classList.contains("hidden");
+  if (boardVisible && kanbanBoard) openKanbanFind();
+  else if (editor) {
+    if (viewMode === "preview") {
+      setViewMode("split");
+      requestAnimationFrame(() => editor?.openFind());
+    } else editor.openFind();
+  }
+}
+
+function commandCatalog(includeFiles: boolean): AppCommand[] {
+  const commands: AppCommand[] = [
+    { id: "save", title: "Save current file", keywords: "write", run: () => saveFile(false) },
+    { id: "command", title: "Open command bar", keywords: "palette actions", run: showCommandBar },
+    { id: "file-search", title: "Search file names", keywords: "quick open", run: focusFileFilter },
+    { id: "find", title: "Find in current note or board", keywords: "search current", run: openFindCommand },
+    { id: "mode-source", title: "View: Source", keywords: "editor", run: () => setViewMode("source") },
+    { id: "mode-live", title: "View: Live Preview", keywords: "editor rendered markdown", run: () => setViewMode("live") },
+    { id: "mode-split", title: "View: Split", keywords: "editor preview", run: () => setViewMode("split") },
+    { id: "mode-preview", title: "View: Preview", keywords: "render", run: () => setViewMode("preview") },
+    { id: "search", title: "Search vault", keywords: "find", run: showSearchPanel },
+    { id: "graph", title: "Open graph", keywords: "links backlinks local", run: showGraphPanel },
+    { id: "tasks", title: "Open tasks", keywords: "todo agenda", run: showTasksPanel },
+    { id: "bookmarks", title: "Open bookmarks", run: showBookmarksPanel },
+    { id: "git", title: "Open Git history", keywords: "versions source control", run: showGitPanel },
+    { id: "templates", title: "Apply template", keywords: "templater automation", run: showTemplatePanel },
+    { id: "today", title: "Open today's journal", keywords: "daily note", run: openToday },
+    { id: "canvas", title: "Create canvas", run: createCanvas },
+    { id: "drawing", title: "Create Excalidraw drawing", keywords: "draw", run: createDrawing },
+    { id: "sidebar", title: sidebarCollapsed ? "Show file sidebar" : "Hide file sidebar", keywords: "files", run: () => setSidebarCollapsed(!sidebarCollapsed) },
+    { id: "vim", title: vimOn ? "Disable Vim mode" : "Enable Vim mode", run: () => {
+      vimOn = !vimOn;
+      localStorage.setItem(VIM_KEY, vimOn ? "1" : "0");
+      ($("vim-toggle") as HTMLInputElement).checked = vimOn;
+      editor?.setVim(vimOn);
+      updateVimPowerline();
+    } },
+    { id: "preferences", title: "Open preferences", keywords: "settings", run: togglePreferences },
+    { id: "plugins", title: "Preferences: Plugins", keywords: "extensions permissions reload", run: () => {
+      if ($("preferences-popover").classList.contains("hidden")) togglePreferences();
+      renderPreferencesPlugins();
+      document.getElementById("preferences-plugins")?.scrollIntoView({ block: "center" });
+    } },
+    { id: "hotkeys", title: "Preferences: Keyboard shortcuts", keywords: "keys bindings", run: showHotkeysPanel },
+    ...(automationConfig?.commands.map((automation): AppCommand => ({
+      id: `automation:${automation.id}`,
+      title: automation.name,
+      keywords: `${automation.description ?? ""} automation macro capture template`,
+      run: () => executeAutomation(automation.id),
+    })) ?? []),
+    ...(pluginManager?.commands() ?? []),
+    ...(includeFiles ? mdFilesAll
+      .filter((file) => file.file_kind === "markdown")
+      .map((file): AppCommand => ({
+        id: `open:${file.path}`,
+        title: `Open: ${file.path}`,
+        keywords: `note file ${file.name}`,
+        run: () => openNote(file.path),
+      })) : []),
+  ];
+  return commands.map((command) => ({ ...command, shortcut: shortcuts.get(command.id) }));
+}
+
+function showHotkeysPanel() {
+  closePreferences();
+  const body = openFeaturePanel("Keyboard shortcuts");
+  const help = document.createElement("p");
+  help.className = "feature-help";
+  help.textContent = "Click a shortcut field, then press the desired key combination. Conflicting assignments are rejected.";
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.textContent = "Reset defaults";
+  reset.addEventListener("click", () => {
+    if (!confirm("Reset all keyboard shortcuts to their defaults?")) return;
+    shortcuts.reset();
+    showHotkeysPanel();
+  });
+  const list = document.createElement("div");
+  list.className = "hotkey-list";
+  for (const command of commandCatalog(false).sort((left, right) => left.title.localeCompare(right.title))) {
+    const row = document.createElement("div");
+    row.className = "hotkey-row";
+    const label = document.createElement("label");
+    label.textContent = command.title;
+    label.htmlFor = `hotkey-${command.id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+    const input = document.createElement("input");
+    input.id = label.htmlFor;
+    input.readOnly = true;
+    input.value = shortcuts.get(command.id);
+    input.placeholder = "Unassigned";
+    input.addEventListener("keydown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.key === "Escape") { input.blur(); return; }
+      if (event.key === "Backspace" || event.key === "Delete") {
+        shortcuts.set(command.id, "");
+        input.value = "";
+        return;
+      }
+      const value = shortcutFromEvent(event);
+      if (!value) return;
+      const conflict = shortcuts.set(command.id, value);
+      if (conflict) {
+        const other = commandCatalog(false).find((candidate) => candidate.id === conflict)?.title ?? conflict;
+        setTransientStatus(`${value} is already assigned to ${other}`, "#e9ad55");
+        return;
+      }
+      input.value = shortcuts.get(command.id);
+    });
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.textContent = "Clear";
+    clear.addEventListener("click", () => { shortcuts.set(command.id, ""); input.value = ""; });
+    row.append(label, input, clear);
+    list.appendChild(row);
+  }
+  body.append(help, reset, list);
+}
+
 async function createDrawing() {
   const initialFolder = currentPath ? parentDir(currentPath) : "";
   const entered = promptName("New Excalidraw drawing", "Untitled.excalidraw");
@@ -2807,55 +3290,340 @@ async function renderTemplateForCurrent(source: string, targetPath: string, sele
 
 async function showTasksPanel() {
   const body = openFeaturePanel("Tasks");
-  body.innerHTML = `<p class="feature-help">Open tasks across the vault. Checking one edits its Markdown source directly.</p><div class="feature-loading">Loading…</div>`;
+  body.innerHTML = `<div class="feature-loading">Loading indexed tasks…</div>`;
   try {
     if (dirty) await saveFile(true);
-    const tasks = await invoke<TaskRow[]>("list_tasks", { completed: false });
+    let view: TaskView = { ...DEFAULT_TASK_VIEW };
+    let tasks = await loadIndexedTasks(view);
+    let savedViews: TaskView[] = [];
+    try {
+      const parsed = JSON.parse(localStorage.getItem(TASK_VIEWS_KEY) || "[]");
+      if (Array.isArray(parsed)) savedViews = parsed;
+    } catch { /* discard malformed local UI state */ }
+    const selectedTasks = new Set<string>();
+    let renderLimit = 200;
+    body.replaceChildren();
+    const controls = document.createElement("div");
+    controls.className = "task-dashboard-controls";
+    const saved = taskSelect(["", ...savedViews.map((candidate) => candidate.name)], "", "Saved view", "Saved views");
+    const completion = taskSelect(["open", "completed", "all"], view.completion, "Completion");
+    const scope = taskSelect(["global", "all"], view.scope, "Task scope");
+    scope.options[0].textContent = taskScopeIsActive(taskScope) ? "Configured task scope" : "All checkboxes (no scope configured)";
+    scope.options[1].textContent = "Ignore scope for this view";
+    const observedStatuses = [...new Set(tasks.map((task) => task.status_char))];
+    const status = taskStatusSelect(view.status, "Status", true, observedStatuses);
+    const due = taskSelect(["all", "overdue", "today", "week", "none"], view.due, "Due date");
+    const priority = taskSelect(["", "highest", "high", "medium", "low", "lowest"], "", "Priority", "All priorities");
+    const sort = taskSelect(["due", "scheduled", "priority", "path"], view.sort, "Sort tasks");
+    const group = taskSelect(["none", "agenda", "due", "priority", "path"], view.group, "Group tasks");
+    const pathFilter = document.createElement("input");
+    pathFilter.type = "search";
+    pathFilter.placeholder = "Path…";
+    pathFilter.setAttribute("aria-label", "Filter task path");
+    const query = document.createElement("input");
+    query.type = "search";
+    query.placeholder = "Task text or tag…";
+    query.setAttribute("aria-label", "Filter task text or tag");
+    const saveView = document.createElement("button");
+    saveView.type = "button";
+    saveView.textContent = "Save view";
+    const deleteView = document.createElement("button");
+    deleteView.type = "button";
+    deleteView.textContent = "Delete view";
+    deleteView.disabled = true;
+    const summary = document.createElement("span");
+    const bulkStatus = taskStatusSelect("x", "Bulk status", false, observedStatuses);
+    const applyBulk = document.createElement("button");
+    applyBulk.type = "button";
+    applyBulk.textContent = "Apply selected";
+    controls.append(saved, completion, scope, status, due, priority, sort, group, pathFilter, query, saveView, deleteView, bulkStatus, applyBulk, summary);
     const list = document.createElement("div");
     list.className = "task-dashboard";
-    if (!tasks.length) list.innerHTML = `<div class="feature-empty">No open tasks.</div>`;
-    for (const task of tasks) {
-      const row = document.createElement("div");
-      row.className = "task-dashboard-row";
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = task.completed;
-      checkbox.title = "Write task status to Markdown";
-      checkbox.addEventListener("change", () => void (async () => {
-        checkbox.disabled = true;
-        try {
-          await invoke("set_task_completed", {
+    body.append(controls, list);
+
+    const readControls = () => {
+      view = {
+        ...view,
+        completion: completion.value as TaskView["completion"],
+        scope: scope.value as TaskView["scope"],
+        status: status.value,
+        due: due.value as TaskView["due"],
+        priority: priority.value,
+        sort: sort.value as TaskView["sort"],
+        group: group.value as TaskView["group"],
+        path: pathFilter.value,
+        query: query.value,
+      };
+    };
+    const writeControls = () => {
+      completion.value = view.completion;
+      scope.value = view.scope;
+      status.value = view.status || "";
+      due.value = view.due;
+      priority.value = view.priority;
+      sort.value = view.sort;
+      group.value = view.group;
+      pathFilter.value = view.path;
+      query.value = view.query;
+    };
+    const persistViews = () => {
+      localStorage.setItem(TASK_VIEWS_KEY, JSON.stringify(savedViews));
+      saved.replaceChildren(...["", ...savedViews.map((candidate) => candidate.name)].map((name) => {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name || "Saved views";
+        return option;
+      }));
+    };
+    const render = () => {
+      readControls();
+      const selected = selectTasks(tasks, view);
+      const visible = selected.slice(0, renderLimit);
+      const groups = groupTasks(visible, view.group);
+      list.replaceChildren();
+      summary.textContent = `${selected.length} indexed match${selected.length === 1 ? "" : "es"}`;
+      if (!selected.length) list.innerHTML = `<div class="feature-empty">No tasks match this view.</div>`;
+      for (const [label, rows] of groups) {
+        if (view.group !== "none") {
+          const heading = document.createElement("h3");
+          heading.className = "task-dashboard-group";
+          heading.textContent = `${label.replace(/^\d+ · /, "")} (${rows.length})`;
+          list.appendChild(heading);
+        }
+        for (const task of rows) list.appendChild(renderTaskDashboardRow(task, selectedTasks, () => void refreshTasks()));
+      }
+      if (visible.length < selected.length) {
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "task-dashboard-more";
+        more.textContent = `Show ${Math.min(200, selected.length - visible.length)} more (${selected.length - visible.length} remaining)`;
+        more.addEventListener("click", () => { renderLimit += 200; render(); });
+        list.appendChild(more);
+      }
+    };
+    const refreshTasks = async () => {
+      tasks = await loadIndexedTasks(view);
+      selectedTasks.clear();
+      renderLimit = 200;
+      render();
+    };
+    completion.addEventListener("change", () => {
+      readControls();
+      void refreshTasks();
+    });
+    scope.addEventListener("change", () => {
+      readControls();
+      void refreshTasks();
+    });
+    for (const control of [status, due, priority, sort, group]) control.addEventListener("change", render);
+    pathFilter.addEventListener("input", render);
+    query.addEventListener("input", render);
+    saved.addEventListener("change", () => {
+      const selected = savedViews.find((candidate) => candidate.name === saved.value);
+      if (!selected) return;
+      view = { ...DEFAULT_TASK_VIEW, ...selected };
+      writeControls();
+      deleteView.disabled = false;
+      void refreshTasks();
+    });
+    saveView.addEventListener("click", () => {
+      readControls();
+      const name = window.prompt("Saved task view name", view.name || "Task view")?.trim();
+      if (!name) return;
+      view.name = name;
+      const existing = savedViews.findIndex((candidate) => candidate.name === name);
+      if (existing >= 0) savedViews[existing] = { ...view };
+      else savedViews.push({ ...view });
+      persistViews();
+      saved.value = name;
+      deleteView.disabled = false;
+    });
+    deleteView.addEventListener("click", () => {
+      if (!saved.value) return;
+      savedViews = savedViews.filter((candidate) => candidate.name !== saved.value);
+      persistViews();
+      deleteView.disabled = true;
+    });
+    applyBulk.addEventListener("click", () => void (async () => {
+      const selected = tasks
+        .filter((task) => selectedTasks.has(`${task.path}:${task.task_id}`))
+        .sort((left, right) => left.path.localeCompare(right.path) || right.task_id - left.task_id);
+      if (!selected.length) return;
+      applyBulk.disabled = true;
+      try {
+        for (const task of selected) {
+          await invoke("set_task_status", {
             path: task.path,
             taskId: task.task_id,
-            completed: checkbox.checked,
+            status: bulkStatus.value,
           });
-          if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
-          row.remove();
-        } catch (error) {
-          checkbox.checked = !checkbox.checked;
-          checkbox.disabled = false;
-          alert(String(error));
         }
-      })());
-      const text = document.createElement("button");
-      text.type = "button";
-      text.className = "task-dashboard-text";
-      text.textContent = task.text;
-      text.addEventListener("click", () => void (async () => {
-        closeFeaturePanel();
-        await openNote(task.path);
-        editor?.goToLine(task.line);
-      })());
-      const source = document.createElement("span");
-      source.className = "task-dashboard-source";
-      source.textContent = `${task.path}:${task.line}`;
-      row.append(checkbox, text, source);
-      list.appendChild(row);
-    }
-    body.querySelector(".feature-loading")?.replaceWith(list);
+        await refreshTasks();
+        if (currentPath && selected.some((task) => task.path === currentPath)) {
+          await openNote(currentPath, { skipDirtyPrompt: true });
+        }
+      } catch (error) {
+        alert(String(error));
+      } finally {
+        applyBulk.disabled = false;
+      }
+    })());
+    render();
   } catch (error) {
     body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
   }
+}
+
+function loadIndexedTasks(view: TaskView): Promise<TaskRow[]> {
+  const completed = view.completion === "open" ? false : view.completion === "completed" ? true : null;
+  return invoke<TaskRow[]>("list_tasks", {
+    completed,
+    scope: view.scope === "all" || !taskScopeIsActive(taskScope) ? null : taskScope,
+  });
+}
+
+function taskSelect(values: string[], selected: string, label: string, emptyLabel?: string) {
+  const select = document.createElement("select");
+  select.className = "feature-select task-dashboard-select";
+  select.setAttribute("aria-label", label);
+  select.title = label;
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value || emptyLabel || "All";
+    option.selected = value === selected;
+    select.appendChild(option);
+  }
+  return select;
+}
+
+function taskStatusSelect(
+  selected: string,
+  label: string,
+  includeAll = false,
+  extraStatuses: readonly string[] = [],
+) {
+  const options: Array<[string, string]> = [
+    [" ", "Todo [ ]"], ["/", "In progress [/]"], ["-", "Cancelled [-]"],
+    ["?", "Question [?]"], ["!", "Important [!]"], ["x", "Done [x]"],
+  ];
+  const known = new Set(options.map(([value]) => value));
+  for (const value of [...extraStatuses, selected]) {
+    if (value && !known.has(value)) {
+      options.push([value, `Custom [${value}]`]);
+      known.add(value);
+    }
+  }
+  if (includeAll) options.unshift(["", "All statuses"]);
+  const select = document.createElement("select");
+  select.className = "feature-select task-dashboard-select";
+  select.setAttribute("aria-label", label);
+  select.title = label;
+  for (const [value, text] of options) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = text;
+    option.selected = value === selected;
+    select.appendChild(option);
+  }
+  return select;
+}
+
+function renderTaskDashboardRow(
+  task: TaskRow,
+  selectedTasks: Set<string>,
+  rerender: () => void,
+) {
+  const row = document.createElement("div");
+  row.className = "task-dashboard-row";
+  const taskKey = `${task.path}:${task.task_id}`;
+  const selected = document.createElement("input");
+  selected.type = "checkbox";
+  selected.checked = selectedTasks.has(taskKey);
+  selected.title = "Select task for bulk operation";
+  selected.addEventListener("change", () => {
+    if (selected.checked) selectedTasks.add(taskKey);
+    else selectedTasks.delete(taskKey);
+  });
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = task.completed;
+  checkbox.title = "Write task status to Markdown";
+  checkbox.addEventListener("change", () => void (async () => {
+    checkbox.disabled = true;
+    try {
+      await invoke("set_task_completed", { path: task.path, taskId: task.task_id, completed: checkbox.checked });
+      task.completed = checkbox.checked;
+      if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
+      rerender();
+    } catch (error) {
+      checkbox.checked = !checkbox.checked;
+      checkbox.disabled = false;
+      alert(String(error));
+    }
+  })());
+  const text = document.createElement("button");
+  text.type = "button";
+  text.className = "task-dashboard-text";
+  text.textContent = task.text;
+  text.addEventListener("click", () => void (async () => {
+    closeFeaturePanel();
+    await openNote(task.path);
+    editor?.goToLine(task.line);
+  })());
+  const metadata = document.createElement("div");
+  metadata.className = "task-dashboard-metadata";
+  const scheduled = document.createElement("input");
+  scheduled.type = "date";
+  scheduled.value = task.scheduled || "";
+  scheduled.title = "Scheduled date";
+  const dueDate = document.createElement("input");
+  dueDate.type = "date";
+  dueDate.value = task.due || "";
+  dueDate.title = "Due date";
+  const priority = taskSelect(["", "highest", "high", "medium", "low", "lowest"], task.priority || "", "Task priority", "No priority");
+  const status = taskStatusSelect(task.status_char, "Task status");
+  status.addEventListener("change", () => void (async () => {
+    status.disabled = true;
+    try {
+      await invoke("set_task_status", { path: task.path, taskId: task.task_id, status: status.value });
+      if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
+      rerender();
+    } catch (error) {
+      status.value = task.status_char;
+      status.disabled = false;
+      alert(String(error));
+    }
+  })());
+  const update = async () => {
+    const replacement = updateTaskMetadataLine(task.raw_line, {
+      due: dueDate.value || null,
+      scheduled: scheduled.value || null,
+      priority: priority.value || null,
+    });
+    for (const control of [scheduled, dueDate, priority]) control.disabled = true;
+    try {
+      await invoke("replace_task_line", { path: task.path, taskId: task.task_id, replacement });
+      task.raw_line = replacement;
+      task.due = dueDate.value || null;
+      task.scheduled = scheduled.value || null;
+      task.priority = priority.value || null;
+      if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
+      rerender();
+    } catch (error) {
+      for (const control of [scheduled, dueDate, priority]) control.disabled = false;
+      alert(String(error));
+    }
+  };
+  scheduled.addEventListener("change", () => void update());
+  dueDate.addEventListener("change", () => void update());
+  priority.addEventListener("change", () => void update());
+  metadata.append(status, scheduled, dueDate, priority);
+  const source = document.createElement("span");
+  source.className = "task-dashboard-source";
+  source.textContent = `${task.path}:${task.line}`;
+  row.append(selected, checkbox, text, metadata, source);
+  return row;
 }
 
 async function showGitPanel() {
@@ -3188,12 +3956,12 @@ async function runGitAction(command: string, args: Record<string, unknown> = {})
 
 function folderForCreate(target: CtxTarget): string {
   if (target.kind === "folder") return target.path;
-  if (target.kind === "file") return parentDir(target.path);
+  if (target.kind === "file" || target.kind === "tab") return parentDir(target.path);
   return "";
 }
 
 function existingPaths(): Set<string> {
-  return new Set(mdFilesAll.map((f) => f.path));
+  return new Set(vaultFilesAll.map((f) => f.path));
 }
 
 function promptName(title: string, initial: string): string | null {
@@ -3220,8 +3988,17 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
   const dir = folderForCreate(target);
 
   switch (action) {
+    case "close-tab": {
+      await closeTab(target.path);
+      return;
+    }
     case "open-new-tab": {
-      if (target.kind !== "file") return;
+      if (target.kind !== "file" && target.kind !== "tab") return;
+      const entry = vaultFilesAll.find((file) => file.path === target.path);
+      if (entry && !isDocumentEntry(entry)) {
+        await invoke("open_with_default_app", { path: target.path });
+        return;
+      }
       if (!openTabs.includes(target.path)) openTabs.push(target.path);
       await openNote(target.path);
       renderTabBar();
@@ -3230,6 +4007,11 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
     }
     case "open-right": {
       if (target.kind !== "file") return;
+      const entry = vaultFilesAll.find((file) => file.path === target.path);
+      if (entry && !isDocumentEntry(entry)) {
+        await invoke("open_with_default_app", { path: target.path });
+        return;
+      }
       rightPath = target.path;
       await updateRightPane();
       saveSession();
@@ -3248,7 +4030,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       return;
     }
     case "version-history": {
-      if (target.kind !== "file") return;
+      if (target.kind !== "file" && target.kind !== "tab") return;
       await showFileHistory(target.path);
       return;
     }
@@ -3343,7 +4125,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       const to = uniqueCopyName(target.path, existingPaths());
       await invoke("copy_path", { from: target.path, to });
       await refreshTree();
-      if (target.kind === "file") await openNote(to);
+      if (target.kind === "file" || target.kind === "tab") await openNote(to);
       return;
     }
     case "move-to": {
@@ -3404,7 +4186,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       let name = promptName("Rename to", cur);
       if (!name || name === cur) return;
       // Keep extension if the user drops it on a file rename
-      if (target.kind === "file") {
+      if (target.kind === "file" || target.kind === "tab") {
         const dot = cur.lastIndexOf(".");
         if (dot > 0 && !name.includes(".")) {
           name = name + cur.slice(dot);
@@ -3477,6 +4259,30 @@ function removeBookmarksUnder(path: string, includeChildren: boolean) {
   ));
 }
 
+async function closeTab(path: string) {
+  if (currentPath === path && dirty) {
+    await saveFile(true);
+    if (dirty) {
+      const discard = confirm(`Automatic save of ${path} failed. Close and discard changes?`);
+      if (!discard) return;
+    }
+  }
+  openTabs = openTabs.filter((tab) => tab !== path);
+  if (currentPath === path) {
+    const next = openTabs[openTabs.length - 1];
+    if (next) await openNote(next);
+    else {
+      currentPath = null;
+      editor?.setDoc("");
+      dirty = false;
+      updateChrome();
+      schedulePreview("");
+      saveSession();
+    }
+  } else saveSession();
+  renderTabBar();
+}
+
 function renderTabBar() {
   const bar = document.getElementById("tab-bar");
   if (!bar) return;
@@ -3484,6 +4290,11 @@ function renderTabBar() {
   for (const path of openTabs) {
     const chip = document.createElement("div");
     chip.className = "tab-chip" + (path === currentPath ? " active" : "");
+    chip.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      showContextMenu(event.clientX, event.clientY, { kind: "tab", path }, handleCtxAction);
+    });
     const label = document.createElement("button");
     label.type = "button";
     label.className = "tab-chip-label";
@@ -3497,29 +4308,7 @@ function renderTabBar() {
     x.title = "Close tab";
     x.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (currentPath === path && dirty) {
-        await saveFile(true);
-        if (dirty) {
-          const discard = confirm(`Automatic save of ${path} failed. Close and discard changes?`);
-          if (!discard) return;
-        }
-      }
-      openTabs = openTabs.filter((t) => t !== path);
-      if (currentPath === path) {
-        const next = openTabs[openTabs.length - 1];
-        if (next) void openNote(next);
-        else {
-          currentPath = null;
-          editor?.setDoc("");
-          dirty = false;
-          updateChrome();
-          schedulePreview("");
-          saveSession();
-        }
-      } else {
-        saveSession();
-      }
-      renderTabBar();
+      await closeTab(path);
     });
     chip.appendChild(label);
     chip.appendChild(x);

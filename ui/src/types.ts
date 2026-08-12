@@ -48,6 +48,19 @@ export type MediaFile = {
   data: string;
 };
 
+export type AttachmentRow = {
+  path: string;
+  name: string;
+  file_kind: string;
+  mime_type: string;
+  size_bytes: number;
+  width: number | null;
+  height: number | null;
+  reference_count: number;
+  orphaned: boolean;
+  text_indexed: boolean;
+};
+
 export type UserVimrc = {
   path: string;
   content: string;
@@ -55,7 +68,7 @@ export type UserVimrc = {
   source_warnings: string[];
 };
 
-export type ViewMode = "source" | "preview" | "split";
+export type ViewMode = "source" | "live" | "preview" | "split";
 
 export type TaskRow = {
   path: string;
@@ -63,12 +76,20 @@ export type TaskRow = {
   status: string;
   status_char: string;
   text: string;
+  raw_line: string;
   line: number;
   completed: boolean;
   due: string | null;
   scheduled: string | null;
   priority: string | null;
   recurrence: string | null;
+  tags: string[];
+};
+
+export type TaskScope = {
+  folders: string[];
+  tags: string[];
+  property: string;
 };
 
 export type GitEntry = {
@@ -129,6 +150,7 @@ export type SearchResult = {
 export type GraphNode = {
   path: string;
   title: string;
+  tags: string[];
 };
 
 export type GraphEdge = {

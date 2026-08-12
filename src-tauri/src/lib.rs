@@ -2,15 +2,17 @@ mod state;
 mod postgres_compat;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
 use nephrite_index::{ProgressPhase, VaultIndex, PROJECT_VERSION};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::AppState;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Serialize)]
@@ -66,6 +68,150 @@ pub struct MediaFile {
     pub path: String,
     pub mime: String,
     pub data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginManifestFile {
+    id: String,
+    name: String,
+    version: String,
+    main: Option<String>,
+    description: Option<String>,
+    permissions: Option<Vec<String>>,
+    api_version: Option<u32>,
+    min_app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDescriptor {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub permissions: Vec<String>,
+    pub api_version: u32,
+    pub min_app_version: Option<String>,
+    pub source: String,
+}
+
+const MAX_PLUGIN_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+const PLUGIN_PERMISSIONS: &[&str] = &[
+    "vault.read",
+    "vault.write",
+    "index.query",
+    "editor.read",
+    "editor.write",
+    "workspace.commands",
+    "workspace.views",
+    "shell.execute",
+];
+
+fn valid_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 96
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Discover isolated plugins under `.nephrite/plugins/<id>/manifest.json`.
+/// The frontend never receives arbitrary host paths, only validated source.
+#[tauri::command]
+fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, String> {
+    let root = {
+        let guard = state.index.lock();
+        guard
+            .as_ref()
+            .ok_or_else(|| "No vault open".to_string())?
+            .vault_root()
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+    };
+    let plugin_root = root.join(".nephrite").join("plugins");
+    if !plugin_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let canonical_plugin_root = plugin_root.canonicalize().map_err(|error| error.to_string())?;
+    let mut plugins = Vec::new();
+    let entries = std::fs::read_dir(&plugin_root).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let manifest_text = std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        let manifest: PluginManifestFile = serde_json::from_str(&manifest_text)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        if !valid_plugin_id(&manifest.id) || entry.file_name().to_string_lossy() != manifest.id {
+            return Err(format!(
+                "Plugin folder and manifest id must match: {}",
+                entry.path().display()
+            ));
+        }
+        let main = manifest.main.unwrap_or_else(|| "main.js".to_string());
+        let canonical_entry = entry.path().canonicalize().map_err(|error| error.to_string())?;
+        let main_path = canonical_entry.join(main.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let canonical_main = main_path
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", main_path.display()))?;
+        if !canonical_main.starts_with(&canonical_plugin_root) || !canonical_main.starts_with(&canonical_entry) {
+            return Err(format!("Plugin main file escapes its folder: {}", manifest.id));
+        }
+        let metadata = std::fs::metadata(&canonical_main).map_err(|error| error.to_string())?;
+        if metadata.len() > MAX_PLUGIN_SOURCE_BYTES {
+            return Err(format!("Plugin {} exceeds the 2 MiB source limit", manifest.id));
+        }
+        let permissions = manifest.permissions.unwrap_or_default();
+        if let Some(permission) = permissions
+            .iter()
+            .find(|permission| !PLUGIN_PERMISSIONS.contains(&permission.as_str()))
+        {
+            return Err(format!("Plugin {} requests unknown permission: {permission}", manifest.id));
+        }
+        plugins.push(PluginDescriptor {
+            id: manifest.id,
+            name: manifest.name,
+            version: manifest.version,
+            description: manifest.description.unwrap_or_default(),
+            permissions,
+            api_version: manifest.api_version.unwrap_or(1),
+            min_app_version: manifest.min_app_version,
+            source: std::fs::read_to_string(&canonical_main)
+                .map_err(|error| format!("{}: {error}", canonical_main.display()))?,
+        });
+    }
+    plugins.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    Ok(plugins)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AttachmentRow {
+    pub path: String,
+    pub name: String,
+    pub file_kind: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub reference_count: i64,
+    pub orphaned: bool,
+    pub text_indexed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskScope {
+    pub folders: Vec<String>,
+    pub tags: Vec<String>,
+    pub property: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -441,61 +587,147 @@ fn reconcile_vault(index: &mut VaultIndex) -> Result<VaultChangeEvent, String> {
     })
 }
 
-/// A lightweight background reconciler catches changes made by scripts,
-/// editors, sync tools, and shell commands. Reconcile compares filesystem
-/// metadata first and parses only changed files, so the steady-state scan does
-/// not reread Markdown contents.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(350);
+const WATCH_SAFETY_RECONCILE: Duration = Duration::from_secs(60);
+
+fn watcher_event_is_relevant(root: &Path, event: &Event) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    // Some backends report a rescan/overflow without individual paths. A full
+    // reconciliation is the only safe response to those notifications.
+    if event.paths.is_empty() {
+        return true;
+    }
+    event.paths.iter().any(|path| {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let relative_text = relative.to_string_lossy().replace('\\', "/");
+        if relative_text == ".git" || relative_text.starts_with(".git/") {
+            return false;
+        }
+        // SQLite changes these files while reconciling. Watching them would
+        // turn every index update into another index update.
+        !matches!(
+            relative_text.as_str(),
+            ".nephrite/index.db"
+                | ".nephrite/index.db-shm"
+                | ".nephrite/index.db-wal"
+                | ".nephrite/index.db-journal"
+        )
+    })
+}
+
+fn reconcile_and_emit(
+    app: &AppHandle,
+    index: &Arc<Mutex<Option<VaultIndex>>>,
+    watcher_generation: &AtomicU64,
+    generation: u64,
+) -> bool {
+    if watcher_generation.load(Ordering::Acquire) != generation {
+        return false;
+    }
+    let result = {
+        let mut guard = index.lock();
+        let Some(index) = guard.as_mut() else {
+            return false;
+        };
+        reconcile_vault(index)
+    };
+    if watcher_generation.load(Ordering::Acquire) != generation {
+        return false;
+    }
+    match result {
+        Ok(change) if change.updated > 0 || change.removed > 0 => {
+            let _ = app.emit("vault-index-changed", change);
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("vault watcher reconcile failed: {error}"),
+    }
+    true
+}
+
+/// Use the operating system's recursive file watcher for prompt external
+/// updates. Bursts are coalesced before reconciling, and a slow periodic pass
+/// remains as a safety net for backend overflows and network filesystems.
 fn start_vault_watcher(
     app: AppHandle,
     index: Arc<Mutex<Option<VaultIndex>>>,
     watcher_generation: Arc<AtomicU64>,
     generation: u64,
 ) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(1_000));
-        if watcher_generation.load(Ordering::Acquire) != generation {
-            break;
-        }
-        // Clone only the root while holding the database mutex. Walking a
-        // large vault can take long enough to starve query hydration if the
-        // walk shares this lock with SQL and DataviewJS.
+    std::thread::spawn(move || {
         let root = {
             let guard = index.lock();
             let Some(index) = guard.as_ref() else {
-                break;
+                return;
             };
             index.vault_root().to_path_buf()
         };
-        let disk = match VaultIndex::scan_vault_files(&root) {
-            Ok(disk) => disk,
+
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        }) {
+            Ok(watcher) => watcher,
             Err(error) => {
-                eprintln!("vault watcher scan failed: {error}");
-                continue;
+                eprintln!("native vault watcher unavailable: {error}");
+                while watcher_generation.load(Ordering::Acquire) == generation {
+                    std::thread::sleep(WATCH_SAFETY_RECONCILE);
+                    if !reconcile_and_emit(
+                        &app,
+                        &index,
+                        &watcher_generation,
+                        generation,
+                    ) {
+                        return;
+                    }
+                }
+                return;
             }
         };
-        if watcher_generation.load(Ordering::Acquire) != generation {
-            break;
+        if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+            eprintln!("native vault watcher could not watch {}: {error}", root.display());
+            return;
         }
-        let change = {
-            let mut guard = index.lock();
-            let Some(index) = guard.as_mut() else {
-                break;
-            };
-            match index.filesystem_changed_from(&disk) {
-                Ok(false) => None,
-                Ok(true) => Some(reconcile_vault(index)),
-                Err(error) => Some(Err(error.to_string())),
+
+        let mut last_reconcile = Instant::now();
+        while watcher_generation.load(Ordering::Acquire) == generation {
+            let safety_due = WATCH_SAFETY_RECONCILE.saturating_sub(last_reconcile.elapsed());
+            match receiver.recv_timeout(safety_due) {
+                Ok(Ok(event)) if watcher_event_is_relevant(&root, &event) => {
+                    // Drain and coalesce the rest of this save/sync burst. The
+                    // deadline moves forward for each relevant event.
+                    let mut deadline = Instant::now() + WATCH_DEBOUNCE;
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match receiver.recv_timeout(remaining) {
+                            Ok(Ok(event)) if watcher_event_is_relevant(&root, &event) => {
+                                deadline = Instant::now() + WATCH_DEBOUNCE;
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => eprintln!("vault watcher event error: {error}"),
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
+                        return;
+                    }
+                    last_reconcile = Instant::now();
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("vault watcher event error: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
+                        return;
+                    }
+                    last_reconcile = Instant::now();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
-        };
-        if watcher_generation.load(Ordering::Acquire) != generation {
-            break;
-        }
-        match change {
-            Some(Ok(change)) if change.updated > 0 || change.removed > 0 => {
-                let _ = app.emit("vault-index-changed", change);
-            }
-            Some(Ok(_)) | None => {}
-            Some(Err(error)) => eprintln!("vault watcher reconcile failed: {error}"),
         }
     });
 }
@@ -548,6 +780,42 @@ fn list_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
         out.push(row.map_err(|e| e.to_string())?);
     }
     Ok(out)
+}
+
+#[tauri::command]
+fn list_attachments(state: State<'_, AppState>) -> Result<Vec<AttachmentRow>, String> {
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let mut statement = index.connection().prepare(
+        "SELECT f.path, f.name, f.file_kind,
+                COALESCE(a.mime_type, 'application/octet-stream'), f.size_bytes,
+                a.width, a.height,
+                COUNT(DISTINCT l.path),
+                COALESCE(a.text_indexed, 0)
+           FROM files f
+           LEFT JOIN attachment_metadata a ON a.path = f.path
+           LEFT JOIN links l ON l.target_path = f.path
+          WHERE f.file_kind NOT IN ('markdown', 'canvas', 'excalidraw')
+          GROUP BY f.path
+          ORDER BY f.path COLLATE NOCASE"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map([], |row| {
+        let reference_count: i64 = row.get(7)?;
+        Ok(AttachmentRow {
+            path: row.get(0)?,
+            name: row.get(1)?,
+            file_kind: row.get(2)?,
+            mime_type: row.get(3)?,
+            size_bytes: row.get(4)?,
+            width: row.get(5)?,
+            height: row.get(6)?,
+            reference_count,
+            orphaned: reference_count == 0,
+            text_indexed: row.get::<_, i64>(8)? != 0,
+        })
+    }).map_err(|error| error.to_string())?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 fn fts_query(input: &str) -> String {
@@ -729,12 +997,19 @@ fn graph_data(state: State<'_, AppState>) -> Result<GraphData, String> {
     let connection = index.connection();
     let mut node_statement = connection
         .prepare(
-            "SELECT path, COALESCE(NULLIF(title, ''), name, path)
+            "SELECT path, COALESCE(NULLIF(title, ''), name, path), tags
              FROM pages ORDER BY path COLLATE NOCASE",
         )
         .map_err(|error| error.to_string())?;
     let nodes = node_statement
-        .query_map([], |row| Ok(GraphNode { path: row.get(0)?, title: row.get(1)? }))
+        .query_map([], |row| {
+            let tags_json: String = row.get(2)?;
+            Ok(GraphNode {
+                path: row.get(0)?,
+                title: row.get(1)?,
+                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            })
+        })
         .map_err(|error| error.to_string())?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -830,6 +1105,16 @@ fn write_file(path: String, content: String, state: State<'_, AppState>) -> Resu
     };
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let canonical_parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical_parent.starts_with(&root) {
+            return Err("Path escapes vault through a symbolic link".into());
+        }
+    }
+    if abs.exists() {
+        let canonical_target = abs.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical_target.starts_with(&root) {
+            return Err("Path escapes vault through a symbolic link".into());
+        }
     }
     std::fs::write(&abs, content.as_bytes()).map_err(|e| e.to_string())?;
     let abs_c = abs.canonicalize().map_err(|e| e.to_string())?;
@@ -872,39 +1157,61 @@ pub struct TaskRow {
     pub status: String,
     pub status_char: String,
     pub text: String,
+    pub raw_line: String,
     pub line: i64,
     pub completed: bool,
     pub due: Option<String>,
     pub scheduled: Option<String>,
     pub priority: Option<String>,
     pub recurrence: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[tauri::command]
-fn list_tasks(completed: Option<bool>, state: State<'_, AppState>) -> Result<Vec<TaskRow>, String> {
+fn list_tasks(
+    completed: Option<bool>,
+    scope: Option<TaskScope>,
+    state: State<'_, AppState>,
+) -> Result<Vec<TaskRow>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
-    let sql = "SELECT path, task_id, status, status_char, text, line, completed,
-                      due, scheduled, priority, recurrence
-               FROM tasks
-               WHERE (?1 IS NULL OR completed = ?1)
-               ORDER BY completed, COALESCE(due, '9999-12-31'), path COLLATE NOCASE, line";
+    let sql = "SELECT t.path, t.task_id, t.status, t.status_char, t.text, t.raw_line, t.line, t.completed,
+                      t.due, t.scheduled, t.priority, t.recurrence, COALESCE(t.tags_json, '[]')
+               FROM tasks t
+               LEFT JOIN file_frontmatter fm ON fm.path = t.path
+               WHERE (?1 IS NULL OR t.completed = ?1)
+                 AND (?2 = 0
+                   OR EXISTS (SELECT 1 FROM json_each(?3) folders
+                              WHERE t.path = folders.value OR t.path LIKE folders.value || '/%')
+                   OR EXISTS (SELECT 1 FROM json_each(?4) wanted
+                              JOIN json_each(COALESCE(t.tags_json, '[]')) actual
+                                ON lower(ltrim(actual.value, '#')) = lower(ltrim(wanted.value, '#')))
+                   OR (?5 <> '' AND json_type(fm.json, '$.' || ?5) IS NOT NULL
+                       AND lower(CAST(json_extract(fm.json, '$.' || ?5) AS TEXT))
+                           NOT IN ('', '0', 'false', 'no', 'off', 'null')))
+               ORDER BY t.completed, COALESCE(t.due, '9999-12-31'), t.path COLLATE NOCASE, t.line";
     let mut statement = index.connection().prepare(sql).map_err(|e| e.to_string())?;
     let completed_value = completed.map(|value| if value { 1_i64 } else { 0_i64 });
+    let scope = scope.unwrap_or(TaskScope { folders: Vec::new(), tags: Vec::new(), property: String::new() });
+    let scope_enabled = if scope.folders.is_empty() && scope.tags.is_empty() && scope.property.is_empty() { 0_i64 } else { 1_i64 };
+    let folders = serde_json::to_string(&scope.folders).map_err(|error| error.to_string())?;
+    let tags = serde_json::to_string(&scope.tags).map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([completed_value], |row| {
+        .query_map(rusqlite::params![completed_value, scope_enabled, folders, tags, scope.property], |row| {
             Ok(TaskRow {
                 path: row.get(0)?,
                 task_id: row.get(1)?,
                 status: row.get(2)?,
                 status_char: row.get(3)?,
                 text: row.get(4)?,
-                line: row.get(5)?,
-                completed: row.get::<_, i64>(6)? != 0,
-                due: row.get(7)?,
-                scheduled: row.get(8)?,
-                priority: row.get(9)?,
-                recurrence: row.get(10)?,
+                raw_line: row.get(5)?,
+                line: row.get(6)?,
+                completed: row.get::<_, i64>(7)? != 0,
+                due: row.get(8)?,
+                scheduled: row.get(9)?,
+                priority: row.get(10)?,
+                recurrence: row.get(11)?,
+                tags: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -922,12 +1229,12 @@ fn set_task_completed(
 ) -> Result<(), String> {
     let mut guard = state.index.lock();
     let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
-    let (start, end): (i64, i64) = index
+    let (start, end, recurrence): (i64, i64, Option<String>) = index
         .connection()
         .query_row(
-            "SELECT start_offset, end_offset FROM tasks WHERE path = ?1 AND task_id = ?2",
+            "SELECT start_offset, end_offset, recurrence FROM tasks WHERE path = ?1 AND task_id = ?2",
             rusqlite::params![path, task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| format!("Task is stale or missing: {e}"))?;
     let absolute = vault_abs(index, &path)?;
@@ -946,9 +1253,199 @@ fn set_task_completed(
     if !content.is_char_boundary(marker_from) || !content.is_char_boundary(marker_to) {
         return Err("Task checkbox has an invalid byte boundary".into());
     }
-    content.replace_range(marker_from..marker_to, if completed { "x" } else { " " });
+    if completed {
+        if let Some(recurrence) = recurrence.as_deref() {
+            let source = line.trim_end_matches(['\r', '\n']);
+            let eol = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            let today = Local::now().date_naive();
+            let (completed_line, next_line) = recurring_task_lines(source, recurrence, today)?;
+            content.replace_range(from..to, &format!("{completed_line}{eol}{next_line}{eol}"));
+        } else {
+            content.replace_range(marker_from..marker_to, "x");
+        }
+    } else {
+        content.replace_range(marker_from..marker_to, " ");
+    }
     std::fs::write(&absolute, content.as_bytes()).map_err(|e| e.to_string())?;
     index.index_path(&path).map_err(|e| e.to_string())
+}
+
+fn task_line_with_status(line: &str, status: char) -> Result<String, String> {
+    let open = line.find('[').ok_or_else(|| "Task checkbox is no longer present".to_string())?;
+    let close = line[open + 1..].find(']').map(|value| open + 1 + value)
+        .ok_or_else(|| "Task checkbox is no longer present".to_string())?;
+    let mut output = line.to_string();
+    output.replace_range(open + 1..close, &status.to_string());
+    Ok(output)
+}
+
+fn recurring_task_lines(
+    line: &str,
+    recurrence: &str,
+    today: NaiveDate,
+) -> Result<(String, String), String> {
+    let mut completed = task_line_with_status(line, 'x')?;
+    if !completed.contains('✅') {
+        let block = regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
+        if let Some(found) = block.find(&completed) {
+            completed.insert_str(found.start(), &format!(" ✅ {}", today.format("%Y-%m-%d")));
+        } else {
+            completed.push_str(&format!(" ✅ {}", today.format("%Y-%m-%d")));
+        }
+    }
+    let mut next = task_line_with_status(line, ' ')?;
+    let done = regex::Regex::new(r"\s*✅\s*\d{4}-\d{2}-\d{2}").map_err(|error| error.to_string())?;
+    next = done.replace_all(&next, "").into_owned();
+    let date = regex::Regex::new(r"(📅|⏳|🛫)\s*(\d{4}-\d{2}-\d{2})")
+        .map_err(|error| error.to_string())?;
+    let when_done = recurrence.to_ascii_lowercase().contains("when done");
+    let mut shifted = false;
+    next = date.replace_all(&next, |captures: &regex::Captures<'_>| {
+        let source = if when_done {
+            today
+        } else {
+            NaiveDate::parse_from_str(&captures[2], "%Y-%m-%d").unwrap_or(today)
+        };
+        match next_recurrence_date(source, recurrence) {
+            Ok(value) => {
+                shifted = true;
+                format!("{} {}", &captures[1], value.format("%Y-%m-%d"))
+            }
+            Err(_) => captures[0].to_string(),
+        }
+    }).into_owned();
+    if !shifted {
+        let date = next_recurrence_date(today, recurrence)?;
+        let block = regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
+        if let Some(found) = block.find(&next) {
+            next.insert_str(found.start(), &format!(" 📅 {}", date.format("%Y-%m-%d")));
+        } else {
+            next.push_str(&format!(" 📅 {}", date.format("%Y-%m-%d")));
+        }
+    }
+    Ok((completed, next))
+}
+
+fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, String> {
+    let normalized = recurrence.to_ascii_lowercase().replace("when done", "");
+    let value = normalized.trim().strip_prefix("every ").unwrap_or(normalized.trim()).trim();
+    if value == "weekday" || value == "weekdays" {
+        let mut next = date + ChronoDuration::days(1);
+        while matches!(next.weekday(), Weekday::Sat | Weekday::Sun) {
+            next += ChronoDuration::days(1);
+        }
+        return Ok(next);
+    }
+    let weekdays = [
+        ("monday", Weekday::Mon), ("tuesday", Weekday::Tue),
+        ("wednesday", Weekday::Wed), ("thursday", Weekday::Thu),
+        ("friday", Weekday::Fri), ("saturday", Weekday::Sat), ("sunday", Weekday::Sun),
+    ];
+    if let Some((_, weekday)) = weekdays.iter().find(|(name, _)| value == *name) {
+        let mut next = date + ChronoDuration::days(1);
+        while next.weekday() != *weekday { next += ChronoDuration::days(1); }
+        return Ok(next);
+    }
+    let words = value.split_whitespace().collect::<Vec<_>>();
+    let (count, unit) = if words.len() >= 2 {
+        (words[0].parse::<i64>().unwrap_or(1).max(1), words[1])
+    } else {
+        (1, words.first().copied().unwrap_or(""))
+    };
+    match unit.trim_end_matches('s') {
+        "day" | "daily" => Ok(date + ChronoDuration::days(count)),
+        "week" | "weekly" => Ok(date + ChronoDuration::weeks(count)),
+        "month" | "monthly" => add_calendar_months(date, count),
+        "year" | "yearly" | "annually" => add_calendar_months(date, count * 12),
+        _ => Err(format!("Unsupported recurrence: {recurrence}")),
+    }
+}
+
+fn add_calendar_months(date: NaiveDate, months: i64) -> Result<NaiveDate, String> {
+    let month_index = date.year() as i64 * 12 + date.month0() as i64 + months;
+    let year = i32::try_from(month_index.div_euclid(12)).map_err(|_| "Recurrence year is out of range")?;
+    let month = u32::try_from(month_index.rem_euclid(12) + 1).map_err(|_| "Invalid recurrence month")?;
+    let mut day = date.day();
+    while day > 0 {
+        if let Some(value) = NaiveDate::from_ymd_opt(year, month, day) { return Ok(value); }
+        day -= 1;
+    }
+    Err("Could not calculate recurring date".into())
+}
+
+#[tauri::command]
+fn set_task_status(
+    path: String,
+    task_id: i64,
+    status: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let status = status.chars().next().ok_or_else(|| "Task status is empty".to_string())?;
+    if status == 'x' || status == 'X' {
+        return set_task_completed(path, task_id, true, state);
+    }
+    let mut guard = state.index.lock();
+    let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
+    let (start, end, indexed_line): (i64, i64, String) = index.connection().query_row(
+        "SELECT start_offset, end_offset, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
+        rusqlite::params![path, task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).map_err(|error| format!("Task is stale or missing: {error}"))?;
+    let absolute = vault_abs(index, &path)?;
+    let mut content = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
+    let from = usize::try_from(start).map_err(|_| "Invalid task offset".to_string())?;
+    let to = usize::try_from(end).map_err(|_| "Invalid task offset".to_string())?;
+    let current = content.get(from..to).ok_or_else(|| "Task offsets are stale".to_string())?;
+    let eol = if current.ends_with("\r\n") { "\r\n" } else if current.ends_with('\n') { "\n" } else { "" };
+    if current.trim_end_matches(['\r', '\n']) != indexed_line {
+        return Err("Task changed on disk; refresh before editing its status".into());
+    }
+    let replacement = task_line_with_status(&indexed_line, status)?;
+    content.replace_range(from..to, &format!("{replacement}{eol}"));
+    std::fs::write(&absolute, content.as_bytes()).map_err(|error| error.to_string())?;
+    index.index_path(&path).map_err(|error| error.to_string())
+}
+
+/// Replace one indexed task line after checking that its source offsets and
+/// checkbox still identify the same task. The frontend uses this for due,
+/// scheduled, and priority edits while Markdown remains authoritative.
+#[tauri::command]
+fn replace_task_line(
+    path: String,
+    task_id: i64,
+    replacement: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if replacement.contains(['\r', '\n']) || replacement.len() > 16_384 {
+        return Err("A task replacement must be one reasonably sized line".into());
+    }
+    if !replacement.contains("[") || !replacement.contains("]") {
+        return Err("The replacement is no longer a Markdown task".into());
+    }
+    let mut guard = state.index.lock();
+    let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
+    let (start, end, indexed_line): (i64, i64, String) = index
+        .connection()
+        .query_row(
+            "SELECT start_offset, end_offset, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
+            rusqlite::params![path, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("Task is stale or missing: {error}"))?;
+    let absolute = vault_abs(index, &path)?;
+    let mut content = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
+    let from = usize::try_from(start).map_err(|_| "Invalid task offset".to_string())?;
+    let to = usize::try_from(end).map_err(|_| "Invalid task offset".to_string())?;
+    let current = content
+        .get(from..to)
+        .ok_or_else(|| "Task offsets are stale".to_string())?;
+    let eol = if current.ends_with("\r\n") { "\r\n" } else if current.ends_with('\n') { "\n" } else { "" };
+    if current.trim_end_matches(['\r', '\n']) != indexed_line {
+        return Err("Task changed on disk; refresh before editing its metadata".into());
+    }
+    content.replace_range(from..to, &format!("{replacement}{eol}"));
+    std::fs::write(&absolute, content.as_bytes()).map_err(|error| error.to_string())?;
+    index.index_path(&path).map_err(|error| error.to_string())
 }
 
 /// Pages for Dataview-style queries. `source` examples: `"people"`, `"folder/sub"`, empty = all markdown.
@@ -2003,6 +2500,7 @@ pub struct SearchResult {
 pub struct GraphNode {
     pub path: String,
     pub title: String,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2772,8 +3270,10 @@ pub fn run() {
             refresh_vault,
             vault_stats,
             list_files,
+            list_attachments,
             search_vault,
             graph_data,
+            list_plugins,
             read_file,
             read_media_file,
             write_file,
@@ -2782,6 +3282,8 @@ pub fn run() {
             query_vault_sql,
             list_tasks,
             set_task_completed,
+            set_task_status,
+            replace_task_line,
             create_folder,
             create_file,
             rename_path,
@@ -2866,6 +3368,23 @@ mod sql_query_tests {
         for status in [" M", "M ", "??", "R "] {
             assert!(!is_conflict_status(status));
         }
+    }
+
+    #[test]
+    fn recurring_tasks_advance_dates_and_preserve_month_ends() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let (completed, next) = recurring_task_lines(
+            "- [ ] Invoice 🔁 every month 📅 2026-01-31 ^invoice",
+            "every month",
+            today,
+        ).unwrap();
+        assert!(completed.contains("[x]") && completed.contains("✅ 2026-08-12"));
+        assert!(next.contains("[ ]") && next.contains("📅 2026-02-28"));
+        assert!(next.ends_with("^invoice"));
+        assert_eq!(
+            next_recurrence_date(NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(), "every weekday").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+        );
     }
 
     #[test]
