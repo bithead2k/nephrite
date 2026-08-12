@@ -1,0 +1,10 @@
+--- tests/editor-performance.test.ts
++++ tests/editor-performance.test.ts
+@@ -21,7 +21,6 @@
+ import { layoutGraph } from "../ui/src/graph-view";
+ import { parseCanvas, serializeCanvas } from "../ui/src/canvas-view";
+ import {
+-  KANBAN_EDGE_SNAP_DISTANCE,
+   resizedKanbanLaneWidth,
+ } from "../ui/src/kanban-resize";
+ import { findInKanbanLane, kanbanCardSearchText } from "../ui/src/kanban-find";

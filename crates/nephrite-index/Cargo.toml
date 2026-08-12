@@ -1,0 +1,18 @@
+[package]
+name = "nephrite-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Disposable SQLite vault index for Nephrite"
+readme = "README.md"
+
+[dependencies]
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

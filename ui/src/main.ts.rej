@@ -1,0 +1,10 @@
+--- ui/src/main.ts
++++ ui/src/main.ts
+@@ -75,6 +75,7 @@ import { hydrateNoteEmbeds } from "./note-embed";
+ import { hydrateMarkdownImages } from "./image-embed";
+ import { DeferredDocumentWork } from "./edit-scheduler";
+ import { RefreshGate } from "./refresh-gate";
++import { resizedKanbanLaneWidth } from "./kanban-resize";
+ import { findInKanbanLane, normalizePageFindQuery } from "./kanban-find";
+ import { CanvasView, serializeCanvas } from "./canvas-view";
+ import { renderGraph } from "./graph-view";

@@ -1,0 +1,13 @@
+[package]
+name = "nephrite-index-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI to open/reconcile a Nephrite vault index"
+
+[[bin]]
+name = "nephrite-index"
+path = "src/main.rs"
+
+[dependencies]
+nephrite-index = { path = "../nephrite-index" }

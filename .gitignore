@@ -1,0 +1,12 @@
+/target
+/dist
+/node_modules
+ui/node_modules
+.DS_Store
+*.log
+.nephrite
+src-tauri/target
+.vscode
+.idea
+*.db
+*.db-*
