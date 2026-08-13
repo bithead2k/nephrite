@@ -4,6 +4,18 @@
 
 Open-source, local-first knowledge app. Markdown is storage; the SQLite index is disposable. Opens an existing Obsidian vault without import or conversion.
 
+Nephrite is softer, but more resilient than Obsidian.  It overcomes some of the friction of Obsidian plugins that really should be native by now.
+
+It's also free and open source (FOSS), based on the AGPL-3.0 license.   Do what you like with it.
+
+Please fork my repo, and give me back any additions or bug fixes you'd like to make.
+
+This code was largely created with codex, claude, and grok on the command line. 
+
+Anybody who tells you that AI can create professional level code is an idiot or a liar.   It required several hundred human iterations to create this, and all of the AI models combined still produced garbage sometimes.  Excuse me for saying so, but AI is still a professional code assistant, not a finished product creator.
+
+Still, I find AI to be a great drudge work assistant, and it fairly regularly comes up with a better idea than what I had.  That's enough to make it useful, not enough to stake your business on it.  Productivity is definitely and dramatically higher.
+
 License: [AGPL-3.0](LICENSE)
 
 ## Native integrations
@@ -27,6 +39,8 @@ License: [AGPL-3.0](LICENSE)
   of indexed wikilinks and backlinks.
 - **Canvas:** open and edit Obsidian `.canvas` files directly; unknown JSON
   fields are preserved while nodes and edges remain indexed and searchable.
+- **Dataview** SQL-ish query language
+- **SQL** Actual SQL language largely based on PostgreSQL syntax.
 
 ## Core features
 
