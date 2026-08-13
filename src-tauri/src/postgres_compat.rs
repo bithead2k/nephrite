@@ -52,6 +52,43 @@ fn json_value(value: ValueRef<'_>) -> rusqlite::Result<serde_json::Value> {
     })
 }
 
+fn parse_json_text(
+    context: &rusqlite::functions::Context<'_>,
+    index: usize,
+) -> rusqlite::Result<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(&context.get::<String>(index)?)
+        .map_err(function_error)
+}
+
+fn json_sql_value(value: serde_json::Value, text: bool) -> rusqlite::Result<Value> {
+    if text {
+        return Ok(match value {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::String(value) => Value::Text(value),
+            value => Value::Text(value.to_string()),
+        });
+    }
+    Ok(match value {
+        serde_json::Value::Null => Value::Null,
+        value => Value::Text(value.to_string()),
+    })
+}
+
+fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            right.iter().all(|(key, value)| {
+                left.get(key)
+                    .is_some_and(|candidate| json_contains(candidate, value))
+            })
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => right
+            .iter()
+            .all(|value| left.iter().any(|candidate| json_contains(candidate, value))),
+        _ => left == right,
+    }
+}
+
 fn chars_slice(source: &str, start: usize, length: usize) -> String {
     source.chars().skip(start).take(length).collect()
 }
@@ -760,6 +797,132 @@ fn register_json(connection: &rusqlite::Connection) -> Result<(), String> {
             })
             .map_err(|error| error.to_string())?;
     }
+    for name in ["json_array_length", "jsonb_array_length"] {
+        connection
+            .create_scalar_function(name, 1, SAFE, |context| {
+                Ok(parse_json_text(context, 0)?
+                    .as_array()
+                    .map(Vec::len)
+                    .map(|length| length as i64))
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    for (name, text) in [
+        ("json_extract_path", false),
+        ("jsonb_extract_path", false),
+        ("json_extract_path_text", true),
+        ("jsonb_extract_path_text", true),
+    ] {
+        connection
+            .create_scalar_function(name, -1, SAFE, move |context| {
+                let mut value = parse_json_text(context, 0)?;
+                for index in 1..context.len() {
+                    let key = context.get::<String>(index)?;
+                    value = match value {
+                        serde_json::Value::Object(object) => {
+                            object.get(&key).cloned().unwrap_or(serde_json::Value::Null)
+                        }
+                        serde_json::Value::Array(array) => key
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|index| array.get(index).cloned())
+                            .unwrap_or(serde_json::Value::Null),
+                        _ => serde_json::Value::Null,
+                    };
+                }
+                json_sql_value(value, text)
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .create_scalar_function("jsonb_contains", 2, SAFE, |context| {
+            Ok(json_contains(
+                &parse_json_text(context, 0)?,
+                &parse_json_text(context, 1)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    connection
+        .create_scalar_function("jsonb_exists", 2, SAFE, |context| {
+            let value = parse_json_text(context, 0)?;
+            let key = context.get::<String>(1)?;
+            Ok(match value {
+                serde_json::Value::Object(object) => object.contains_key(&key),
+                serde_json::Value::Array(array) => {
+                    array.iter().any(|value| value.as_str() == Some(&key))
+                }
+                _ => false,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    for (name, all) in [("jsonb_exists_all", true), ("jsonb_exists_any", false)] {
+        connection
+            .create_scalar_function(name, 2, SAFE, move |context| {
+                let value = parse_json_text(context, 0)?;
+                let keys = serde_json::from_str::<Vec<String>>(&context.get::<String>(1)?)
+                    .map_err(function_error)?;
+                let exists = |key: &String| match &value {
+                    serde_json::Value::Object(object) => object.contains_key(key),
+                    serde_json::Value::Array(array) => {
+                        array.iter().any(|value| value.as_str() == Some(key))
+                    }
+                    _ => false,
+                };
+                Ok(if all {
+                    keys.iter().all(exists)
+                } else {
+                    keys.iter().any(exists)
+                })
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .create_scalar_function("jsonb_concat", 2, SAFE, |context| {
+            let left = parse_json_text(context, 0)?;
+            let right = parse_json_text(context, 1)?;
+            let value = match (left, right) {
+                (serde_json::Value::Object(mut left), serde_json::Value::Object(right)) => {
+                    left.extend(right);
+                    serde_json::Value::Object(left)
+                }
+                (serde_json::Value::Array(mut left), serde_json::Value::Array(right)) => {
+                    left.extend(right);
+                    serde_json::Value::Array(left)
+                }
+                (left, right) => serde_json::Value::Array(vec![left, right]),
+            };
+            Ok(value.to_string())
+        })
+        .map_err(|error| error.to_string())?;
+    connection
+        .create_scalar_function("jsonb_delete", 2, SAFE, |context| {
+            let mut value = parse_json_text(context, 0)?;
+            let key = context.get::<String>(1)?;
+            match &mut value {
+                serde_json::Value::Object(object) => {
+                    object.remove(&key);
+                }
+                serde_json::Value::Array(array) => {
+                    if let Ok(index) = key.parse::<i64>() {
+                        let index = if index < 0 {
+                            array.len() as i64 + index
+                        } else {
+                            index
+                        };
+                        if let Ok(index) = usize::try_from(index) {
+                            if index < array.len() {
+                                array.remove(index);
+                            }
+                        }
+                    } else {
+                        array.retain(|item| item.as_str() != Some(&key));
+                    }
+                }
+                _ => {}
+            }
+            Ok(value.to_string())
+        })
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -906,6 +1069,7 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "sum",
     "upper",
     "array_append",
+    "array_agg",
     "array_cat",
     "array_dims",
     "array_length",
@@ -917,6 +1081,8 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "array_remove",
     "array_replace",
     "array_reverse",
+    "array_sample",
+    "array_shuffle",
     "array_sort",
     "array_to_string",
     "array_upper",
@@ -948,12 +1114,28 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "gcd",
     "initcap",
     "json_build_array",
+    "json_agg",
     "json_build_object",
+    "json_object_agg",
+    "json_array_length",
+    "json_extract_path",
+    "json_extract_path_text",
     "json_pretty",
     "json_strip_nulls",
     "json_typeof",
     "jsonb_build_array",
+    "jsonb_agg",
     "jsonb_build_object",
+    "jsonb_object_agg",
+    "jsonb_array_length",
+    "jsonb_concat",
+    "jsonb_contains",
+    "jsonb_delete",
+    "jsonb_extract_path",
+    "jsonb_extract_path_text",
+    "jsonb_exists",
+    "jsonb_exists_all",
+    "jsonb_exists_any",
     "jsonb_strip_nulls",
     "jsonb_typeof",
     "lcm",
@@ -1020,5 +1202,69 @@ pub fn register(connection: &rusqlite::Connection) -> Result<(), String> {
     register_binary(connection)?;
     register_datetime(connection)?;
     register_system(connection)?;
+    register_catalog(connection)?;
+    Ok(())
+}
+
+fn register_catalog(connection: &rusqlite::Connection) -> Result<(), String> {
+    let attached = connection
+        .prepare("PRAGMA database_list")
+        .and_then(|mut statement| {
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            Ok(rows.filter_map(Result::ok).any(|name| name == "pg_catalog"))
+        })
+        .map_err(|error| error.to_string())?;
+    if !attached {
+        connection
+            .execute("ATTACH DATABASE ':memory:' AS pg_catalog", [])
+            .map_err(|error| error.to_string())?;
+        connection.execute_batch(
+            "CREATE TABLE pg_catalog.pg_proc(oid INTEGER PRIMARY KEY, proname TEXT NOT NULL, prokind TEXT NOT NULL, provolatile TEXT NOT NULL, proparallel TEXT NOT NULL);\
+             CREATE TABLE pg_catalog.pg_operator(oid INTEGER PRIMARY KEY, oprname TEXT NOT NULL, oprleft TEXT NOT NULL, oprright TEXT NOT NULL, oprresult TEXT NOT NULL);",
+        ).map_err(|error| error.to_string())?;
+        for (index, name) in SUPPORTED_FUNCTIONS.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO pg_catalog.pg_proc VALUES (?1, ?2, 'f', 'i', 's')",
+                    rusqlite::params![index as i64 + 10_000, name],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        const OPERATORS: &[(&str, &str, &str, &str)] = &[
+            ("@>", "anyarray", "anyarray", "boolean"),
+            ("<@", "anyarray", "anyarray", "boolean"),
+            ("&&", "anyarray", "anyarray", "boolean"),
+            ("||", "anyarray", "anyarray", "anyarray"),
+            ("=", "anyarray", "anyarray", "boolean"),
+            ("<>", "anyarray", "anyarray", "boolean"),
+            ("<", "anyarray", "anyarray", "boolean"),
+            ("<=", "anyarray", "anyarray", "boolean"),
+            (">", "anyarray", "anyarray", "boolean"),
+            (">=", "anyarray", "anyarray", "boolean"),
+            ("->", "jsonb", "text", "jsonb"),
+            ("->>", "jsonb", "text", "text"),
+            ("#>", "jsonb", "text[]", "jsonb"),
+            ("#>>", "jsonb", "text[]", "text"),
+            ("?", "jsonb", "text", "boolean"),
+            ("?&", "jsonb", "text[]", "boolean"),
+            ("?|", "jsonb", "text[]", "boolean"),
+            ("@>", "jsonb", "jsonb", "boolean"),
+            ("<@", "jsonb", "jsonb", "boolean"),
+            ("-", "jsonb", "text", "jsonb"),
+            ("||", "jsonb", "jsonb", "jsonb"),
+            ("~", "text", "text", "boolean"),
+            ("~*", "text", "text", "boolean"),
+            ("!~", "text", "text", "boolean"),
+            ("!~*", "text", "text", "boolean"),
+        ];
+        for (index, (name, left, right, result)) in OPERATORS.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO pg_catalog.pg_operator VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![index as i64 + 20_000, name, left, right, result],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
     Ok(())
 }

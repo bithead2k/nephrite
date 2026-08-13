@@ -1,17 +1,22 @@
 # PostgreSQL function compatibility
 
-Nephrite validates native SQL with PostgreSQL's parser and executes a safe,
+Nephrite validates native SQL with PostgreSQL's parser and audits the exposed
+surface against PostgreSQL 18.4's `pg_catalog`. It executes a safe,
 read-only lowering on SQLite. `nephrite_pg_proc()` returns the comma-separated
-inventory of callable PostgreSQL-compatible functions in the current build.
+inventory of callable PostgreSQL-compatible functions. The same inventory is
+queryable as rows in `pg_catalog.pg_proc`; supported operator signatures are
+in `pg_catalog.pg_operator`.
 
 The compatibility layer includes:
 
 - native conditional and aggregate functions such as `coalesce`, `nullif`,
   `count`, `sum`, `avg`, `min`, and `max`;
-- `string_agg`, `bool_and`, `bool_or`, and `every` lowering;
+- `string_agg`, `array_agg`, JSON/JSONB aggregates, `bool_and`, `bool_or`, and
+  `every` lowering;
 - text, padding, quoting, regular-expression, and encoding functions;
 - numeric and mathematical functions;
-- one-dimensional array constructors and functions;
+- typed one-dimensional array constructors, functions, subscripts, slices,
+  quantified comparisons, concatenation, containment, overlap, and ordering;
 - JSON/JSONB construction, inspection, formatting, and null stripping;
 - UTC timestamps, date construction, `date_part`, and PostgreSQL
   `EXTRACT(field FROM value)` syntax;
@@ -25,13 +30,31 @@ implementations, whose relevant NULL behavior matches PostgreSQL: `coalesce`
 returns the first non-NULL value, while either NULL operand makes `||` return
 NULL.
 
-The compatibility boundary is intentionally semantic rather than a fabricated
-copy of PostgreSQL's physical `pg_proc` table. Nephrite does not advertise
+The compatibility boundary is semantic. The catalog-shaped tables advertise
+only behavior Nephrite can execute; they are not copies of a server's complete
+physical catalogs. Nephrite does not advertise
 server administration, filesystem, network, procedural-language, replication,
 or mutation routines that cannot safely operate in a local read-only vault
 query. PostgreSQL arrays are currently one-dimensional, timestamps are handled
 as ISO text in UTC or without a zone, and Rust regex syntax is used for the
 supported PostgreSQL regex functions.
+
+PostgreSQL 18 array additions `array_sort`, `array_reverse`, `array_shuffle`,
+and `array_sample` are included. JSONPath operators and set-returning
+record-expansion functions are intentionally not advertised: implementing
+those requires a genuine JSONPath/table-function runtime, not a misleading
+approximation.
+
+The ordinary read-only relational surface—CTEs, `VALUES`, joins, subqueries,
+`CASE`, aggregates, `FILTER`, grouping, `HAVING`, set operations, ordering,
+limits, and SQLite-supported window functions—passes through after PostgreSQL
+validation.
+
+```sql
+SELECT proname FROM pg_catalog.pg_proc ORDER BY proname;
+SELECT oprname, oprleft, oprright, oprresult
+FROM pg_catalog.pg_operator ORDER BY oprname, oprleft;
+```
 
 ## Page semantic types
 
@@ -49,6 +72,12 @@ forms are lowered into SQLite helpers before execution:
 | `aliases @>` / `&&` / `ANY` | same helpers (aliases are string arrays) |
 | `ARRAY[...]` | `page_array(...)` |
 | `EXTRACT(field FROM expr)` | `date_part('field', expr)` |
+| `a[n]`, `a[l:u]` | typed array get/slice helpers |
+| `a @> b`, `a <@ b`, `a && b` | array containment/overlap helpers |
+| `a || b`, array comparisons | concatenation and lexicographic comparison |
+| `value OP ANY(a)` / `ALL(a)` | quantified comparison helper |
+| JSON `->`, `->>`, `#>`, `#>>` | JSON path extraction helpers |
+| JSON `?`, `?&`, `?|`, `@>`, `<@`, `-`, `||` | JSONB-compatible helpers |
 
 The public model remains:
 
@@ -62,8 +91,10 @@ page.record
 └── todos       page.todo[]
 ```
 
-Further expansion will replace the remaining textual lowering with AST-to-IR
-translation so additional operators can be added without fragile regexes.
+Page-owned property and array indirection now lower from `A_Indirection` AST
+nodes. Recognized AST statements run only the syntax residual; the complete
+textual page pass remains solely as a compatibility fallback when no safe AST
+rewrite can be recovered.
 
 ## AST → IR lowering
 
@@ -76,8 +107,8 @@ Pipeline:
 
 1. **AST rewrite** of recognized page forms, FuncCalls, arrays, null tests, casts.
 2. **EXTRACT keyword** scan for raw `EXTRACT(field FROM expr)` not already covered.
-3. **Residual textual** (`ARRAY` / remaining EXTRACT / aggregates) when AST applied.
-4. **Full textual** forms+residual when AST finds nothing.
+3. **Residual syntax lowering** for grammar SQLite cannot parse directly.
+4. **Compatibility fallback** only when AST span recovery produces no rewrite.
 
 | Form | IR | Emission |
 |------|----|----------|
@@ -96,4 +127,3 @@ Pipeline:
 | `TypeCast` wrappers | (peeled) | inner lowerer |
 
 `analyze_page_forms(sql)` returns IR for diagnostics and tests.
-

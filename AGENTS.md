@@ -800,7 +800,7 @@ p.tags && ARRAY['recruiter', 'interviewer']
 
 The normalized `properties`, `tags`, `aliases`, `links`, `headings`, and `tasks` tables remain disposable index internals/advanced escape hatches. Ordinary page queries should use `pages` and its page-owned values.
 
-Current implementation note: SQLite still serializes complex page values internally. That encoding is private. `libpg_query` validates PostgreSQL syntax, and a lowering layer implements the public `page.*` behavior. Literal property subscripts and literal tag-array operations are implemented; replace the current narrowly scoped textual lowering with AST/IR lowering as the supported surface grows.
+Current implementation note: SQLite still serializes complex page values internally; that encoding is private. `libpg_query` validates PostgreSQL syntax. Page properties, array literals, property/array indirection, tag operators, JSON paths, null tests, casts, and supported function forms lower through AST/IR when source spans are recoverable. Successful AST lowering runs only the SQLite grammar residual; the full textual page translator remains a compatibility fallback. One-dimensional arrays support typed values, subscripts, slices, concatenation, containment, contained-by, overlap, lexicographic comparison, all scalar comparison operators through `ANY`/`ALL`, and PostgreSQL 18's sort/reverse/shuffle/sample functions. JSONB-compatible extraction, existence, containment, concatenation, deletion, and JSON/JSONB aggregates are available. `pg_catalog.pg_proc` and `pg_catalog.pg_operator` expose the supported safe surface, audited against PostgreSQL 18.4 on port 5438. JSONPath and set-returning record expansion remain deliberately unadvertised rather than approximated incorrectly.
 
 ### YAML Index Typing
 
@@ -839,13 +839,14 @@ The live v2 backing index returns Josh Flanders alone. His missing `work_email` 
 
 The latest completed validation is:
 
-* 13/13 TypeScript performance/rendering regression tests passing;
-* 8/8 `nephrite-index` tests passing;
-* 4/4 native PostgreSQL SQL tests passing;
+* 61/61 Nephrite Rust application tests passing;
+* 13/13 `nephrite-index` tests passing;
+* 50/50 TypeScript performance/rendering regression tests passing;
+* 4/4 UI integration tests passing;
 * `cargo fmt --check` passing;
-* `cargo check -p nephrite` passing;
+* strict workspace Clippy passing with warnings denied;
 * `npm run build` passing;
-* live v2 vault index rebuilt and queried successfully.
+* the supported SQL surface audited against the local PostgreSQL 18.4 catalog at port 5438.
 
 Expected Vite warnings about third-party `"use client"` directives and large chunks are non-fatal.
 
@@ -855,7 +856,7 @@ Expected Vite warnings about third-party `"use client"` directives and large chu
 2. Open `people/Brady Gunter.md` in split/preview mode and verify the SQL table renders Josh Flanders rather than source text or an error.
 3. Verify `p.tags @> ARRAY['recruiter']` works unchanged.
 4. Visually verify frontmatter email, phone, website, LinkedIn, and file-extension URLs are clickable and carry the expected MIME `type`.
-5. Continue replacing textual PostgreSQL lowering with AST-to-IR translation as additional `page.*` operations are introduced.
+5. Query `pg_catalog.pg_proc` or `pg_catalog.pg_operator` when inspecting the intentionally supported embedded PostgreSQL surface; unsupported server-only features are omitted rather than approximated.
 
 Fundamental Requirements — Status vs Gaps
 
@@ -866,7 +867,7 @@ Fundamental Requirements — Status vs Gaps
 1. Existing Obsidian vault compatibility (open as-is, no silent rewrite)StrongBlock-reference fidelity is “where practical”; some edge-case link/heading/alias resolution and hierarchical YAML write discipline still need hardening. The Git-diff acceptance test is the right bar and is largely held.
 2. Markdown is authoritative (disposable .nephrite/ index)DoneIndex rebuild on major version bump is implemented; residual risk is only in accidental non-minimal writes during property/task edits.
 3. Native vault metadata indexStrongRich schema already covers files, properties (hierarchical), headings, blocks, links, tags, tasks, aliases, attachments, canvas nodes/edges, kanban boards/columns/cards, inline fields, footnotes, and pages / backlinks views. Gap is mostly completeness of incremental reconcile under heavy concurrent external changes (Obsidian Sync / other editors).
-4. PostgreSQL SQL as the query languagePartial / core workinglibpg_query gate + read-only enforcement + page-type lowering + many PG functions exist. Main gap: still uses textual/regex lowering for p.properties['…'], tags @>, ANY, &&, etc. AGENTS.md explicitly calls for replacing this with proper AST → IR lowering. Limited operators, no full window functions / complex array/JSON path surface yet. Dataview DQL compatibility covers the common TABLE/LIST/FROM/WHERE/SORT/LIMIT path but is not exhaustive.
+4. PostgreSQL SQL as the query languageStronglibpg_query gate + read-only enforcement + AST/IR page lowering + typed one-dimensional arrays + JSONB operators + catalog-visible safe functions/operators are implemented. SQLite-native joins, CTEs, aggregates, grouping, subqueries, CASE, and window functions remain available. This is a semantic read-only PostgreSQL compatibility layer, not a bundled PostgreSQL server; server administration, procedural languages, extensions, network/filesystem functions, ranges, multidimensional arrays, and mutation remain outside its boundary. Dataview compatibility remains separate and incomplete.
 5. Tasks as a core facilityUsable partialIndexing of status, due/scheduled/start/done/created, recurrence, priority, tags; surgical checkbox edits; task dashboard with scoping. Gaps: fuller interactive editing UX, complete Obsidian Tasks syntax variants, richer grouping/views (by project, recurrence series, etc.), and tighter source-location navigation.
 6. Native template & automation engineEarly / limitedDeclarative .nephrite/automations.json (create/append/prepend/move/apply-template/open + lifecycle hooks) + safe Templater subset (tp.file.*, dates, frontmatter, prompts, includes, cursor). Gaps: no sandboxed execution of <%* JavaScript %>  (preserved with warning); no full user-defined JS functions or rich runtime; QuickAdd-style capture is only partially covered by the declarative layer.
 7. Excalidraw integrationDoneUpstream engine, vault files, embeds, editing, autosave, fonts bundled. Minor fidelity gaps possible with exotic Obsidian Excalidraw plugin files.
@@ -878,7 +879,7 @@ Fundamental Requirements — Status vs Gaps
 
  - Phase 1 (Safe Vault Reader) — Largely complete (open, parse, index, search, basic editor/viewer, watcher).
  - Phase 2 (Vault Database) — Complete and quite rich (see schema.sql + docs/vault-schema.md).
- - Phase 3 (SQL) — Core path works; the AST/IR lowering rewrite and broader expression surface are the clear next engineering focus.
+ - Phase 3 (SQL) — Complete for the documented safe embedded boundary: parser/read-only gate, AST/IR page semantics, array/JSON operators, PostgreSQL compatibility functions/catalog, typed results, and dynamic rendering.
  - Phase 4 (Dataview Compatibility) — Partial. Common DQL works; DataviewJS has a usable but incomplete page/collection API. TASK/CALENDAR and deeper JS features remain.
  - Phase 5 (Tasks) — Functional dashboard + surgical edits; advanced views, recurrence editing, and full syntax parity still needed.
  - Phase 6 (Templates & Automation) — Declarative + limited Templater only. Full native automation runtime + sandboxed JS is the largest product gap relative to the original vision.
@@ -917,7 +918,6 @@ What still falls short for “mature local-first knowledge system” users:
   
 ## Highest-Leverage Gaps to Close Next
 
- - Replace textual translate_page_sql with proper AST → IR lowering (explicitly called out in the 2026-08-09 reload context). This unlocks the rest of the SQL surface cleanly.
  - Deepen the automation/Templater runtime (sandboxed JS + richer declarative actions).
  - Task views + full syntax fidelity.
  - Dataview DQL/JS completeness for the common power-user patterns.

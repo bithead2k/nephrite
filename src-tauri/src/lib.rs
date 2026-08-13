@@ -1781,6 +1781,8 @@ fn context_json_value(
         ValueRef::Text(value) => serde_json::Value::String(
             String::from_utf8(value.to_vec()).map_err(user_function_error)?,
         ),
+        ValueRef::Blob(b"nephrite:bool:true") => serde_json::Value::Bool(true),
+        ValueRef::Blob(b"nephrite:bool:false") => serde_json::Value::Bool(false),
         ValueRef::Blob(value) => serde_json::Value::String(BASE64.encode(value)),
     })
 }
@@ -1830,6 +1832,15 @@ fn register_page_array_functions(connection: &rusqlite::Connection) -> Result<()
     const SAFE: FunctionFlags =
         FunctionFlags::SQLITE_DETERMINISTIC.union(FunctionFlags::SQLITE_INNOCUOUS);
 
+    connection
+        .create_scalar_function("page_bool", 1, SAFE, |context| {
+            Ok(if context.get::<i64>(0)? == 0 {
+                b"nephrite:bool:false".to_vec()
+            } else {
+                b"nephrite:bool:true".to_vec()
+            })
+        })
+        .map_err(|error| format!("register page_bool: {error}"))?;
     connection
         .create_scalar_function("page_array", -1, SAFE, |context| {
             let values = (0..context.len())
@@ -2054,6 +2065,42 @@ fn register_page_array_functions(connection: &rusqlite::Connection) -> Result<()
             serde_json::to_string(&array).map_err(user_function_error)
         })
         .map_err(|error| error.to_string())?;
+    for (name, sample) in [("array_shuffle", false), ("array_sample", true)] {
+        connection
+            .create_scalar_function(
+                name,
+                if sample { 2 } else { 1 },
+                FunctionFlags::SQLITE_INNOCUOUS,
+                move |context| {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static SEED: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
+                    let mut array = parse_page_array(context.get::<String>(0)?.as_str())?;
+                    let mut state = SEED.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed)
+                        ^ std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_nanos() as u64)
+                            .unwrap_or(0);
+                    for index in (1..array.len()).rev() {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        array.swap(index, state as usize % (index + 1));
+                    }
+                    if sample {
+                        let count = context.get::<i64>(1)?;
+                        if count < 0 {
+                            return Err(user_function_error(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "sample size must not be negative",
+                            )));
+                        }
+                        array.truncate((count as usize).min(array.len()));
+                    }
+                    serde_json::to_string(&array).map_err(user_function_error)
+                },
+            )
+            .map_err(|error| error.to_string())?;
+    }
     connection
         .create_scalar_function("array_sort", -1, SAFE, |context| {
             let mut array = parse_page_array(context.get::<String>(0)?.as_str())?;
@@ -2573,6 +2620,8 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
             format!("page_array({})", &captures[1])
         })
         .into_owned();
+    translated = page_sql::lower_array_operators(&translated);
+    translated = page_sql::lower_json_operators(&translated);
 
     let extract = regex::Regex::new(r"(?i)\bEXTRACT\s*\(\s*([a-z_]+)\s+FROM\s+([^()]+?)\s*\)")
         .map_err(|error| error.to_string())?;
@@ -2593,12 +2642,15 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
         })
         .into_owned();
 
-    let aggregate = regex::Regex::new(r"(?i)\b(string_agg|bool_and|bool_or|every)\s*\(")
+    let aggregate = regex::Regex::new(r"(?i)\b(string_agg|array_agg|json_agg|jsonb_agg|json_object_agg|jsonb_object_agg|bool_and|bool_or|every)\s*\(")
         .map_err(|error| error.to_string())?;
     translated = aggregate
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             let function = match captures[1].to_ascii_lowercase().as_str() {
                 "string_agg" => "group_concat",
+                "array_agg" => "json_group_array",
+                "json_agg" | "jsonb_agg" => "json_group_array",
+                "json_object_agg" | "jsonb_object_agg" => "json_group_object",
                 "bool_or" => "max",
                 _ => "min",
             };
@@ -4111,6 +4163,122 @@ mod sql_query_tests {
     }
 
     #[test]
+    fn executes_complete_one_dimensional_array_operator_family() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            "SELECT ARRAY[1,2,3] @> ARRAY[2,3] AS contains, ARRAY[2] <@ ARRAY[1,2] AS contained, ARRAY[1,2] && ARRAY[2,4] AS overlaps, 2 = ANY(ARRAY[1,2,3]) AS any_match, 4 > ALL(ARRAY[1,2,3]) AS all_match, ARRAY[1,2] < ARRAY[1,3] AS ordered, array_to_string(ARRAY[1] || ARRAY[2,3], ',') AS concatenated, array_to_string(ARRAY[true,false], ',') AS booleans",
+        ).unwrap();
+        assert_eq!(
+            result.rows,
+            [[
+                serde_json::json!(1),
+                serde_json::json!(1),
+                serde_json::json!(1),
+                serde_json::json!(1),
+                serde_json::json!(1),
+                serde_json::json!(1),
+                serde_json::json!("1,2,3"),
+                serde_json::json!("true,false"),
+            ]]
+        );
+    }
+
+    #[test]
+    fn executes_array_subscripts_slices_and_element_concatenation() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            "WITH sample(items) AS (VALUES (ARRAY['a','b','c'])) SELECT items[2] AS item, array_to_string(items[2:3], ',') AS slice, array_to_string(ARRAY['a'] || 'b', ',') AS appended, array_to_string('a' || ARRAY['b'], ',') AS prepended FROM sample",
+        ).unwrap();
+        assert_eq!(
+            result.rows,
+            [[
+                serde_json::json!("b"),
+                serde_json::json!("b,c"),
+                serde_json::json!("a,b"),
+                serde_json::json!("a,b"),
+            ]]
+        );
+    }
+
+    #[test]
+    fn executes_json_path_containment_concat_and_delete_functions() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            r#"SELECT jsonb_extract_path_text('{"person":{"name":"Ada"}}', 'person', 'name') AS name, jsonb_contains('{"tags":["sql","rust"]}', '{"tags":["sql"]}') AS contains, jsonb_concat('{"a":1}', '{"b":2}') AS merged, jsonb_delete('{"a":1,"b":2}', 'a') AS deleted"#,
+        ).unwrap();
+        assert_eq!(result.rows[0][0], "Ada");
+        assert_eq!(result.rows[0][1], serde_json::json!(1));
+        assert_eq!(result.rows[0][2], serde_json::json!({"a": 1, "b": 2}));
+        assert_eq!(result.rows[0][3], serde_json::json!({"b": 2}));
+    }
+
+    #[test]
+    fn executes_postgres_jsonb_operator_family() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE sample(payload TEXT)", [])
+            .unwrap();
+        connection.execute(
+            r#"INSERT INTO sample VALUES ('{"person":{"name":"Ada"},"tags":["sql","rust"],"active":true}')"#,
+            [],
+        ).unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            r#"SELECT payload->'person' AS person, payload #>> ARRAY['person','name'] AS name, payload ? 'active' AS has_key, payload ?& ARRAY['active','tags'] AS has_all, payload @> '{"active":true}'::jsonb AS contains, payload - 'active' AS deleted FROM sample"#,
+        ).unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!({"name": "Ada"}));
+        assert_eq!(result.rows[0][1], "Ada");
+        assert_eq!(result.rows[0][2], serde_json::json!(1));
+        assert_eq!(result.rows[0][3], serde_json::json!(1));
+        assert_eq!(result.rows[0][4], serde_json::json!(1));
+        assert_eq!(
+            result.rows[0][5],
+            serde_json::json!({
+                "person": {"name": "Ada"}, "tags": ["sql", "rust"]
+            })
+        );
+    }
+
+    #[test]
+    fn exposes_the_supported_surface_through_pg_catalog() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let functions = run_readonly_sql(
+            &connection,
+            "SELECT proname FROM pg_catalog.pg_proc WHERE proname IN ('array_replace', 'jsonb_contains', 'regexp_like') ORDER BY proname",
+        ).unwrap();
+        assert_eq!(
+            functions.rows,
+            [
+                [serde_json::json!("array_replace")],
+                [serde_json::json!("jsonb_contains")],
+                [serde_json::json!("regexp_like")],
+            ]
+        );
+        let operators = run_readonly_sql(
+            &connection,
+            "SELECT oprname, oprleft, oprright FROM pg_catalog.pg_operator WHERE oprname = '@>' ORDER BY oprleft",
+        ).unwrap();
+        assert_eq!(
+            operators.rows,
+            [
+                [
+                    serde_json::json!("@>"),
+                    serde_json::json!("anyarray"),
+                    serde_json::json!("anyarray")
+                ],
+                [
+                    serde_json::json!("@>"),
+                    serde_json::json!("jsonb"),
+                    serde_json::json!("jsonb")
+                ],
+            ]
+        );
+    }
+
+    #[test]
     fn executes_required_null_and_concatenation_functions() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         let result = run_readonly_sql(
@@ -4266,6 +4434,74 @@ mod sql_query_tests {
                 serde_json::json!(0),
                 serde_json::json!(1),
             ]]
+        );
+    }
+
+    #[test]
+    fn executes_array_aggregates_and_window_functions() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            "WITH sample(group_name, value) AS (VALUES ('a', 2), ('a', 1), ('b', 5)) SELECT group_name, array_agg(value) AS values_seen, sum(value) AS total, row_number() OVER (ORDER BY group_name) AS row_number FROM sample GROUP BY group_name ORDER BY group_name",
+        ).unwrap();
+        assert_eq!(
+            result.rows,
+            [
+                [
+                    serde_json::json!("a"),
+                    serde_json::json!([2, 1]),
+                    serde_json::json!(3),
+                    serde_json::json!(1)
+                ],
+                [
+                    serde_json::json!("b"),
+                    serde_json::json!([5]),
+                    serde_json::json!(5),
+                    serde_json::json!(2)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn executes_postgresql_18_array_and_json_aggregate_additions() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            "WITH sample(key, value) AS (VALUES ('a', 1), ('b', 2)) SELECT cardinality(array_shuffle(ARRAY[1,2,3])) AS shuffled, cardinality(array_sample(ARRAY[1,2,3], 2)) AS sampled, json_agg(value) AS json_values, jsonb_object_agg(key, value) AS json_object FROM sample",
+        ).unwrap();
+        assert_eq!(result.rows[0][0], serde_json::json!(3));
+        assert_eq!(result.rows[0][1], serde_json::json!(2));
+        assert_eq!(result.rows[0][2], serde_json::json!([1, 2]));
+        assert_eq!(result.rows[0][3], serde_json::json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn executes_promised_select_cte_join_subquery_group_case_and_filter_surface() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            "WITH people(id, company, active) AS (VALUES (1, 'A', true), (2, 'A', false), (3, 'B', true)), companies(name) AS (VALUES ('A'), ('B')) SELECT c.name, CASE WHEN count(*) FILTER (WHERE p.active) > 0 THEN 'active' ELSE 'idle' END AS status, count(*) AS people FROM companies c JOIN people p ON p.company = c.name WHERE p.id IN (SELECT id FROM people WHERE id > 0) GROUP BY c.name HAVING count(*) >= 1 UNION ALL SELECT 'Z', 'idle', 0 ORDER BY name FETCH FIRST 10 ROWS ONLY",
+        ).unwrap();
+        assert_eq!(
+            result.rows,
+            [
+                [
+                    serde_json::json!("A"),
+                    serde_json::json!("active"),
+                    serde_json::json!(2)
+                ],
+                [
+                    serde_json::json!("B"),
+                    serde_json::json!("active"),
+                    serde_json::json!(1)
+                ],
+                [
+                    serde_json::json!("Z"),
+                    serde_json::json!("idle"),
+                    serde_json::json!(0)
+                ],
+            ]
         );
     }
 

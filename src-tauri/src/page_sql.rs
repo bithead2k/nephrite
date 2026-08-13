@@ -315,12 +315,11 @@ pub fn lower_page_sql(
     if std::hint::black_box(false) {
         retain_page_expr_surface();
     }
-    let _ = residual_textual; // residual is included inside full_textual today
-                              // Drop comments before AST/residual so `-- …` never confuses rewrites and
-                              // SQLite receives clean text (both dialects allow comments; stripping is safer).
+    // Drop comments before AST/residual so `-- …` never confuses rewrites and
+    // SQLite receives clean text (both dialects allow comments; stripping is safer).
     let sql = strip_sql_comments(sql);
     match try_ast_lower(&sql)? {
-        Some(rewritten) => full_textual(&rewritten),
+        Some(rewritten) => residual_textual(&rewritten),
         None => full_textual(&sql),
     }
 }
@@ -475,6 +474,11 @@ fn collect_rewrites(
             }
             NodeRef::SubscriptingRef(sub) => {
                 if let Some(rw) = lower_subscript(sql, sub, tokens)? {
+                    out.push(rw);
+                }
+            }
+            NodeRef::AIndirection(indirection) => {
+                if let Some(rw) = lower_aindirection(sql, indirection, tokens)? {
                     out.push(rw);
                 }
             }
@@ -979,6 +983,74 @@ fn lower_subscript(
     Ok(None)
 }
 
+fn lower_aindirection(
+    sql: &str,
+    indirection: &protobuf::AIndirection,
+    tokens: &[protobuf::ScanToken],
+) -> Result<Option<AstRewrite>, String> {
+    let Some((column, location)) = indirection.arg.as_ref().and_then(|node| column_ref(node))
+    else {
+        return Ok(None);
+    };
+    let Some(start) = column_start(sql, &column, location, 0) else {
+        return Ok(None);
+    };
+    let mut expression = PageExpr::Column(column.clone());
+    let properties = column == "properties" || column.ends_with(".properties");
+    for node in &indirection.indirection {
+        let Some(NodeEnum::AIndices(index)) = &node.node else {
+            return Ok(None);
+        };
+        if properties {
+            let Some(key) = index.uidx.as_ref().and_then(|node| string_const(node)) else {
+                return Ok(None);
+            };
+            expression = PageExpr::PropertyGet {
+                base: Box::new(expression),
+                key,
+            };
+        } else {
+            let upper = index
+                .uidx
+                .as_ref()
+                .and_then(|node| literal_expr(node))
+                .map(|value| value.emit())
+                .unwrap_or_else(|| "NULL".into());
+            if index.is_slice {
+                let lower = index
+                    .lidx
+                    .as_ref()
+                    .and_then(|node| literal_expr(node))
+                    .map(|value| value.emit())
+                    .unwrap_or_else(|| "NULL".into());
+                expression = PageExpr::Raw(format!(
+                    "page_array_slice({}, {lower}, {upper})",
+                    expression.emit()
+                ));
+            } else {
+                expression =
+                    PageExpr::Raw(format!("page_array_get({}, {upper})", expression.emit()));
+            }
+        }
+    }
+    let mut end = start + column.len();
+    for _ in &indirection.indirection {
+        let Some(open_rel) = sql[end..].find('[') else {
+            return Ok(None);
+        };
+        let open = end + open_rel;
+        let Some(next_end) = find_closing_bracket_end(sql, tokens, open) else {
+            return Ok(None);
+        };
+        end = next_end;
+    }
+    Ok(Some(AstRewrite {
+        start,
+        end,
+        replacement: expression.emit(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Span recovery helpers (token scan + location hints)
 // ---------------------------------------------------------------------------
@@ -1323,15 +1395,7 @@ fn lower_aarrayexpr(
     if end <= start || !sql.is_char_boundary(start) || !sql.is_char_boundary(end) {
         return Ok(None);
     }
-    let elems: Vec<PageExpr> = arr
-        .elements
-        .iter()
-        .filter_map(|n| {
-            string_const(n)
-                .map(|s| PageExpr::Raw(format!("'{s}'")))
-                .or_else(|| column_name(n).map(PageExpr::Column))
-        })
-        .collect();
+    let elems: Vec<PageExpr> = arr.elements.iter().filter_map(literal_expr).collect();
     if elems.is_empty() && !arr.elements.is_empty() {
         // Unrecognized element shapes — leave for residual textual.
         return Ok(None);
@@ -1536,6 +1600,9 @@ fn lower_funccall(
     // Aggregate renames that residual also handles.
     let sqlite = match name_l.as_str() {
         "string_agg" => Some("group_concat"),
+        "array_agg" => Some("json_group_array"),
+        "json_agg" | "jsonb_agg" => Some("json_group_array"),
+        "json_object_agg" | "jsonb_object_agg" => Some("json_group_object"),
         "bool_or" => Some("max"),
         "bool_and" | "every" => Some("min"),
         _ => None,
@@ -1788,6 +1855,32 @@ fn string_const(node: &protobuf::Node) -> Option<String> {
     }
 }
 
+fn literal_expr(node: &protobuf::Node) -> Option<PageExpr> {
+    match &node.node {
+        Some(NodeEnum::AConst(value)) if value.isnull => Some(PageExpr::Raw("NULL".into())),
+        Some(NodeEnum::AConst(value)) => match &value.val {
+            Some(protobuf::a_const::Val::Ival(value)) => {
+                Some(PageExpr::Raw(value.ival.to_string()))
+            }
+            Some(protobuf::a_const::Val::Fval(value)) => Some(PageExpr::Raw(value.fval.clone())),
+            Some(protobuf::a_const::Val::Boolval(value)) => Some(PageExpr::Raw(format!(
+                "page_bool({})",
+                if value.boolval { 1 } else { 0 }
+            ))),
+            Some(protobuf::a_const::Val::Sval(value)) => Some(PageExpr::Raw(format!(
+                "'{}'",
+                escape_sql_string(&value.sval)
+            ))),
+            Some(protobuf::a_const::Val::Bsval(value)) => Some(PageExpr::Raw(format!(
+                "'{}'",
+                escape_sql_string(&value.bsval)
+            ))),
+            None => None,
+        },
+        _ => column_name(node).map(PageExpr::Column),
+    }
+}
+
 fn const_location(node: &protobuf::Node) -> Option<i32> {
     match &node.node {
         Some(NodeEnum::AConst(c)) => Some(c.location),
@@ -1913,15 +2006,7 @@ pub fn analyze_page_forms(sql: &str) -> Result<Vec<PageExpr>, String> {
                 }
             }
             NodeRef::AArrayExpr(arr) => {
-                let elems: Vec<PageExpr> = arr
-                    .elements
-                    .iter()
-                    .filter_map(|n| {
-                        string_const(n)
-                            .map(|s| PageExpr::Raw(format!("'{s}'")))
-                            .or_else(|| column_name(n).map(PageExpr::Column))
-                    })
-                    .collect();
+                let elems: Vec<PageExpr> = arr.elements.iter().filter_map(literal_expr).collect();
                 forms.push(PageExpr::ArrayLit(elems));
             }
             NodeRef::FuncCall(func) => {
@@ -2135,6 +2220,174 @@ pub fn lower_pg_syntax(sql: &str) -> String {
     out
 }
 
+/// Lower PostgreSQL's one-dimensional array operator family after ARRAY
+/// constructors have become `page_array(...)`. The parser gate has already
+/// validated the statement, so these rewrites only bridge SQLite grammar.
+pub fn lower_array_operators(sql: &str) -> String {
+    let atom = r"(?:page_array\([^()]*\)|[A-Za-z_][A-Za-z0-9_$.]*)";
+    let scalar = r"(?:page_property\([^()]*\)|'(?:''|[^'])*'|-?[0-9]+(?:\.[0-9]+)?|[A-Za-z_][A-Za-z0-9_$.]*)";
+    let mut out = sql.to_string();
+
+    // scalar OP ANY/ALL(array), including every comparison operator supported
+    // by PostgreSQL's quantified array predicates.
+    if let Ok(re) = regex::Regex::new(&format!(
+        r"(?i)({scalar})\s*(=|<>|!=|<=|>=|<|>)\s*(ANY|ALL)\s*\(\s*({atom})\s*\)"
+    )) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!(
+                    "page_array_quantified({}, '{}', '{}', {})",
+                    &c[1],
+                    &c[2],
+                    c[3].to_ascii_uppercase(),
+                    &c[4]
+                )
+            })
+            .into_owned();
+    }
+
+    // Slices precede scalar subscripts so `a[2:4]` is consumed as one unit.
+    if let Ok(re) = regex::Regex::new(&format!(
+        r"(?i)({atom})\s*\[\s*([0-9]*)\s*:\s*([0-9]*)\s*\]"
+    )) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let lower = if c[2].is_empty() { "NULL" } else { &c[2] };
+                let upper = if c[3].is_empty() { "NULL" } else { &c[3] };
+                format!("page_array_slice({}, {lower}, {upper})", &c[1])
+            })
+            .into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({atom})\s*\[\s*([0-9]+)\s*\]")) {
+        out = re.replace_all(&out, "page_array_get($1, $2)").into_owned();
+    }
+
+    for (operator, function, reverse) in [
+        ("@>", "page_array_contains", false),
+        ("<@", "page_array_contains", true),
+        ("&&", "page_array_overlap", false),
+    ] {
+        if let Ok(re) = regex::Regex::new(&format!(
+            r"(?i)({atom})\s*{}\s*({atom})",
+            regex::escape(operator)
+        )) {
+            out = re
+                .replace_all(&out, |c: &regex::Captures<'_>| {
+                    if reverse {
+                        format!("{function}({}, {})", &c[2], &c[1])
+                    } else {
+                        format!("{function}({}, {})", &c[1], &c[2])
+                    }
+                })
+                .into_owned();
+        }
+    }
+
+    let array_call = r"page_array\([^()]*\)";
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({array_call})\s*\|\|\s*({array_call})")) {
+        out = re
+            .replace_all(&out, "page_array_concat($1, $2)")
+            .into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({array_call})\s*\|\|\s*({scalar})")) {
+        out = re.replace_all(&out, "array_append($1, $2)").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({scalar})\s*\|\|\s*({array_call})")) {
+        out = re.replace_all(&out, "array_prepend($1, $2)").into_owned();
+    }
+
+    // Array ordering/equality is lexicographic in PostgreSQL. Restrict this
+    // bridge to expressions containing an explicit page_array constructor so
+    // ordinary scalar comparisons remain native SQLite expressions.
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({atom})\s*(=|<>|!=|<=|>=|<|>)\s*({atom})")) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                if !c[1].to_ascii_lowercase().starts_with("page_array(")
+                    && !c[3].to_ascii_lowercase().starts_with("page_array(")
+                {
+                    return c[0].to_string();
+                }
+                let op = match &c[2] {
+                    "=" => "=",
+                    "<>" | "!=" => "!=",
+                    other => other,
+                };
+                format!("page_array_compare({}, {}) {op} 0", &c[1], &c[3])
+            })
+            .into_owned();
+    }
+
+    out
+}
+
+/// Lower JSON/JSONB extraction and mutation-free operators used by page
+/// property expressions. JSON remains serialized text inside SQLite.
+pub fn lower_json_operators(sql: &str) -> String {
+    let source = r"(?:page_property\([^()]*\)|[A-Za-z_][A-Za-z0-9_$.]*)";
+    let json_literal = r"'(?:''|[^'])*'";
+    let mut out = sql.to_string();
+    if let Ok(re) = regex::Regex::new(&format!(
+        r"(?i)({source})\s*(#>>|#>)\s*page_array\(([^()]*)\)"
+    )) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let function = if &c[2] == "#>>" {
+                    "jsonb_extract_path_text"
+                } else {
+                    "jsonb_extract_path"
+                };
+                format!("{function}({}, {})", &c[1], &c[3])
+            })
+            .into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(
+        r"(?i)({source})\s*(->>|->)\s*('(?:''|[^'])*'|[0-9]+)"
+    )) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let function = if &c[2] == "->>" {
+                    "jsonb_extract_path_text"
+                } else {
+                    "jsonb_extract_path"
+                };
+                format!("{function}({}, {})", &c[1], &c[3])
+            })
+            .into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({source})\s*-\s*('(?:''|[^'])*'|-?[0-9]+)")) {
+        out = re.replace_all(&out, "jsonb_delete($1, $2)").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(
+        r"(?i)({source})\s*\?([&|])\s*(page_array\([^()]*\))"
+    )) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let function = if &c[2] == "&" {
+                    "jsonb_exists_all"
+                } else {
+                    "jsonb_exists_any"
+                };
+                format!("{function}({}, {})", &c[1], &c[3])
+            })
+            .into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({source})\s*\?\s*({json_literal})")) {
+        out = re.replace_all(&out, "jsonb_exists($1, $2)").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({source})\s*@>\s*({json_literal})")) {
+        out = re.replace_all(&out, "jsonb_contains($1, $2)").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(r"(?i)({json_literal})\s*<@\s*({source})")) {
+        out = re.replace_all(&out, "jsonb_contains($2, $1)").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(&format!(
+        r"(?i)((?:[A-Za-z_][A-Za-z0-9_$.]*properties|properties|page_property\([^()]*\)))\s*\|\|\s*({json_literal})"
+    )) {
+        out = re.replace_all(&out, "jsonb_concat($1, $2)").into_owned();
+    }
+    out
+}
+
 fn similar_to_rust_regex(quoted_pat: &str) -> String {
     // Strip surrounding quotes; convert SIMILAR TO metacharacters to Rust regex.
     let inner = quoted_pat.trim().trim_matches('\'').replace("''", "'");
@@ -2270,17 +2523,17 @@ mod tests {
     }
 
     #[test]
-    fn lower_page_sql_runs_full_textual_after_ast() {
+    fn lower_page_sql_runs_only_residual_after_ast() {
         let sql = "SELECT path FROM pages WHERE tags @> ARRAY['x']";
         let out = lower_page_sql(
             sql,
-            |s| Ok(format!("/*full*/{s}")),
-            |_s| panic!("residual callback unused (folded into full)"),
+            |_s| panic!("full callback must not run after an AST rewrite"),
+            |s| Ok(format!("/*residual*/{s}")),
         )
         .unwrap();
         assert!(
-            out.starts_with("/*full*/"),
-            "full textual not applied: {out}"
+            out.starts_with("/*residual*/"),
+            "residual lowering not applied: {out}"
         );
         assert!(out.contains("page_has_tag"), "AST rewrite missing: {out}");
         assert!(!out.contains("@>"), "operator remains: {out}");
@@ -2376,6 +2629,36 @@ mod tests {
         assert!(
             !out.contains("page_property(properties, 'company' AS"),
             "paren swallowed AS: {out}"
+        );
+    }
+
+    #[test]
+    fn ast_lowers_property_and_array_indirection_without_textual_page_fallback() {
+        let sql = "SELECT properties['company'] AS company, tags[2:3] AS selected FROM pages";
+        let out = lower_page_sql(
+            sql,
+            |_sql| panic!("AST indirection should not need the full textual fallback"),
+            |sql| Ok(sql.to_string()),
+        )
+        .unwrap();
+        assert!(
+            out.contains("page_property(properties, 'company') AS company"),
+            "{out}"
+        );
+        assert!(
+            out.contains("page_array_slice(tags, 2, 3) AS selected"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ast_array_literals_preserve_scalar_types() {
+        let out = try_ast_lower("SELECT ARRAY[1, 2.5, true, NULL, 'four']")
+            .unwrap()
+            .expect("array should lower");
+        assert!(
+            out.contains("page_array(1, 2.5, page_bool(1), NULL, 'four')"),
+            "{out}"
         );
     }
 
