@@ -55,9 +55,11 @@ import {
 } from "./context-menu";
 import {
   clearScrollSync,
+  CURSOR_SYNC_DELAY_MS,
   rebindScrollSync,
   setEditorDocumentEnd,
   syncEditorCursorMovement,
+  withoutScrollSync,
 } from "./scroll-sync";
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
 import { findTaskCheckboxEdit } from "./tasks";
@@ -2512,22 +2514,211 @@ async function openToday() {
 }
 
 async function openWikilink(target: string) {
-  const { note, heading } = splitWikilinkTarget(target);
-  if (!note && !heading) return;
+  const { note, heading, block } = splitWikilinkTarget(target);
+  if (!note && !heading && !block) return;
   try {
-    const resolved = await invoke<string | null>("resolve_wikilink", {
-      target: note || currentPath || "",
-      fromPath: currentPath,
-    });
-    if (!resolved) {
+    // Same-note fragment link: [[#Heading]] / [[#^block]] — do not reload (setDoc resets caret).
+    if (!note && (heading || block) && currentPath) {
+      jumpToWikilinkFragment(heading, block);
+      return;
+    }
+
+    const resolved = note
+      ? await invoke<string | null>("resolve_wikilink", {
+          target: note,
+          fromPath: currentPath,
+        })
+      : currentPath;
+
+    if (resolved) {
+      if (resolved === currentPath) {
+        jumpToWikilinkFragment(heading, block);
+        return;
+      }
+      await openNote(resolved);
+      // Defer past openNote's setDoc/focus/preview so the caret sticks.
+      requestAnimationFrame(() => jumpToWikilinkFragment(heading, block));
+      return;
+    }
+    // Missing target: create the note (wiki click-to-create) and open it.
+    if (!note) {
       alert(`Could not resolve [[${target}]]`);
       return;
     }
-    await openNote(resolved);
-    void heading;
+    const path = pathForNewWikilink(note);
+    const title = path
+      .replace(/\.md$/i, "")
+      .split("/")
+      .pop() || "Untitled";
+    const content = `# ${title}
+
+`;
+    try {
+      await invoke("create_file", { path, content });
+    } catch (createErr) {
+      // If the file appeared between resolve and create, open it.
+      const message = createErr instanceof Error ? createErr.message : String(createErr);
+      if (!/already exists|exists/i.test(message)) {
+        throw createErr;
+      }
+    }
+    await refreshTree();
+    await openNote(path);
+    requestAnimationFrame(() => jumpToWikilinkFragment(heading, block));
   } catch (e) {
     alert(String(e));
   }
+}
+
+/** Vault-relative path for a missing wikilink target (Obsidian-style). */
+function pathForNewWikilink(note: string): string {
+  let key = note.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!key) key = "Untitled";
+  // Strip accidental .md for title handling; re-add below.
+  const hasExt = /\.md$/i.test(key);
+  if (!hasExt) key = `${key}.md`;
+  // Path-like targets are vault-relative.
+  if (key.includes("/")) return key;
+  // Bare names land next to the current note when possible.
+  if (currentPath && currentPath.includes("/")) {
+    const dir = currentPath.slice(0, currentPath.lastIndexOf("/"));
+    return `${dir}/${key}`;
+  }
+  return key;
+}
+
+function jumpToWikilinkFragment(
+  heading: string | null,
+  block: string | null,
+) {
+  if (currentFileKind !== "markdown") return;
+
+  const edScroll = editor?.scrollElement() ?? null;
+  const previewHost = document.getElementById("preview-host");
+
+  const applyEditor = () => {
+    if (!editor) return;
+    const doc = editor.getDoc();
+    if (heading) {
+      const line = findMarkdownHeadingLine(doc, heading);
+      if (line != null) editor.goToLine(line);
+    } else if (block) {
+      const line = findMarkdownBlockLine(doc, block);
+      if (line != null) editor.goToLine(line);
+    }
+  };
+
+  const applyPreview = () => {
+    // Element-based scroll on #preview-host (not ratio sync — different content height).
+    if (heading) scrollPreviewToHeading(heading);
+    else if (block) scrollPreviewToBlock(block);
+  };
+
+  // Editor jump under suppress so goToLine does not schedule ratio sync unchecked.
+  if (edScroll) withoutScrollSync(edScroll, applyEditor);
+  else applyEditor();
+
+  // Preview: set scrollTop now, then again after cursor-sync delay so we win the race.
+  const runPreview = () => {
+    if (previewHost) withoutScrollSync(previewHost, applyPreview);
+    else applyPreview();
+  };
+  runPreview();
+  window.setTimeout(runPreview, CURSOR_SYNC_DELAY_MS + 30);
+  window.setTimeout(runPreview, CURSOR_SYNC_DELAY_MS + 100);
+}
+
+/**
+ * Scroll `#preview-host` so `el` sits ~35% from the top (readable, not edge-clipped).
+ * Uses scrollTop math against the real scroller — not scrollIntoView (wrong ancestor / sync fights).
+ */
+function scrollChildIntoPreviewHost(host: HTMLElement, el: HTMLElement) {
+  const hostRect = host.getBoundingClientRect();
+  const elRect = el.getBoundingClientRect();
+  const delta = elRect.top - hostRect.top;
+  const next = host.scrollTop + delta - host.clientHeight * 0.35;
+  const max = Math.max(0, host.scrollHeight - host.clientHeight);
+  host.scrollTop = Math.max(0, Math.min(next, max));
+}
+
+/** Scroll preview pane to an ATX heading by visible text. */
+function scrollPreviewToHeading(heading: string) {
+  const host = document.getElementById("preview-host");
+  if (!host) return;
+  const want = normalizeHeadingKey(heading);
+  if (!want) return;
+  const headings = host.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6");
+  for (const el of headings) {
+    if (normalizeHeadingKey(el.textContent || "") === want) {
+      scrollChildIntoPreviewHost(host, el);
+      return;
+    }
+  }
+  const slug = want.replace(/\s+/g, "-");
+  const byId =
+    host.querySelector<HTMLElement>(`#${cssEscape(slug)}`) ||
+    host.querySelector<HTMLElement>(`[id^="${cssEscape(slug)}"]`);
+  if (byId) scrollChildIntoPreviewHost(host, byId);
+}
+
+function scrollPreviewToBlock(blockId: string) {
+  const host = document.getElementById("preview-host");
+  if (!host) return;
+  const want = blockId.trim().toLowerCase();
+  if (!want) return;
+  const byId =
+    host.querySelector<HTMLElement>(`#${cssEscape(want)}`) ||
+    host.querySelector<HTMLElement>(`#user-content-${cssEscape(want)}`) ||
+    host.querySelector<HTMLElement>(`[id*="${cssEscape(want)}"]`);
+  if (byId) {
+    scrollChildIntoPreviewHost(host, byId);
+    return;
+  }
+  for (const el of host.querySelectorAll<HTMLElement>("p, li, blockquote, h1, h2, h3, h4, h5, h6")) {
+    if ((el.textContent || "").toLowerCase().includes("^" + want)) {
+      scrollChildIntoPreviewHost(host, el);
+      return;
+    }
+  }
+}
+
+function cssEscape(value: string): string {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return CSS.escape(value);
+  }
+  return value.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+}
+
+/** 1-based line of an ATX heading matching `heading`. */
+function findMarkdownHeadingLine(doc: string, heading: string): number | null {
+  const want = normalizeHeadingKey(heading);
+  if (!want) return null;
+  const lines = doc.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(lines[i]);
+    if (!m) continue;
+    if (normalizeHeadingKey(m[2]) === want) return i + 1;
+  }
+  return null;
+}
+
+/** 1-based line of a `^block` marker. */
+function findMarkdownBlockLine(doc: string, blockId: string): number | null {
+  const want = blockId.trim().toLowerCase();
+  if (!want) return null;
+  const lines = doc.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].toLowerCase().includes("^" + want)) return i + 1;
+  }
+  return null;
+}
+
+function normalizeHeadingKey(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/gi, "")
+    .replace(/\s+/g, " ");
 }
 
 function scheduleAutosave() {

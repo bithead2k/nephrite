@@ -68,32 +68,20 @@ translation so additional operators can be added without fragile regexes.
 ## AST → IR lowering
 
 Native page SQL walks the `libpg_query` parse tree, lowers recognized forms
-into `PageExpr` (`src-tauri/src/page_sql.rs`), recovers spans (token scan +
-node locations + name-search fallback), and rewrites those spans to SQLite
-helpers.
-
-Pipeline:
-
-1. **AST rewrite** of recognized page forms, FuncCalls, arrays, null tests, casts.
-2. **EXTRACT keyword** scan for raw `EXTRACT(field FROM expr)` not already covered.
-3. **Residual textual** (`ARRAY` / remaining EXTRACT / aggregates) when AST applied.
-4. **Full textual** forms+residual when AST finds nothing.
+into a small intermediate representation (`PageExpr` in
+`src-tauri/src/page_sql.rs`), recovers source spans via token scan + node
+locations, and rewrites those spans to SQLite helpers:
 
 | Form | IR | Emission |
 |------|----|----------|
-| `tags` / `aliases` `@> ARRAY[...]` | `AllTags` | `page_has_tag` AND |
-| `tags` / `aliases` `&& ARRAY[...]` | `AnyTag` | `page_has_tag` OR |
-| `'x' = ANY(tags\|aliases)` | `HasTag` | `page_has_tag` |
-| `properties ? 'key'` | `HasKey` | `page_has_key` |
-| `properties ?&` / `?\|` `ARRAY[...]` | `AllKeys` / `AnyKeys` | AND / OR of `page_has_key` |
-| `jsonb_exists(properties, 'key')` | `HasKey` | `page_has_key` |
-| `jsonb_exists_all` / `_any` | `AllKeys` / `AnyKeys` | AND / OR of `page_has_key` |
-| `properties->'key'` / `->>'key'` / `[...]` | `PropertyGet` | `page_property` |
-| `ARRAY[...]` (standalone / casted) | `ArrayLit` | `page_array` |
-| `date_part` / `extract` / `EXTRACT(...)` | `DatePart` | `date_part('field', …)` |
-| `string_agg` / `bool_or` / `bool_and` / `every` | `AggRename` | SQLite aggregates |
-| `… IS [NOT] NULL` on page forms | `NullCheck` | null test on lowered expr |
-| `TypeCast` wrappers | (peeled) | inner lowerer |
+| `tags` / `aliases` `@> ARRAY[...]` | `AllTags` | `page_has_tag` AND chain |
+| `tags` / `aliases` `&& ARRAY[...]` | `AnyTag` | `page_has_tag` OR chain |
+| `'x' = ANY(tags\|aliases)` | `HasTag` | `page_has_tag(...)` |
+| `properties ? 'key'` | `HasKey` | `page_has_key(...)` |
+| `properties->'key'` / `->>'key'` | `PropertyGet` | `page_property(...)` |
+| `properties['key']` (SubscriptingRef) | `PropertyGet` | `page_property(...)` when span recovered |
 
-`analyze_page_forms(sql)` returns IR for diagnostics and tests.
+`analyze_page_forms(sql)` returns the IR for diagnostics and tests.
 
+Residual forms (EXTRACT, aggregates, bare ARRAY constructors not consumed
+above) still go through the textual translator after AST rewrites.

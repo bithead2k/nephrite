@@ -1,0 +1,13 @@
+--- src-tauri/src/page_sql.rs
++++ src-tauri/src/page_sql.rs
+@@ -2,7 +2,9 @@
+         retain_page_expr_surface();
+     }
+     match try_ast_lower(sql)? {
+-        Some(rewritten) => residual_textual(&rewritten),
++        // Always run full textual forms after AST. Residual-only left
++        // properties['key'] intact when AST rewrote a different fragment.
++        Some(rewritten) => full_textual(&rewritten),
+         None => full_textual(sql),
+     }
+ }

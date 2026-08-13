@@ -1,16 +1,19 @@
 mod state;
 mod postgres_compat;
+mod page_sql;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
 use nephrite_index::{ProgressPhase, VaultIndex, PROJECT_VERSION};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::AppState;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Serialize)]
@@ -66,6 +69,150 @@ pub struct MediaFile {
     pub path: String,
     pub mime: String,
     pub data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginManifestFile {
+    id: String,
+    name: String,
+    version: String,
+    main: Option<String>,
+    description: Option<String>,
+    permissions: Option<Vec<String>>,
+    api_version: Option<u32>,
+    min_app_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDescriptor {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub permissions: Vec<String>,
+    pub api_version: u32,
+    pub min_app_version: Option<String>,
+    pub source: String,
+}
+
+const MAX_PLUGIN_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+const PLUGIN_PERMISSIONS: &[&str] = &[
+    "vault.read",
+    "vault.write",
+    "index.query",
+    "editor.read",
+    "editor.write",
+    "workspace.commands",
+    "workspace.views",
+    "shell.execute",
+];
+
+fn valid_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 96
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Discover isolated plugins under `.nephrite/plugins/<id>/manifest.json`.
+/// The frontend never receives arbitrary host paths, only validated source.
+#[tauri::command]
+fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, String> {
+    let root = {
+        let guard = state.index.lock();
+        guard
+            .as_ref()
+            .ok_or_else(|| "No vault open".to_string())?
+            .vault_root()
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+    };
+    let plugin_root = root.join(".nephrite").join("plugins");
+    if !plugin_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let canonical_plugin_root = plugin_root.canonicalize().map_err(|error| error.to_string())?;
+    let mut plugins = Vec::new();
+    let entries = std::fs::read_dir(&plugin_root).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let manifest_text = std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        let manifest: PluginManifestFile = serde_json::from_str(&manifest_text)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        if !valid_plugin_id(&manifest.id) || entry.file_name().to_string_lossy() != manifest.id {
+            return Err(format!(
+                "Plugin folder and manifest id must match: {}",
+                entry.path().display()
+            ));
+        }
+        let main = manifest.main.unwrap_or_else(|| "main.js".to_string());
+        let canonical_entry = entry.path().canonicalize().map_err(|error| error.to_string())?;
+        let main_path = canonical_entry.join(main.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let canonical_main = main_path
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", main_path.display()))?;
+        if !canonical_main.starts_with(&canonical_plugin_root) || !canonical_main.starts_with(&canonical_entry) {
+            return Err(format!("Plugin main file escapes its folder: {}", manifest.id));
+        }
+        let metadata = std::fs::metadata(&canonical_main).map_err(|error| error.to_string())?;
+        if metadata.len() > MAX_PLUGIN_SOURCE_BYTES {
+            return Err(format!("Plugin {} exceeds the 2 MiB source limit", manifest.id));
+        }
+        let permissions = manifest.permissions.unwrap_or_default();
+        if let Some(permission) = permissions
+            .iter()
+            .find(|permission| !PLUGIN_PERMISSIONS.contains(&permission.as_str()))
+        {
+            return Err(format!("Plugin {} requests unknown permission: {permission}", manifest.id));
+        }
+        plugins.push(PluginDescriptor {
+            id: manifest.id,
+            name: manifest.name,
+            version: manifest.version,
+            description: manifest.description.unwrap_or_default(),
+            permissions,
+            api_version: manifest.api_version.unwrap_or(1),
+            min_app_version: manifest.min_app_version,
+            source: std::fs::read_to_string(&canonical_main)
+                .map_err(|error| format!("{}: {error}", canonical_main.display()))?,
+        });
+    }
+    plugins.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    Ok(plugins)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AttachmentRow {
+    pub path: String,
+    pub name: String,
+    pub file_kind: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub reference_count: i64,
+    pub orphaned: bool,
+    pub text_indexed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskScope {
+    pub folders: Vec<String>,
+    pub tags: Vec<String>,
+    pub property: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -441,61 +588,147 @@ fn reconcile_vault(index: &mut VaultIndex) -> Result<VaultChangeEvent, String> {
     })
 }
 
-/// A lightweight background reconciler catches changes made by scripts,
-/// editors, sync tools, and shell commands. Reconcile compares filesystem
-/// metadata first and parses only changed files, so the steady-state scan does
-/// not reread Markdown contents.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(350);
+const WATCH_SAFETY_RECONCILE: Duration = Duration::from_secs(60);
+
+fn watcher_event_is_relevant(root: &Path, event: &Event) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    // Some backends report a rescan/overflow without individual paths. A full
+    // reconciliation is the only safe response to those notifications.
+    if event.paths.is_empty() {
+        return true;
+    }
+    event.paths.iter().any(|path| {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let relative_text = relative.to_string_lossy().replace('\\', "/");
+        if relative_text == ".git" || relative_text.starts_with(".git/") {
+            return false;
+        }
+        // SQLite changes these files while reconciling. Watching them would
+        // turn every index update into another index update.
+        !matches!(
+            relative_text.as_str(),
+            ".nephrite/index.db"
+                | ".nephrite/index.db-shm"
+                | ".nephrite/index.db-wal"
+                | ".nephrite/index.db-journal"
+        )
+    })
+}
+
+fn reconcile_and_emit(
+    app: &AppHandle,
+    index: &Arc<Mutex<Option<VaultIndex>>>,
+    watcher_generation: &AtomicU64,
+    generation: u64,
+) -> bool {
+    if watcher_generation.load(Ordering::Acquire) != generation {
+        return false;
+    }
+    let result = {
+        let mut guard = index.lock();
+        let Some(index) = guard.as_mut() else {
+            return false;
+        };
+        reconcile_vault(index)
+    };
+    if watcher_generation.load(Ordering::Acquire) != generation {
+        return false;
+    }
+    match result {
+        Ok(change) if change.updated > 0 || change.removed > 0 => {
+            let _ = app.emit("vault-index-changed", change);
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("vault watcher reconcile failed: {error}"),
+    }
+    true
+}
+
+/// Use the operating system's recursive file watcher for prompt external
+/// updates. Bursts are coalesced before reconciling, and a slow periodic pass
+/// remains as a safety net for backend overflows and network filesystems.
 fn start_vault_watcher(
     app: AppHandle,
     index: Arc<Mutex<Option<VaultIndex>>>,
     watcher_generation: Arc<AtomicU64>,
     generation: u64,
 ) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(1_000));
-        if watcher_generation.load(Ordering::Acquire) != generation {
-            break;
-        }
-        // Clone only the root while holding the database mutex. Walking a
-        // large vault can take long enough to starve query hydration if the
-        // walk shares this lock with SQL and DataviewJS.
+    std::thread::spawn(move || {
         let root = {
             let guard = index.lock();
             let Some(index) = guard.as_ref() else {
-                break;
+                return;
             };
             index.vault_root().to_path_buf()
         };
-        let disk = match VaultIndex::scan_vault_files(&root) {
-            Ok(disk) => disk,
+
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        }) {
+            Ok(watcher) => watcher,
             Err(error) => {
-                eprintln!("vault watcher scan failed: {error}");
-                continue;
+                eprintln!("native vault watcher unavailable: {error}");
+                while watcher_generation.load(Ordering::Acquire) == generation {
+                    std::thread::sleep(WATCH_SAFETY_RECONCILE);
+                    if !reconcile_and_emit(
+                        &app,
+                        &index,
+                        &watcher_generation,
+                        generation,
+                    ) {
+                        return;
+                    }
+                }
+                return;
             }
         };
-        if watcher_generation.load(Ordering::Acquire) != generation {
-            break;
+        if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
+            eprintln!("native vault watcher could not watch {}: {error}", root.display());
+            return;
         }
-        let change = {
-            let mut guard = index.lock();
-            let Some(index) = guard.as_mut() else {
-                break;
-            };
-            match index.filesystem_changed_from(&disk) {
-                Ok(false) => None,
-                Ok(true) => Some(reconcile_vault(index)),
-                Err(error) => Some(Err(error.to_string())),
+
+        let mut last_reconcile = Instant::now();
+        while watcher_generation.load(Ordering::Acquire) == generation {
+            let safety_due = WATCH_SAFETY_RECONCILE.saturating_sub(last_reconcile.elapsed());
+            match receiver.recv_timeout(safety_due) {
+                Ok(Ok(event)) if watcher_event_is_relevant(&root, &event) => {
+                    // Drain and coalesce the rest of this save/sync burst. The
+                    // deadline moves forward for each relevant event.
+                    let mut deadline = Instant::now() + WATCH_DEBOUNCE;
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match receiver.recv_timeout(remaining) {
+                            Ok(Ok(event)) if watcher_event_is_relevant(&root, &event) => {
+                                deadline = Instant::now() + WATCH_DEBOUNCE;
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => eprintln!("vault watcher event error: {error}"),
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
+                        return;
+                    }
+                    last_reconcile = Instant::now();
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("vault watcher event error: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
+                        return;
+                    }
+                    last_reconcile = Instant::now();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
-        };
-        if watcher_generation.load(Ordering::Acquire) != generation {
-            break;
-        }
-        match change {
-            Some(Ok(change)) if change.updated > 0 || change.removed > 0 => {
-                let _ = app.emit("vault-index-changed", change);
-            }
-            Some(Ok(_)) | None => {}
-            Some(Err(error)) => eprintln!("vault watcher reconcile failed: {error}"),
         }
     });
 }
@@ -550,17 +783,123 @@ fn list_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
     Ok(out)
 }
 
+#[tauri::command]
+fn list_attachments(state: State<'_, AppState>) -> Result<Vec<AttachmentRow>, String> {
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let mut statement = index.connection().prepare(
+        "SELECT f.path, f.name, f.file_kind,
+                COALESCE(a.mime_type, 'application/octet-stream'), f.size_bytes,
+                a.width, a.height,
+                COUNT(DISTINCT l.path),
+                COALESCE(a.text_indexed, 0)
+           FROM files f
+           LEFT JOIN attachment_metadata a ON a.path = f.path
+           LEFT JOIN links l ON l.target_path = f.path
+          WHERE f.file_kind NOT IN ('markdown', 'canvas', 'excalidraw')
+          GROUP BY f.path
+          ORDER BY f.path COLLATE NOCASE"
+    ).map_err(|error| error.to_string())?;
+    let rows = statement.query_map([], |row| {
+        let reference_count: i64 = row.get(7)?;
+        Ok(AttachmentRow {
+            path: row.get(0)?,
+            name: row.get(1)?,
+            file_kind: row.get(2)?,
+            mime_type: row.get(3)?,
+            size_bytes: row.get(4)?,
+            width: row.get(5)?,
+            height: row.get(6)?,
+            reference_count,
+            orphaned: reference_count == 0,
+            text_indexed: row.get::<_, i64>(8)? != 0,
+        })
+    }).map_err(|error| error.to_string())?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
 fn fts_query(input: &str) -> String {
+    vault_search_terms(input)
+        .into_iter()
+        .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn vault_search_terms(input: &str) -> Vec<String> {
     input
         .split_whitespace()
         .filter_map(|token| {
             let cleaned = token.trim_matches(|character: char| {
                 !character.is_alphanumeric() && !matches!(character, '_' | '-' | '/' | '.')
             });
-            (!cleaned.is_empty()).then(|| format!("\"{}\"*", cleaned.replace('"', "\"\"")))
+            (!cleaned.is_empty()).then(|| cleaned.to_lowercase())
         })
+        .collect()
+}
+
+fn like_search_pattern(term: &str) -> String {
+    let escaped = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+fn search_yaml_properties(
+    connection: &rusqlite::Connection,
+    terms: &[String],
+    maximum: i64,
+) -> Result<Vec<SearchResult>, String> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    const PROPERTY_TEXT: &str =
+        "prop_path || ' ' || prop_key || ' ' || COALESCE(value_text, CAST(value_num AS TEXT), CASE value_bool WHEN 1 THEN 'true' WHEN 0 THEN 'false' END, value_json, '')";
+    let predicates = terms
+        .iter()
+        .map(|_| format!(
+            "EXISTS (SELECT 1 FROM properties matched WHERE matched.path = f.path AND lower({PROPERTY_TEXT}) LIKE ? ESCAPE '\\')"
+        ))
         .collect::<Vec<_>>()
-        .join(" AND ")
+        .join(" AND ");
+    let sql = format!(
+        "SELECT f.path,
+                COALESCE(NULLIF(p.title, ''), NULLIF(f.name, ''), f.path),
+                (SELECT shown.prop_path || ': ' || COALESCE(shown.value_text, CAST(shown.value_num AS TEXT), CASE shown.value_bool WHEN 1 THEN 'true' WHEN 0 THEN 'false' END, shown.value_json, '')
+                   FROM properties shown
+                  WHERE shown.path = f.path AND lower({PROPERTY_TEXT}) LIKE ? ESCAPE '\\'
+                  ORDER BY shown.is_leaf DESC, shown.prop_path
+                  LIMIT 1)
+           FROM files f
+           LEFT JOIN pages p ON p.path = f.path
+          WHERE f.file_kind = 'markdown' AND {predicates}
+          ORDER BY f.path COLLATE NOCASE
+          LIMIT ?"
+    );
+    let mut values = Vec::<rusqlite::types::Value>::with_capacity(terms.len() + 2);
+    values.push(like_search_pattern(&terms[0]).into());
+    values.extend(terms.iter().map(|term| like_search_pattern(term).into()));
+    values.push(maximum.into());
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(values), |row| {
+            let snippet: String = row.get(2)?;
+            Ok(SearchResult {
+                path: row.get(0)?,
+                title: row.get(1)?,
+                snippet: format!("[[HIT]]{snippet}[[/HIT]]"),
+                line: None,
+                rank: 1000.0,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -601,11 +940,7 @@ fn search_vault(
             })
         })
         .map_err(|error| error.to_string())?;
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|term| term.to_lowercase())
-        .filter(|term| !term.is_empty())
-        .collect();
+    let terms = vault_search_terms(&query);
     let mut results = Vec::new();
     for row in rows {
         let mut result = row.map_err(|error| error.to_string())?;
@@ -620,6 +955,39 @@ fn search_vault(
         }
         results.push(result);
     }
+    let existing = results
+        .iter()
+        .map(|result| result.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for result in search_yaml_properties(index.connection(), &terms, maximum)? {
+        if !existing.contains(&result.path) {
+            results.push(result);
+        }
+    }
+    results.truncate(maximum as usize);
+    for result in &mut results {
+        if result.line.is_some() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(index.vault_root().join(&result.path)) {
+            result.line = content
+                .lines()
+                .position(|line| {
+                    let lower = line.to_lowercase();
+                    terms.iter().all(|term| lower.contains(term))
+                })
+                .map(|line| line + 1)
+                .or_else(|| {
+                    content
+                        .lines()
+                        .position(|line| {
+                            let lower = line.to_lowercase();
+                            terms.iter().any(|term| lower.contains(term))
+                        })
+                        .map(|line| line + 1)
+                });
+        }
+    }
     Ok(results)
 }
 
@@ -630,12 +998,19 @@ fn graph_data(state: State<'_, AppState>) -> Result<GraphData, String> {
     let connection = index.connection();
     let mut node_statement = connection
         .prepare(
-            "SELECT path, COALESCE(NULLIF(title, ''), name, path)
+            "SELECT path, COALESCE(NULLIF(title, ''), name, path), tags
              FROM pages ORDER BY path COLLATE NOCASE",
         )
         .map_err(|error| error.to_string())?;
     let nodes = node_statement
-        .query_map([], |row| Ok(GraphNode { path: row.get(0)?, title: row.get(1)? }))
+        .query_map([], |row| {
+            let tags_json: String = row.get(2)?;
+            Ok(GraphNode {
+                path: row.get(0)?,
+                title: row.get(1)?,
+                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            })
+        })
         .map_err(|error| error.to_string())?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -731,6 +1106,16 @@ fn write_file(path: String, content: String, state: State<'_, AppState>) -> Resu
     };
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let canonical_parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical_parent.starts_with(&root) {
+            return Err("Path escapes vault through a symbolic link".into());
+        }
+    }
+    if abs.exists() {
+        let canonical_target = abs.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical_target.starts_with(&root) {
+            return Err("Path escapes vault through a symbolic link".into());
+        }
     }
     std::fs::write(&abs, content.as_bytes()).map_err(|e| e.to_string())?;
     let abs_c = abs.canonicalize().map_err(|e| e.to_string())?;
@@ -773,39 +1158,61 @@ pub struct TaskRow {
     pub status: String,
     pub status_char: String,
     pub text: String,
+    pub raw_line: String,
     pub line: i64,
     pub completed: bool,
     pub due: Option<String>,
     pub scheduled: Option<String>,
     pub priority: Option<String>,
     pub recurrence: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[tauri::command]
-fn list_tasks(completed: Option<bool>, state: State<'_, AppState>) -> Result<Vec<TaskRow>, String> {
+fn list_tasks(
+    completed: Option<bool>,
+    scope: Option<TaskScope>,
+    state: State<'_, AppState>,
+) -> Result<Vec<TaskRow>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
-    let sql = "SELECT path, task_id, status, status_char, text, line, completed,
-                      due, scheduled, priority, recurrence
-               FROM tasks
-               WHERE (?1 IS NULL OR completed = ?1)
-               ORDER BY completed, COALESCE(due, '9999-12-31'), path COLLATE NOCASE, line";
+    let sql = "SELECT t.path, t.task_id, t.status, t.status_char, t.text, t.raw_line, t.line, t.completed,
+                      t.due, t.scheduled, t.priority, t.recurrence, COALESCE(t.tags_json, '[]')
+               FROM tasks t
+               LEFT JOIN file_frontmatter fm ON fm.path = t.path
+               WHERE (?1 IS NULL OR t.completed = ?1)
+                 AND (?2 = 0
+                   OR EXISTS (SELECT 1 FROM json_each(?3) folders
+                              WHERE t.path = folders.value OR t.path LIKE folders.value || '/%')
+                   OR EXISTS (SELECT 1 FROM json_each(?4) wanted
+                              JOIN json_each(COALESCE(t.tags_json, '[]')) actual
+                                ON lower(ltrim(actual.value, '#')) = lower(ltrim(wanted.value, '#')))
+                   OR (?5 <> '' AND json_type(fm.json, '$.' || ?5) IS NOT NULL
+                       AND lower(CAST(json_extract(fm.json, '$.' || ?5) AS TEXT))
+                           NOT IN ('', '0', 'false', 'no', 'off', 'null')))
+               ORDER BY t.completed, COALESCE(t.due, '9999-12-31'), t.path COLLATE NOCASE, t.line";
     let mut statement = index.connection().prepare(sql).map_err(|e| e.to_string())?;
     let completed_value = completed.map(|value| if value { 1_i64 } else { 0_i64 });
+    let scope = scope.unwrap_or(TaskScope { folders: Vec::new(), tags: Vec::new(), property: String::new() });
+    let scope_enabled = if scope.folders.is_empty() && scope.tags.is_empty() && scope.property.is_empty() { 0_i64 } else { 1_i64 };
+    let folders = serde_json::to_string(&scope.folders).map_err(|error| error.to_string())?;
+    let tags = serde_json::to_string(&scope.tags).map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([completed_value], |row| {
+        .query_map(rusqlite::params![completed_value, scope_enabled, folders, tags, scope.property], |row| {
             Ok(TaskRow {
                 path: row.get(0)?,
                 task_id: row.get(1)?,
                 status: row.get(2)?,
                 status_char: row.get(3)?,
                 text: row.get(4)?,
-                line: row.get(5)?,
-                completed: row.get::<_, i64>(6)? != 0,
-                due: row.get(7)?,
-                scheduled: row.get(8)?,
-                priority: row.get(9)?,
-                recurrence: row.get(10)?,
+                raw_line: row.get(5)?,
+                line: row.get(6)?,
+                completed: row.get::<_, i64>(7)? != 0,
+                due: row.get(8)?,
+                scheduled: row.get(9)?,
+                priority: row.get(10)?,
+                recurrence: row.get(11)?,
+                tags: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -823,12 +1230,12 @@ fn set_task_completed(
 ) -> Result<(), String> {
     let mut guard = state.index.lock();
     let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
-    let (start, end): (i64, i64) = index
+    let (start, end, recurrence): (i64, i64, Option<String>) = index
         .connection()
         .query_row(
-            "SELECT start_offset, end_offset FROM tasks WHERE path = ?1 AND task_id = ?2",
+            "SELECT start_offset, end_offset, recurrence FROM tasks WHERE path = ?1 AND task_id = ?2",
             rusqlite::params![path, task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| format!("Task is stale or missing: {e}"))?;
     let absolute = vault_abs(index, &path)?;
@@ -847,9 +1254,199 @@ fn set_task_completed(
     if !content.is_char_boundary(marker_from) || !content.is_char_boundary(marker_to) {
         return Err("Task checkbox has an invalid byte boundary".into());
     }
-    content.replace_range(marker_from..marker_to, if completed { "x" } else { " " });
+    if completed {
+        if let Some(recurrence) = recurrence.as_deref() {
+            let source = line.trim_end_matches(['\r', '\n']);
+            let eol = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            let today = Local::now().date_naive();
+            let (completed_line, next_line) = recurring_task_lines(source, recurrence, today)?;
+            content.replace_range(from..to, &format!("{completed_line}{eol}{next_line}{eol}"));
+        } else {
+            content.replace_range(marker_from..marker_to, "x");
+        }
+    } else {
+        content.replace_range(marker_from..marker_to, " ");
+    }
     std::fs::write(&absolute, content.as_bytes()).map_err(|e| e.to_string())?;
     index.index_path(&path).map_err(|e| e.to_string())
+}
+
+fn task_line_with_status(line: &str, status: char) -> Result<String, String> {
+    let open = line.find('[').ok_or_else(|| "Task checkbox is no longer present".to_string())?;
+    let close = line[open + 1..].find(']').map(|value| open + 1 + value)
+        .ok_or_else(|| "Task checkbox is no longer present".to_string())?;
+    let mut output = line.to_string();
+    output.replace_range(open + 1..close, &status.to_string());
+    Ok(output)
+}
+
+fn recurring_task_lines(
+    line: &str,
+    recurrence: &str,
+    today: NaiveDate,
+) -> Result<(String, String), String> {
+    let mut completed = task_line_with_status(line, 'x')?;
+    if !completed.contains('✅') {
+        let block = regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
+        if let Some(found) = block.find(&completed) {
+            completed.insert_str(found.start(), &format!(" ✅ {}", today.format("%Y-%m-%d")));
+        } else {
+            completed.push_str(&format!(" ✅ {}", today.format("%Y-%m-%d")));
+        }
+    }
+    let mut next = task_line_with_status(line, ' ')?;
+    let done = regex::Regex::new(r"\s*✅\s*\d{4}-\d{2}-\d{2}").map_err(|error| error.to_string())?;
+    next = done.replace_all(&next, "").into_owned();
+    let date = regex::Regex::new(r"(📅|⏳|🛫)\s*(\d{4}-\d{2}-\d{2})")
+        .map_err(|error| error.to_string())?;
+    let when_done = recurrence.to_ascii_lowercase().contains("when done");
+    let mut shifted = false;
+    next = date.replace_all(&next, |captures: &regex::Captures<'_>| {
+        let source = if when_done {
+            today
+        } else {
+            NaiveDate::parse_from_str(&captures[2], "%Y-%m-%d").unwrap_or(today)
+        };
+        match next_recurrence_date(source, recurrence) {
+            Ok(value) => {
+                shifted = true;
+                format!("{} {}", &captures[1], value.format("%Y-%m-%d"))
+            }
+            Err(_) => captures[0].to_string(),
+        }
+    }).into_owned();
+    if !shifted {
+        let date = next_recurrence_date(today, recurrence)?;
+        let block = regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
+        if let Some(found) = block.find(&next) {
+            next.insert_str(found.start(), &format!(" 📅 {}", date.format("%Y-%m-%d")));
+        } else {
+            next.push_str(&format!(" 📅 {}", date.format("%Y-%m-%d")));
+        }
+    }
+    Ok((completed, next))
+}
+
+fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, String> {
+    let normalized = recurrence.to_ascii_lowercase().replace("when done", "");
+    let value = normalized.trim().strip_prefix("every ").unwrap_or(normalized.trim()).trim();
+    if value == "weekday" || value == "weekdays" {
+        let mut next = date + ChronoDuration::days(1);
+        while matches!(next.weekday(), Weekday::Sat | Weekday::Sun) {
+            next += ChronoDuration::days(1);
+        }
+        return Ok(next);
+    }
+    let weekdays = [
+        ("monday", Weekday::Mon), ("tuesday", Weekday::Tue),
+        ("wednesday", Weekday::Wed), ("thursday", Weekday::Thu),
+        ("friday", Weekday::Fri), ("saturday", Weekday::Sat), ("sunday", Weekday::Sun),
+    ];
+    if let Some((_, weekday)) = weekdays.iter().find(|(name, _)| value == *name) {
+        let mut next = date + ChronoDuration::days(1);
+        while next.weekday() != *weekday { next += ChronoDuration::days(1); }
+        return Ok(next);
+    }
+    let words = value.split_whitespace().collect::<Vec<_>>();
+    let (count, unit) = if words.len() >= 2 {
+        (words[0].parse::<i64>().unwrap_or(1).max(1), words[1])
+    } else {
+        (1, words.first().copied().unwrap_or(""))
+    };
+    match unit.trim_end_matches('s') {
+        "day" | "daily" => Ok(date + ChronoDuration::days(count)),
+        "week" | "weekly" => Ok(date + ChronoDuration::weeks(count)),
+        "month" | "monthly" => add_calendar_months(date, count),
+        "year" | "yearly" | "annually" => add_calendar_months(date, count * 12),
+        _ => Err(format!("Unsupported recurrence: {recurrence}")),
+    }
+}
+
+fn add_calendar_months(date: NaiveDate, months: i64) -> Result<NaiveDate, String> {
+    let month_index = date.year() as i64 * 12 + date.month0() as i64 + months;
+    let year = i32::try_from(month_index.div_euclid(12)).map_err(|_| "Recurrence year is out of range")?;
+    let month = u32::try_from(month_index.rem_euclid(12) + 1).map_err(|_| "Invalid recurrence month")?;
+    let mut day = date.day();
+    while day > 0 {
+        if let Some(value) = NaiveDate::from_ymd_opt(year, month, day) { return Ok(value); }
+        day -= 1;
+    }
+    Err("Could not calculate recurring date".into())
+}
+
+#[tauri::command]
+fn set_task_status(
+    path: String,
+    task_id: i64,
+    status: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let status = status.chars().next().ok_or_else(|| "Task status is empty".to_string())?;
+    if status == 'x' || status == 'X' {
+        return set_task_completed(path, task_id, true, state);
+    }
+    let mut guard = state.index.lock();
+    let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
+    let (start, end, indexed_line): (i64, i64, String) = index.connection().query_row(
+        "SELECT start_offset, end_offset, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
+        rusqlite::params![path, task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).map_err(|error| format!("Task is stale or missing: {error}"))?;
+    let absolute = vault_abs(index, &path)?;
+    let mut content = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
+    let from = usize::try_from(start).map_err(|_| "Invalid task offset".to_string())?;
+    let to = usize::try_from(end).map_err(|_| "Invalid task offset".to_string())?;
+    let current = content.get(from..to).ok_or_else(|| "Task offsets are stale".to_string())?;
+    let eol = if current.ends_with("\r\n") { "\r\n" } else if current.ends_with('\n') { "\n" } else { "" };
+    if current.trim_end_matches(['\r', '\n']) != indexed_line {
+        return Err("Task changed on disk; refresh before editing its status".into());
+    }
+    let replacement = task_line_with_status(&indexed_line, status)?;
+    content.replace_range(from..to, &format!("{replacement}{eol}"));
+    std::fs::write(&absolute, content.as_bytes()).map_err(|error| error.to_string())?;
+    index.index_path(&path).map_err(|error| error.to_string())
+}
+
+/// Replace one indexed task line after checking that its source offsets and
+/// checkbox still identify the same task. The frontend uses this for due,
+/// scheduled, and priority edits while Markdown remains authoritative.
+#[tauri::command]
+fn replace_task_line(
+    path: String,
+    task_id: i64,
+    replacement: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if replacement.contains(['\r', '\n']) || replacement.len() > 16_384 {
+        return Err("A task replacement must be one reasonably sized line".into());
+    }
+    if !replacement.contains("[") || !replacement.contains("]") {
+        return Err("The replacement is no longer a Markdown task".into());
+    }
+    let mut guard = state.index.lock();
+    let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
+    let (start, end, indexed_line): (i64, i64, String) = index
+        .connection()
+        .query_row(
+            "SELECT start_offset, end_offset, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
+            rusqlite::params![path, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("Task is stale or missing: {error}"))?;
+    let absolute = vault_abs(index, &path)?;
+    let mut content = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
+    let from = usize::try_from(start).map_err(|_| "Invalid task offset".to_string())?;
+    let to = usize::try_from(end).map_err(|_| "Invalid task offset".to_string())?;
+    let current = content
+        .get(from..to)
+        .ok_or_else(|| "Task offsets are stale".to_string())?;
+    let eol = if current.ends_with("\r\n") { "\r\n" } else if current.ends_with('\n') { "\n" } else { "" };
+    if current.trim_end_matches(['\r', '\n']) != indexed_line {
+        return Err("Task changed on disk; refresh before editing its metadata".into());
+    }
+    content.replace_range(from..to, &format!("{replacement}{eol}"));
+    std::fs::write(&absolute, content.as_bytes()).map_err(|error| error.to_string())?;
+    index.index_path(&path).map_err(|error| error.to_string())
 }
 
 /// Pages for Dataview-style queries. `source` examples: `"people"`, `"folder/sub"`, empty = all markdown.
@@ -1383,7 +1980,20 @@ fn run_readonly_sql(
             },
         )
         .map_err(|error| error.to_string())?;
-    let translated = translate_page_sql(sql)?;
+    connection
+        .create_scalar_function(
+            "page_has_key",
+            2,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                let source = context.get::<String>(0)?;
+                let key = context.get::<String>(1)?;
+                let object = serde_json::from_str::<serde_json::Value>(&source).unwrap_or_default();
+                Ok(object.as_object().map(|m| m.contains_key(&key)).unwrap_or(false))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let translated = page_sql::lower_page_sql(sql, translate_page_sql, translate_page_sql_residual)?;
     let mut statement = connection
         .prepare(&translated)
         .map_err(|error| error.to_string())?;
@@ -1427,109 +2037,365 @@ fn run_readonly_sql(
 
 /// Lower Nephrite's PostgreSQL custom page types into disposable SQLite
 /// storage expressions. The PostgreSQL parser has already validated syntax.
+///
+/// Supported page surface (v0.2 → expanded):
+///   properties['key']          → page_property(properties, 'key')
+///   properties->>'key'         → page_property(properties, 'key')
+///   properties->'key'          → page_property(properties, 'key')  (text for now)
+///   properties ? 'key'         → page_has_key(properties, 'key')
+///   properties ?& ARRAY[...]   → AND of page_has_key
+///   properties ?| ARRAY[...]   → OR of page_has_key
+///   tags @> ARRAY[...]         → AND of page_has_tag
+///   tags && ARRAY[...]         → OR  of page_has_tag
+///   aliases @> / && ARRAY[...] → same, using page_has_tag helper (array of strings)
+///   'x' = ANY(tags)            → page_has_tag
+///   ARRAY[...]                 → page_array(...)
+///   EXTRACT(field FROM expr)   → date_part('field', expr)
+///   string_agg / bool_and / bool_or / every → SQLite equivalents
 fn translate_page_sql(sql: &str) -> Result<String, String> {
-    let property = regex::Regex::new(
+    let translated = translate_page_sql_forms(sql)?;
+    translate_page_sql_residual(&translated)
+}
+
+/// Page-semantic forms still handled textually when the AST walker misses them.
+fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
+    // properties['key']
+    let property_bracket = regex::Regex::new(
         r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\[\s*'((?:''|[^'])*)'\s*\]",
     )
     .map_err(|error| error.to_string())?;
-    let translated = property.replace_all(sql, |captures: &regex::Captures<'_>| {
-        format!("page_property({}, '{}')", &captures[1], &captures[2])
-    });
-    let any_tag = regex::Regex::new(
-        r"(?i)'((?:''|[^'])*)'\s*=\s*ANY\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?tags)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
-    let translated = any_tag
-        .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            format!("page_has_tag({}, '{}')", &captures[2], &captures[1])
+    let mut translated = property_bracket
+        .replace_all(sql, |captures: &regex::Captures<'_>| {
+            format!("page_property({}, '{}')", &captures[1], &captures[2])
         })
         .into_owned();
-    let contains_tags =
-        regex::Regex::new(r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?tags)\s*@>\s*ARRAY\s*\[([^\]]*)\]")
-            .map_err(|error| error.to_string())?;
+
+    // properties->>'key' and properties->'key'
+    let property_arrow = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*->>?\s*'((?:''|[^'])*)'",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_arrow
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_property({}, '{}')", &captures[1], &captures[2])
+        })
+        .into_owned();
+
+    // jsonb_exists(properties, 'key')
+    let jsonb_exists = regex::Regex::new(
+        r"(?i)\bjsonb_exists\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?properties)\s*,\s*'((?:''|[^'])*)'\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = jsonb_exists
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_has_key({}, '{}')", &captures[1], &captures[2])
+        })
+        .into_owned();
+
+    // properties ? 'key'
+    let property_exists = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?\s*'((?:''|[^'])*)'",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_exists
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_has_key({}, '{}')", &captures[1], &captures[2])
+        })
+        .into_owned();
+
     let string_literal =
         regex::Regex::new(r"'((?:''|[^'])*)'").map_err(|error| error.to_string())?;
-    let translated = contains_tags
+
+    // properties ?& ARRAY[...]  (all keys exist)
+    let property_all_keys = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?&\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_all_keys
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            let tags = string_literal
+            let items = string_literal
                 .captures_iter(&captures[2])
-                .map(|tag| tag[1].to_string())
+                .map(|m| m[1].to_string())
                 .collect::<Vec<_>>();
             let residue = string_literal.replace_all(&captures[2], "");
-            if !residue
-                .chars()
-                .all(|character| character.is_whitespace() || character == ',')
-            {
+            if !residue.chars().all(|c| c.is_whitespace() || c == ',') {
                 return captures[0].to_string();
             }
-            if tags.is_empty() {
+            if items.is_empty() {
                 return "1".to_string();
             }
             format!(
                 "({})",
-                tags.iter()
-                    .map(|tag| format!("page_has_tag({}, '{}')", &captures[1], tag))
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
                     .collect::<Vec<_>>()
                     .join(" AND ")
             )
         })
         .into_owned();
-    let overlaps_tags =
-        regex::Regex::new(r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?tags)\s*&&\s*ARRAY\s*\[([^\]]*)\]")
-            .map_err(|error| error.to_string())?;
-    let translated = overlaps_tags
+
+    // properties ?| ARRAY[...]  (any key exists)
+    let property_any_keys = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?\|\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_any_keys
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            let tags = string_literal
+            let items = string_literal
                 .captures_iter(&captures[2])
-                .map(|tag| tag[1].to_string())
+                .map(|m| m[1].to_string())
                 .collect::<Vec<_>>();
             let residue = string_literal.replace_all(&captures[2], "");
-            if !residue
-                .chars()
-                .all(|character| character.is_whitespace() || character == ',')
-            {
+            if !residue.chars().all(|c| c.is_whitespace() || c == ',') {
                 return captures[0].to_string();
             }
-            if tags.is_empty() {
+            if items.is_empty() {
                 return "0".to_string();
             }
             format!(
                 "({})",
-                tags.iter()
-                    .map(|tag| format!("page_has_tag({}, '{}')", &captures[1], tag))
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
                     .collect::<Vec<_>>()
                     .join(" OR ")
             )
         })
         .into_owned();
 
-    // PostgreSQL ARRAY constructors become Nephrite's JSON-backed semantic
-    // arrays after the page-tag operators above have consumed their operands.
+    // jsonb_exists_all(properties, ARRAY[...])
+    let jsonb_exists_all = regex::Regex::new(
+        r"(?i)\bjsonb_exists_all\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?properties)\s*,\s*ARRAY\s*\[([^\]]*)\]\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = jsonb_exists_all
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "1".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            )
+        })
+        .into_owned();
+
+    // jsonb_exists_any(properties, ARRAY[...])
+    let jsonb_exists_any = regex::Regex::new(
+        r"(?i)\bjsonb_exists_any\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?properties)\s*,\s*ARRAY\s*\[([^\]]*)\]\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = jsonb_exists_any
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "0".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        })
+        .into_owned();
+
+    // 'x' = ANY(tags|aliases)
+    let any_array = regex::Regex::new(
+        r"(?i)'((?:''|[^'])*)'\s*=\s*ANY\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = any_array
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_has_tag({}, '{}')", &captures[2], &captures[1])
+        })
+        .into_owned();
+
+    // (tags|aliases) @> ARRAY[...]
+    let contains = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*@>\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = contains
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            let residue = string_literal.replace_all(&captures[2], "");
+            if !residue
+                .chars()
+                .all(|c| c.is_whitespace() || c == ',')
+            {
+                return captures[0].to_string();
+            }
+            if items.is_empty() {
+                return "1".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            )
+        })
+        .into_owned();
+
+    // (tags|aliases) && ARRAY[...]
+    let overlaps = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*&&\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = overlaps
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            let residue = string_literal.replace_all(&captures[2], "");
+            if !residue
+                .chars()
+                .all(|c| c.is_whitespace() || c == ',')
+            {
+                return captures[0].to_string();
+            }
+            if items.is_empty() {
+                return "0".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        })
+        .into_owned();
+
+    // (tags|aliases) && page_array(...)
+    let overlaps_pa = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*&&\s*page_array\s*\(([^)]*)\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = overlaps_pa
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "0".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        })
+        .into_owned();
+
+    // (tags|aliases) @> page_array(...)
+    let contains_pa = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*@>\s*page_array\s*\(([^)]*)\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = contains_pa
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "1".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            )
+        })
+        .into_owned();
+
+    Ok(translated)
+}
+
+/// Residual lowering after AST page rewrites (or as the tail of full textual).
+fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
+    // PostgreSQL `::type` casts → strip (SQLite is dynamically typed)
+    // Handles: 'Moe'::text, 1::int, col::varchar(10), expr::float8
+    let typecast = regex::Regex::new(
+        r"::\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?",
+    )
+    .map_err(|error| error.to_string())?;
+    let mut translated = typecast.replace_all(sql, "").into_owned();
+
+    // CAST(expr AS type) → (expr)  (SQLite ignores declared types)
+    let cast_fn = regex::Regex::new(
+        r"(?i)\bCAST\s*\((.+?)\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = cast_fn
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("({})", captures[1].trim())
+        })
+        .into_owned();
+
+    // ARRAY constructor (not already consumed by page tag forms)
     let array_constructor = regex::Regex::new(r"(?i)\bARRAY\s*\[([^\[\]]*)\]")
         .map_err(|error| error.to_string())?;
-    let translated = array_constructor
+    translated = array_constructor
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("page_array({})", &captures[1])
         })
         .into_owned();
 
-    // SQLite has the implementation as date_part(field, value), while
-    // PostgreSQL's canonical spelling is EXTRACT(field FROM value).
     let extract = regex::Regex::new(
         r"(?i)\bEXTRACT\s*\(\s*([a-z_]+)\s+FROM\s+([^()]+?)\s*\)",
     )
     .map_err(|error| error.to_string())?;
-    let translated = extract
+    translated = extract
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("date_part('{}', {})", &captures[1], &captures[2])
         })
         .into_owned();
 
-    // These PostgreSQL aggregates have exact SQLite equivalents for the
-    // ordinary (non-ORDER-BY-inside-the-call) form used by page queries.
+    // ILIKE → case-insensitive LIKE
+    let ilike = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_$.]*)|page_property\([^)]+\)|page_has_key\([^)]+\))\s+ILIKE\s+('(?:''|[^'])*')",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = ilike
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("lower({}) LIKE lower({})", &captures[1], &captures[2])
+        })
+        .into_owned();
+
     let aggregate = regex::Regex::new(r"(?i)\b(string_agg|bool_and|bool_or|every)\s*\(")
         .map_err(|error| error.to_string())?;
-    Ok(aggregate
+    translated = aggregate
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             let function = match captures[1].to_ascii_lowercase().as_str() {
                 "string_agg" => "group_concat",
@@ -1538,7 +2404,85 @@ fn translate_page_sql(sql: &str) -> Result<String, String> {
             };
             format!("{function}(")
         })
-        .into_owned())
+        .into_owned();
+
+    // PostgreSQL: (VALUES (...), ...) AS alias(col1, col2)
+    // SQLite (bundled): VALUES columns are column1..columnN; table(col) alias form
+    // is not always available — expand to SELECT columnN AS col FROM (VALUES ...) AS alias
+    // jsonb_array_length(x) / cardinality(x) → length(x)
+    let array_len = regex::Regex::new(
+        r"(?i)\b(?:jsonb_array_length|cardinality)\s*\(\s*([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = array_len
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("length({})", captures[1].trim())
+        })
+        .into_owned();
+
+    // date_trunc('unit', source) → SQLite date/strftime
+    let date_trunc = regex::Regex::new(
+        r"(?i)\bdate_trunc\s*\(\s*'([^']+)'\s*,\s*([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = date_trunc
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let unit = captures[1].to_ascii_lowercase();
+            let source = captures[2].trim();
+            match unit.as_str() {
+                "day" | "days" => format!("date({source})"),
+                "month" | "months" => format!("strftime('%Y-%m-01', {source})"),
+                "year" | "years" => format!("strftime('%Y-01-01', {source})"),
+                "hour" | "hours" => format!("strftime('%Y-%m-%d %H:00:00', {source})"),
+                _ => captures[0].to_string(),
+            }
+        })
+        .into_owned();
+
+    // IS [NOT] DISTINCT FROM → SQLite null-safe IS / IS NOT
+    // SQLite: `IS` / `IS NOT` are null-safe, matching DISTINCT FROM semantics.
+    let not_distinct = regex::Regex::new(r"(?i)\bIS\s+NOT\s+DISTINCT\s+FROM\b")
+        .map_err(|error| error.to_string())?;
+    translated = not_distinct.replace_all(&translated, "IS").into_owned();
+    let is_distinct = regex::Regex::new(r"(?i)\bIS\s+DISTINCT\s+FROM\b")
+        .map_err(|error| error.to_string())?;
+    translated = is_distinct.replace_all(&translated, "IS NOT").into_owned();
+
+    translated = lower_values_table_alias(&translated);
+
+    Ok(translated)
+}
+
+/// Rewrite `(VALUES ...) AS alias(c1, c2, ...)` for SQLite.
+fn lower_values_table_alias(sql: &str) -> String {
+    // Match: (VALUES ...) AS name(col, col, ...)
+    // Non-greedy VALUES body; columns are simple identifiers.
+    let re = match regex::Regex::new(
+        r"(?is)\(\s*VALUES\s*((?:\([^;]*?\))(?:\s*,\s*\([^;]*?\))*)\s*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)",
+    ) {
+        Ok(r) => r,
+        Err(_) => return sql.to_string(),
+    };
+    re.replace_all(sql, |captures: &regex::Captures<'_>| {
+        let values_body = captures[1].trim();
+        let alias = &captures[2];
+        let cols: Vec<&str> = captures[3]
+            .split(',')
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.is_empty() {
+            return captures[0].to_string();
+        }
+        let select_list = cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("column{} AS {col}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("(SELECT {select_list} FROM (VALUES {values_body}) AS _nephrite_values) AS {alias}")
+    })
+    .into_owned()
 }
 
 /// Execute one read-only query against the disposable vault index.
@@ -1904,6 +2848,7 @@ pub struct SearchResult {
 pub struct GraphNode {
     pub path: String,
     pub title: String,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2673,8 +3618,10 @@ pub fn run() {
             refresh_vault,
             vault_stats,
             list_files,
+            list_attachments,
             search_vault,
             graph_data,
+            list_plugins,
             read_file,
             read_media_file,
             write_file,
@@ -2683,6 +3630,8 @@ pub fn run() {
             query_vault_sql,
             list_tasks,
             set_task_completed,
+            set_task_status,
+            replace_task_line,
             create_folder,
             create_file,
             rename_path,
@@ -2722,12 +3671,43 @@ pub fn run() {
 
 #[cfg(test)]
 mod sql_query_tests {
-    use super::{fts_query, is_conflict_status, page_properties, run_readonly_sql, translate_page_sql};
+    use super::{
+        fts_query, is_conflict_status, next_recurrence_date, page_properties,
+        recurring_task_lines, run_readonly_sql, search_yaml_properties,
+        translate_page_sql, vault_search_terms,
+    };
+    use chrono::NaiveDate;
 
     #[test]
     fn full_text_terms_are_quoted_and_prefixed() {
-        assert_eq!(fts_query("PostgreSQL migration"), "\"PostgreSQL\"* AND \"migration\"*");
+        assert_eq!(fts_query("PostgreSQL migration"), "\"postgresql\"* AND \"migration\"*");
         assert_eq!(fts_query("  #jobs  "), "\"jobs\"*");
+    }
+
+    #[test]
+    fn vault_search_includes_yaml_property_keys_and_values() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE files(path TEXT PRIMARY KEY, name TEXT, file_kind TEXT);
+                 CREATE TABLE pages(path TEXT PRIMARY KEY, title TEXT);
+                 CREATE TABLE properties(
+                   path TEXT, prop_path TEXT, prop_key TEXT, value_text TEXT,
+                   value_num REAL, value_bool INTEGER, value_json TEXT, is_leaf INTEGER
+                 );
+                 INSERT INTO files VALUES ('people/Divya Nidhi.md', 'Divya Nidhi.md', 'markdown');
+                 INSERT INTO pages VALUES ('people/Divya Nidhi.md', 'Divya Nidhi');
+                 INSERT INTO properties VALUES (
+                   'people/Divya Nidhi.md', 'company', 'company',
+                   'Deloitte Consulting LLP', NULL, NULL, NULL, 1
+                 );",
+            )
+            .unwrap();
+        let terms = vault_search_terms("Deloitte");
+        let results = search_yaml_properties(&connection, &terms, 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "people/Divya Nidhi.md");
+        assert_eq!(results[0].snippet, "[[HIT]]company: Deloitte Consulting LLP[[/HIT]]");
     }
 
     #[test]
@@ -2738,6 +3718,23 @@ mod sql_query_tests {
         for status in [" M", "M ", "??", "R "] {
             assert!(!is_conflict_status(status));
         }
+    }
+
+    #[test]
+    fn recurring_tasks_advance_dates_and_preserve_month_ends() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
+        let (completed, next) = recurring_task_lines(
+            "- [ ] Invoice 🔁 every month 📅 2026-01-31 ^invoice",
+            "every month",
+            today,
+        ).unwrap();
+        assert!(completed.contains("[x]") && completed.contains("✅ 2026-08-12"));
+        assert!(next.contains("[ ]") && next.contains("📅 2026-02-28"));
+        assert!(next.ends_with("^invoice"));
+        assert_eq!(
+            next_recurrence_date(NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(), "every weekday").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+        );
     }
 
     #[test]
@@ -2836,6 +3833,68 @@ mod sql_query_tests {
     }
 
     #[test]
+    fn strips_postgres_type_casts() {
+        assert_eq!(
+            translate_page_sql(
+                "SELECT a.name FROM (VALUES ('Moe'::text), ('Larry'), ('Curly')) AS a(name)"
+            )
+            .unwrap(),
+            "SELECT a.name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS a(name)"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT 1::int AS n").unwrap(),
+            "SELECT 1 AS n"
+        );
+    }
+
+    #[test]
+    fn lowers_jsonb_array_length() {
+        let out = translate_page_sql("SELECT jsonb_array_length(tags) FROM pages").unwrap();
+        assert!(out.contains("length(tags)"), "array length not lowered: {out}");
+        let out2 = translate_page_sql("SELECT cardinality(tags) FROM pages").unwrap();
+        assert!(out2.contains("length(tags)"), "cardinality not lowered: {out2}");
+    }
+
+    #[test]
+    fn lowers_date_trunc() {
+        assert_eq!(
+            translate_page_sql("SELECT date_trunc('day', created) FROM pages").unwrap(),
+            "SELECT date(created) FROM pages"
+        );
+    }
+
+    #[test]
+    fn lowers_is_distinct_from() {
+        assert_eq!(
+            translate_page_sql("SELECT 1 WHERE a IS DISTINCT FROM b").unwrap(),
+            "SELECT 1 WHERE a IS NOT b"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT 1 WHERE a IS NOT DISTINCT FROM b").unwrap(),
+            "SELECT 1 WHERE a IS b"
+        );
+    }
+
+    #[test]
+    fn strips_postgres_type_casts_and_values_aliases() {
+        assert_eq!(
+            translate_page_sql("SELECT 1::int AS n").unwrap(),
+            "SELECT 1 AS n"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT CAST('x' AS text) AS t").unwrap(),
+            "SELECT ('x') AS t"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT a.name FROM (VALUES ('Moe'::text), ('Larry'), ('Curly')) AS a(name)"
+            )
+            .unwrap(),
+            "SELECT a.name FROM (SELECT column1 AS name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS _nephrite_values) AS a"
+        );
+    }
+
+    #[test]
     fn lowers_postgres_aggregate_names() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         let result = run_readonly_sql(
@@ -2886,17 +3945,95 @@ mod sql_query_tests {
     }
 
     #[test]
+    fn lowers_postgres_page_property_and_alias_forms() {
+        assert_eq!(
+            translate_page_sql(
+                "SELECT properties['company'] FROM pages WHERE properties ? 'company'"
+            )
+            .unwrap(),
+            "SELECT page_property(properties, 'company') FROM pages WHERE page_has_key(properties, 'company')"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT p.properties->>'company' AS company FROM pages p WHERE p.properties->'active' IS NOT NULL"
+            )
+            .unwrap(),
+            "SELECT page_property(p.properties, 'company') AS company FROM pages p WHERE page_property(p.properties, 'active') IS NOT NULL"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT * FROM pages p WHERE p.aliases @> ARRAY['Data']"
+            )
+            .unwrap(),
+            "SELECT * FROM pages p WHERE (page_has_tag(p.aliases, 'Data'))"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT * FROM pages p WHERE 'recruiter' = ANY(p.tags)"
+            )
+            .unwrap(),
+            "SELECT * FROM pages p WHERE page_has_tag(p.tags, 'recruiter')"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages WHERE properties ?& ARRAY['a', 'b']"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages WHERE (page_has_key(properties, 'a') AND page_has_key(properties, 'b'))"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages WHERE properties ?| ARRAY['a', 'b']"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages WHERE (page_has_key(properties, 'a') OR page_has_key(properties, 'b'))"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages WHERE jsonb_exists(properties, 'company')"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages WHERE page_has_key(properties, 'company')"
+        );
+        let ilike_out = translate_page_sql(
+            "SELECT path FROM pages WHERE properties->>'name' ILIKE '%roy%'"
+        )
+        .unwrap();
+        assert!(
+            ilike_out.contains("lower(page_property(properties, 'name')) LIKE lower('%roy%')"),
+            "ILIKE not lowered: {ilike_out}"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages p WHERE p.tags && page_array('recruiter', 'interviewer')"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages p WHERE (page_has_tag(p.tags, 'recruiter') OR page_has_tag(p.tags, 'interviewer'))"
+        );
+        let cte = translate_page_sql(
+            "WITH c AS (SELECT properties['company'] AS company FROM pages) SELECT company FROM c",
+        )
+        .unwrap();
+        assert!(
+            cte.contains("page_property(properties, 'company') AS company"),
+            "CTE property subscript broken: {cte}"
+        );
+        assert!(!cte.contains("properties["), "raw subscript remains: {cte}");
+    }
+
+    #[test]
     fn executes_postgres_page_property_and_tag_types() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
-            .execute("CREATE TABLE pages(properties TEXT, tags TEXT)", [])
+            .execute("CREATE TABLE pages(properties TEXT, tags TEXT, aliases TEXT)", [])
             .unwrap();
         connection
             .execute(
-                "INSERT INTO pages VALUES (?1, ?2)",
+                "INSERT INTO pages VALUES (?1, ?2, ?3)",
                 [
                     r#"{"company":"CDW","active":true}"#,
                     r#"["recruiter","linkedin"]"#,
+                    r#"["Data","Kirk"]"#,
                 ],
             )
             .unwrap();
@@ -2906,6 +4043,20 @@ mod sql_query_tests {
         )
         .unwrap();
         assert_eq!(result.rows, [[serde_json::json!("CDW")]]);
+
+        let arrow = run_readonly_sql(
+            &connection,
+            "SELECT properties->>'company' AS company FROM pages WHERE properties ? 'company'",
+        )
+        .unwrap();
+        assert_eq!(arrow.rows, [[serde_json::json!("CDW")]]);
+
+        let existence = run_readonly_sql(
+            &connection,
+            "SELECT 1 FROM pages WHERE properties ? 'missing'",
+        )
+        .unwrap();
+        assert!(existence.rows.is_empty());
 
         let overlap = run_readonly_sql(
             &connection,
@@ -2920,5 +4071,12 @@ mod sql_query_tests {
         )
         .unwrap();
         assert!(no_overlap.rows.is_empty());
+
+        let alias_hit = run_readonly_sql(
+            &connection,
+            "SELECT properties['company'] AS company FROM pages WHERE aliases @> ARRAY['Data']",
+        )
+        .unwrap();
+        assert_eq!(alias_hit.rows, [[serde_json::json!("CDW")]]);
     }
 }

@@ -1,5 +1,6 @@
 mod state;
 mod postgres_compat;
+mod page_sql;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
@@ -1979,7 +1980,20 @@ fn run_readonly_sql(
             },
         )
         .map_err(|error| error.to_string())?;
-    let translated = translate_page_sql(sql)?;
+    connection
+        .create_scalar_function(
+            "page_has_key",
+            2,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                let source = context.get::<String>(0)?;
+                let key = context.get::<String>(1)?;
+                let object = serde_json::from_str::<serde_json::Value>(&source).unwrap_or_default();
+                Ok(object.as_object().map(|m| m.contains_key(&key)).unwrap_or(false))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let translated = page_sql::lower_page_sql(sql, translate_page_sql, translate_page_sql_residual)?;
     let mut statement = connection
         .prepare(&translated)
         .map_err(|error| error.to_string())?;
@@ -2023,109 +2037,365 @@ fn run_readonly_sql(
 
 /// Lower Nephrite's PostgreSQL custom page types into disposable SQLite
 /// storage expressions. The PostgreSQL parser has already validated syntax.
+///
+/// Supported page surface (v0.2 → expanded):
+///   properties['key']          → page_property(properties, 'key')
+///   properties->>'key'         → page_property(properties, 'key')
+///   properties->'key'          → page_property(properties, 'key')  (text for now)
+///   properties ? 'key'         → page_has_key(properties, 'key')
+///   properties ?& ARRAY[...]   → AND of page_has_key
+///   properties ?| ARRAY[...]   → OR of page_has_key
+///   tags @> ARRAY[...]         → AND of page_has_tag
+///   tags && ARRAY[...]         → OR  of page_has_tag
+///   aliases @> / && ARRAY[...] → same, using page_has_tag helper (array of strings)
+///   'x' = ANY(tags)            → page_has_tag
+///   ARRAY[...]                 → page_array(...)
+///   EXTRACT(field FROM expr)   → date_part('field', expr)
+///   string_agg / bool_and / bool_or / every → SQLite equivalents
 fn translate_page_sql(sql: &str) -> Result<String, String> {
-    let property = regex::Regex::new(
+    let translated = translate_page_sql_forms(sql)?;
+    translate_page_sql_residual(&translated)
+}
+
+/// Page-semantic forms still handled textually when the AST walker misses them.
+fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
+    // properties['key']
+    let property_bracket = regex::Regex::new(
         r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\[\s*'((?:''|[^'])*)'\s*\]",
     )
     .map_err(|error| error.to_string())?;
-    let translated = property.replace_all(sql, |captures: &regex::Captures<'_>| {
-        format!("page_property({}, '{}')", &captures[1], &captures[2])
-    });
-    let any_tag = regex::Regex::new(
-        r"(?i)'((?:''|[^'])*)'\s*=\s*ANY\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?tags)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
-    let translated = any_tag
-        .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            format!("page_has_tag({}, '{}')", &captures[2], &captures[1])
+    let mut translated = property_bracket
+        .replace_all(sql, |captures: &regex::Captures<'_>| {
+            format!("page_property({}, '{}')", &captures[1], &captures[2])
         })
         .into_owned();
-    let contains_tags =
-        regex::Regex::new(r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?tags)\s*@>\s*ARRAY\s*\[([^\]]*)\]")
-            .map_err(|error| error.to_string())?;
+
+    // properties->>'key' and properties->'key'
+    let property_arrow = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*->>?\s*'((?:''|[^'])*)'",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_arrow
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_property({}, '{}')", &captures[1], &captures[2])
+        })
+        .into_owned();
+
+    // jsonb_exists(properties, 'key')
+    let jsonb_exists = regex::Regex::new(
+        r"(?i)\bjsonb_exists\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?properties)\s*,\s*'((?:''|[^'])*)'\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = jsonb_exists
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_has_key({}, '{}')", &captures[1], &captures[2])
+        })
+        .into_owned();
+
+    // properties ? 'key'
+    let property_exists = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?\s*'((?:''|[^'])*)'",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_exists
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_has_key({}, '{}')", &captures[1], &captures[2])
+        })
+        .into_owned();
+
     let string_literal =
         regex::Regex::new(r"'((?:''|[^'])*)'").map_err(|error| error.to_string())?;
-    let translated = contains_tags
+
+    // properties ?& ARRAY[...]  (all keys exist)
+    let property_all_keys = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?&\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_all_keys
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            let tags = string_literal
+            let items = string_literal
                 .captures_iter(&captures[2])
-                .map(|tag| tag[1].to_string())
+                .map(|m| m[1].to_string())
                 .collect::<Vec<_>>();
             let residue = string_literal.replace_all(&captures[2], "");
-            if !residue
-                .chars()
-                .all(|character| character.is_whitespace() || character == ',')
-            {
+            if !residue.chars().all(|c| c.is_whitespace() || c == ',') {
                 return captures[0].to_string();
             }
-            if tags.is_empty() {
+            if items.is_empty() {
                 return "1".to_string();
             }
             format!(
                 "({})",
-                tags.iter()
-                    .map(|tag| format!("page_has_tag({}, '{}')", &captures[1], tag))
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
                     .collect::<Vec<_>>()
                     .join(" AND ")
             )
         })
         .into_owned();
-    let overlaps_tags =
-        regex::Regex::new(r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?tags)\s*&&\s*ARRAY\s*\[([^\]]*)\]")
-            .map_err(|error| error.to_string())?;
-    let translated = overlaps_tags
+
+    // properties ?| ARRAY[...]  (any key exists)
+    let property_any_keys = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?\|\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = property_any_keys
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            let tags = string_literal
+            let items = string_literal
                 .captures_iter(&captures[2])
-                .map(|tag| tag[1].to_string())
+                .map(|m| m[1].to_string())
                 .collect::<Vec<_>>();
             let residue = string_literal.replace_all(&captures[2], "");
-            if !residue
-                .chars()
-                .all(|character| character.is_whitespace() || character == ',')
-            {
+            if !residue.chars().all(|c| c.is_whitespace() || c == ',') {
                 return captures[0].to_string();
             }
-            if tags.is_empty() {
+            if items.is_empty() {
                 return "0".to_string();
             }
             format!(
                 "({})",
-                tags.iter()
-                    .map(|tag| format!("page_has_tag({}, '{}')", &captures[1], tag))
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
                     .collect::<Vec<_>>()
                     .join(" OR ")
             )
         })
         .into_owned();
 
-    // PostgreSQL ARRAY constructors become Nephrite's JSON-backed semantic
-    // arrays after the page-tag operators above have consumed their operands.
+    // jsonb_exists_all(properties, ARRAY[...])
+    let jsonb_exists_all = regex::Regex::new(
+        r"(?i)\bjsonb_exists_all\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?properties)\s*,\s*ARRAY\s*\[([^\]]*)\]\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = jsonb_exists_all
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "1".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            )
+        })
+        .into_owned();
+
+    // jsonb_exists_any(properties, ARRAY[...])
+    let jsonb_exists_any = regex::Regex::new(
+        r"(?i)\bjsonb_exists_any\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?properties)\s*,\s*ARRAY\s*\[([^\]]*)\]\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = jsonb_exists_any
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "0".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_key({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        })
+        .into_owned();
+
+    // 'x' = ANY(tags|aliases)
+    let any_array = regex::Regex::new(
+        r"(?i)'((?:''|[^'])*)'\s*=\s*ANY\s*\(\s*((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = any_array
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("page_has_tag({}, '{}')", &captures[2], &captures[1])
+        })
+        .into_owned();
+
+    // (tags|aliases) @> ARRAY[...]
+    let contains = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*@>\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = contains
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            let residue = string_literal.replace_all(&captures[2], "");
+            if !residue
+                .chars()
+                .all(|c| c.is_whitespace() || c == ',')
+            {
+                return captures[0].to_string();
+            }
+            if items.is_empty() {
+                return "1".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            )
+        })
+        .into_owned();
+
+    // (tags|aliases) && ARRAY[...]
+    let overlaps = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*&&\s*ARRAY\s*\[([^\]]*)\]",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = overlaps
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            let residue = string_literal.replace_all(&captures[2], "");
+            if !residue
+                .chars()
+                .all(|c| c.is_whitespace() || c == ',')
+            {
+                return captures[0].to_string();
+            }
+            if items.is_empty() {
+                return "0".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        })
+        .into_owned();
+
+    // (tags|aliases) && page_array(...)
+    let overlaps_pa = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*&&\s*page_array\s*\(([^)]*)\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = overlaps_pa
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "0".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
+        })
+        .into_owned();
+
+    // (tags|aliases) @> page_array(...)
+    let contains_pa = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?(?:tags|aliases))\s*@>\s*page_array\s*\(([^)]*)\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = contains_pa
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let items = string_literal
+                .captures_iter(&captures[2])
+                .map(|m| m[1].to_string())
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                return "1".to_string();
+            }
+            format!(
+                "({})",
+                items
+                    .iter()
+                    .map(|item| format!("page_has_tag({}, '{}')", &captures[1], item))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            )
+        })
+        .into_owned();
+
+    Ok(translated)
+}
+
+/// Residual lowering after AST page rewrites (or as the tail of full textual).
+fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
+    // PostgreSQL `::type` casts → strip (SQLite is dynamically typed)
+    // Handles: 'Moe'::text, 1::int, col::varchar(10), expr::float8
+    let typecast = regex::Regex::new(
+        r"::\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?",
+    )
+    .map_err(|error| error.to_string())?;
+    let mut translated = typecast.replace_all(sql, "").into_owned();
+
+    // CAST(expr AS type) → (expr)  (SQLite ignores declared types)
+    let cast_fn = regex::Regex::new(
+        r"(?i)\bCAST\s*\((.+?)\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = cast_fn
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("({})", captures[1].trim())
+        })
+        .into_owned();
+
+    // ARRAY constructor (not already consumed by page tag forms)
     let array_constructor = regex::Regex::new(r"(?i)\bARRAY\s*\[([^\[\]]*)\]")
         .map_err(|error| error.to_string())?;
-    let translated = array_constructor
+    translated = array_constructor
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("page_array({})", &captures[1])
         })
         .into_owned();
 
-    // SQLite has the implementation as date_part(field, value), while
-    // PostgreSQL's canonical spelling is EXTRACT(field FROM value).
     let extract = regex::Regex::new(
         r"(?i)\bEXTRACT\s*\(\s*([a-z_]+)\s+FROM\s+([^()]+?)\s*\)",
     )
     .map_err(|error| error.to_string())?;
-    let translated = extract
+    translated = extract
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("date_part('{}', {})", &captures[1], &captures[2])
         })
         .into_owned();
 
-    // These PostgreSQL aggregates have exact SQLite equivalents for the
-    // ordinary (non-ORDER-BY-inside-the-call) form used by page queries.
+    // ILIKE → case-insensitive LIKE
+    let ilike = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_$.]*)|page_property\([^)]+\)|page_has_key\([^)]+\))\s+ILIKE\s+('(?:''|[^'])*')",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = ilike
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("lower({}) LIKE lower({})", &captures[1], &captures[2])
+        })
+        .into_owned();
+
     let aggregate = regex::Regex::new(r"(?i)\b(string_agg|bool_and|bool_or|every)\s*\(")
         .map_err(|error| error.to_string())?;
-    Ok(aggregate
+    translated = aggregate
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             let function = match captures[1].to_ascii_lowercase().as_str() {
                 "string_agg" => "group_concat",
@@ -2134,7 +2404,155 @@ fn translate_page_sql(sql: &str) -> Result<String, String> {
             };
             format!("{function}(")
         })
-        .into_owned())
+        .into_owned();
+
+    // PostgreSQL: (VALUES (...), ...) AS alias(col1, col2)
+    // SQLite (bundled): VALUES columns are column1..columnN; table(col) alias form
+    // is not always available — expand to SELECT columnN AS col FROM (VALUES ...) AS alias
+    // jsonb_array_length(x) / cardinality(x) → length(x)
+    let array_len = regex::Regex::new(
+        r"(?i)\b(?:jsonb_array_length|cardinality)\s*\(\s*([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = array_len
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("length({})", captures[1].trim())
+        })
+        .into_owned();
+
+    // to_char(x, format) — common ISO-ish formats only
+    let to_char = regex::Regex::new(
+        r"(?i)\bto_char\s*\(\s*([^,]+?)\s*,\s*'([^']*)'\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = to_char
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let source = captures[1].trim();
+            let fmt = captures[2];
+            let sqlite_fmt = match fmt {
+                "YYYY-MM-DD" | "yyyy-mm-dd" => "%Y-%m-%d",
+                "YYYY-MM" | "yyyy-mm" => "%Y-%m",
+                "YYYY" | "yyyy" => "%Y",
+                "HH24:MI:SS" | "hh24:mi:ss" => "%H:%M:%S",
+                "YYYY-MM-DD HH24:MI:SS" | "yyyy-mm-dd hh24:mi:ss" => "%Y-%m-%d %H:%M:%S",
+                _ => "",
+            };
+            if sqlite_fmt.is_empty() {
+                captures[0].to_string()
+            } else {
+                format!("strftime('{sqlite_fmt}', {source})")
+            }
+        })
+        .into_owned();
+
+    // strpos(haystack, needle) / position(needle in haystack) → instr
+    let strpos = regex::Regex::new(
+        r"(?i)\bstrpos\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = strpos
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("instr({}, {})", captures[1].trim(), captures[2].trim())
+        })
+        .into_owned();
+    let position = regex::Regex::new(
+        r"(?i)\bposition\s*\(\s*([^)]+?)\s+IN\s+([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = position
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("instr({}, {})", captures[2].trim(), captures[1].trim())
+        })
+        .into_owned();
+
+    // substring(s from n for len) → substr(s, n, len); substring(s from n) → substr(s, n)
+    let substr_for = regex::Regex::new(
+        r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s+FOR\s+([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = substr_for
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!(
+                "substr({}, {}, {})",
+                captures[1].trim(),
+                captures[2].trim(),
+                captures[3].trim()
+            )
+        })
+        .into_owned();
+    let substr_from = regex::Regex::new(
+        r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = substr_from
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            format!("substr({}, {})", captures[1].trim(), captures[2].trim())
+        })
+        .into_owned();
+
+    // date_trunc('unit', source) → SQLite date/strftime
+    let date_trunc = regex::Regex::new(
+        r"(?i)\bdate_trunc\s*\(\s*'([^']+)'\s*,\s*([^)]+?)\s*\)",
+    )
+    .map_err(|error| error.to_string())?;
+    translated = date_trunc
+        .replace_all(&translated, |captures: &regex::Captures<'_>| {
+            let unit = captures[1].to_ascii_lowercase();
+            let source = captures[2].trim();
+            match unit.as_str() {
+                "day" | "days" => format!("date({source})"),
+                "month" | "months" => format!("strftime('%Y-%m-01', {source})"),
+                "year" | "years" => format!("strftime('%Y-01-01', {source})"),
+                "hour" | "hours" => format!("strftime('%Y-%m-%d %H:00:00', {source})"),
+                _ => captures[0].to_string(),
+            }
+        })
+        .into_owned();
+
+    // IS [NOT] DISTINCT FROM → SQLite null-safe IS / IS NOT
+    // SQLite: `IS` / `IS NOT` are null-safe, matching DISTINCT FROM semantics.
+    let not_distinct = regex::Regex::new(r"(?i)\bIS\s+NOT\s+DISTINCT\s+FROM\b")
+        .map_err(|error| error.to_string())?;
+    translated = not_distinct.replace_all(&translated, "IS").into_owned();
+    let is_distinct = regex::Regex::new(r"(?i)\bIS\s+DISTINCT\s+FROM\b")
+        .map_err(|error| error.to_string())?;
+    translated = is_distinct.replace_all(&translated, "IS NOT").into_owned();
+
+    translated = lower_values_table_alias(&translated);
+
+    Ok(translated)
+}
+
+/// Rewrite `(VALUES ...) AS alias(c1, c2, ...)` for SQLite.
+fn lower_values_table_alias(sql: &str) -> String {
+    // Match: (VALUES ...) AS name(col, col, ...)
+    // Non-greedy VALUES body; columns are simple identifiers.
+    let re = match regex::Regex::new(
+        r"(?is)\(\s*VALUES\s*((?:\([^;]*?\))(?:\s*,\s*\([^;]*?\))*)\s*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)",
+    ) {
+        Ok(r) => r,
+        Err(_) => return sql.to_string(),
+    };
+    re.replace_all(sql, |captures: &regex::Captures<'_>| {
+        let values_body = captures[1].trim();
+        let alias = &captures[2];
+        let cols: Vec<&str> = captures[3]
+            .split(',')
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.is_empty() {
+            return captures[0].to_string();
+        }
+        let select_list = cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("column{} AS {col}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("(SELECT {select_list} FROM (VALUES {values_body}) AS _nephrite_values) AS {alias}")
+    })
+    .into_owned()
 }
 
 /// Execute one read-only query against the disposable vault index.
@@ -3324,9 +3742,11 @@ pub fn run() {
 #[cfg(test)]
 mod sql_query_tests {
     use super::{
-        fts_query, is_conflict_status, page_properties, run_readonly_sql,
-        search_yaml_properties, translate_page_sql, vault_search_terms,
+        fts_query, is_conflict_status, next_recurrence_date, page_properties,
+        recurring_task_lines, run_readonly_sql, search_yaml_properties,
+        translate_page_sql, vault_search_terms,
     };
+    use chrono::NaiveDate;
 
     #[test]
     fn full_text_terms_are_quoted_and_prefixed() {
@@ -3483,6 +3903,88 @@ mod sql_query_tests {
     }
 
     #[test]
+    fn strips_postgres_type_casts() {
+        assert_eq!(
+            translate_page_sql(
+                "SELECT a.name FROM (VALUES ('Moe'::text), ('Larry'), ('Curly')) AS a(name)"
+            )
+            .unwrap(),
+            "SELECT a.name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS a(name)"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT 1::int AS n").unwrap(),
+            "SELECT 1 AS n"
+        );
+    }
+
+    #[test]
+    fn lowers_jsonb_array_length() {
+        let out = translate_page_sql("SELECT jsonb_array_length(tags) FROM pages").unwrap();
+        assert!(out.contains("length(tags)"), "array length not lowered: {out}");
+        let out2 = translate_page_sql("SELECT cardinality(tags) FROM pages").unwrap();
+        assert!(out2.contains("length(tags)"), "cardinality not lowered: {out2}");
+    }
+
+    #[test]
+    fn lowers_to_char_strpos_substring() {
+        assert_eq!(
+            translate_page_sql("SELECT to_char(created, 'YYYY-MM-DD') FROM pages").unwrap(),
+            "SELECT strftime('%Y-%m-%d', created) FROM pages"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT strpos(name, 'x') FROM pages").unwrap(),
+            "SELECT instr(name, 'x') FROM pages"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT position('x' IN name) FROM pages").unwrap(),
+            "SELECT instr(name, 'x') FROM pages"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT substring(name FROM 1 FOR 3) FROM pages").unwrap(),
+            "SELECT substr(name, 1, 3) FROM pages"
+        );
+    }
+
+    #[test]
+    fn lowers_date_trunc() {
+        assert_eq!(
+            translate_page_sql("SELECT date_trunc('day', created) FROM pages").unwrap(),
+            "SELECT date(created) FROM pages"
+        );
+    }
+
+    #[test]
+    fn lowers_is_distinct_from() {
+        assert_eq!(
+            translate_page_sql("SELECT 1 WHERE a IS DISTINCT FROM b").unwrap(),
+            "SELECT 1 WHERE a IS NOT b"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT 1 WHERE a IS NOT DISTINCT FROM b").unwrap(),
+            "SELECT 1 WHERE a IS b"
+        );
+    }
+
+    #[test]
+    fn strips_postgres_type_casts_and_values_aliases() {
+        assert_eq!(
+            translate_page_sql("SELECT 1::int AS n").unwrap(),
+            "SELECT 1 AS n"
+        );
+        assert_eq!(
+            translate_page_sql("SELECT CAST('x' AS text) AS t").unwrap(),
+            "SELECT ('x') AS t"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT a.name FROM (VALUES ('Moe'::text), ('Larry'), ('Curly')) AS a(name)"
+            )
+            .unwrap(),
+            "SELECT a.name FROM (SELECT column1 AS name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS _nephrite_values) AS a"
+        );
+    }
+
+    #[test]
     fn lowers_postgres_aggregate_names() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         let result = run_readonly_sql(
@@ -3533,17 +4035,95 @@ mod sql_query_tests {
     }
 
     #[test]
+    fn lowers_postgres_page_property_and_alias_forms() {
+        assert_eq!(
+            translate_page_sql(
+                "SELECT properties['company'] FROM pages WHERE properties ? 'company'"
+            )
+            .unwrap(),
+            "SELECT page_property(properties, 'company') FROM pages WHERE page_has_key(properties, 'company')"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT p.properties->>'company' AS company FROM pages p WHERE p.properties->'active' IS NOT NULL"
+            )
+            .unwrap(),
+            "SELECT page_property(p.properties, 'company') AS company FROM pages p WHERE page_property(p.properties, 'active') IS NOT NULL"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT * FROM pages p WHERE p.aliases @> ARRAY['Data']"
+            )
+            .unwrap(),
+            "SELECT * FROM pages p WHERE (page_has_tag(p.aliases, 'Data'))"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT * FROM pages p WHERE 'recruiter' = ANY(p.tags)"
+            )
+            .unwrap(),
+            "SELECT * FROM pages p WHERE page_has_tag(p.tags, 'recruiter')"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages WHERE properties ?& ARRAY['a', 'b']"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages WHERE (page_has_key(properties, 'a') AND page_has_key(properties, 'b'))"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages WHERE properties ?| ARRAY['a', 'b']"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages WHERE (page_has_key(properties, 'a') OR page_has_key(properties, 'b'))"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages WHERE jsonb_exists(properties, 'company')"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages WHERE page_has_key(properties, 'company')"
+        );
+        let ilike_out = translate_page_sql(
+            "SELECT path FROM pages WHERE properties->>'name' ILIKE '%roy%'"
+        )
+        .unwrap();
+        assert!(
+            ilike_out.contains("lower(page_property(properties, 'name')) LIKE lower('%roy%')"),
+            "ILIKE not lowered: {ilike_out}"
+        );
+        assert_eq!(
+            translate_page_sql(
+                "SELECT 1 FROM pages p WHERE p.tags && page_array('recruiter', 'interviewer')"
+            )
+            .unwrap(),
+            "SELECT 1 FROM pages p WHERE (page_has_tag(p.tags, 'recruiter') OR page_has_tag(p.tags, 'interviewer'))"
+        );
+        let cte = translate_page_sql(
+            "WITH c AS (SELECT properties['company'] AS company FROM pages) SELECT company FROM c",
+        )
+        .unwrap();
+        assert!(
+            cte.contains("page_property(properties, 'company') AS company"),
+            "CTE property subscript broken: {cte}"
+        );
+        assert!(!cte.contains("properties["), "raw subscript remains: {cte}");
+    }
+
+    #[test]
     fn executes_postgres_page_property_and_tag_types() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
-            .execute("CREATE TABLE pages(properties TEXT, tags TEXT)", [])
+            .execute("CREATE TABLE pages(properties TEXT, tags TEXT, aliases TEXT)", [])
             .unwrap();
         connection
             .execute(
-                "INSERT INTO pages VALUES (?1, ?2)",
+                "INSERT INTO pages VALUES (?1, ?2, ?3)",
                 [
                     r#"{"company":"CDW","active":true}"#,
                     r#"["recruiter","linkedin"]"#,
+                    r#"["Data","Kirk"]"#,
                 ],
             )
             .unwrap();
@@ -3553,6 +4133,20 @@ mod sql_query_tests {
         )
         .unwrap();
         assert_eq!(result.rows, [[serde_json::json!("CDW")]]);
+
+        let arrow = run_readonly_sql(
+            &connection,
+            "SELECT properties->>'company' AS company FROM pages WHERE properties ? 'company'",
+        )
+        .unwrap();
+        assert_eq!(arrow.rows, [[serde_json::json!("CDW")]]);
+
+        let existence = run_readonly_sql(
+            &connection,
+            "SELECT 1 FROM pages WHERE properties ? 'missing'",
+        )
+        .unwrap();
+        assert!(existence.rows.is_empty());
 
         let overlap = run_readonly_sql(
             &connection,
@@ -3567,5 +4161,12 @@ mod sql_query_tests {
         )
         .unwrap();
         assert!(no_overlap.rows.is_empty());
+
+        let alias_hit = run_readonly_sql(
+            &connection,
+            "SELECT properties['company'] AS company FROM pages WHERE aliases @> ARRAY['Data']",
+        )
+        .unwrap();
+        assert_eq!(alias_hit.rows, [[serde_json::json!("CDW")]]);
     }
 }
