@@ -2351,6 +2351,10 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
     )
     .map_err(|error| error.to_string())?;
     let mut translated = typecast.replace_all(sql, "").into_owned();
+    // Syntax residual only (operators, SQL-standard forms). Function names
+    // stay intact for postgres_compat UDFs.
+    translated = page_sql::lower_pg_syntax(&translated);
+
 
     // CAST(expr AS type) → (expr)  (SQLite ignores declared types)
     let cast_fn = regex::Regex::new(
@@ -2428,7 +2432,7 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
     translated = to_char
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             let source = captures[1].trim();
-            let fmt = captures[2];
+            let fmt = &captures[2];
             let sqlite_fmt = match fmt {
                 "YYYY-MM-DD" | "yyyy-mm-dd" => "%Y-%m-%d",
                 "YYYY-MM" | "yyyy-mm" => "%Y-%m",

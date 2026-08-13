@@ -1262,6 +1262,45 @@ fn lower_funccall(
 
     // EXTRACT / date_part(field, source) — PG often emits date_part after analysis;
     // raw trees may still say "date_part" or use extract-like FuncCall.
+    // now() / current_timestamp / current_date / current_time
+    if matches!(
+        name_l.as_str(),
+        "now" | "current_timestamp" | "current_date" | "current_time"
+    ) {
+        let start = if loc >= 0 { loc as usize } else { 0 };
+        if loc >= 0 {
+            // Bare CURRENT_DATE has no parens; FuncCall form usually does.
+            let end = find_closing_paren_end(sql, start).unwrap_or_else(|| {
+                // keyword-only: span the identifier
+                let b = sql.as_bytes();
+                let mut i = start;
+                while i < b.len()
+                    && (b[i].is_ascii_alphanumeric() || b[i] == b'_')
+                {
+                    i += 1;
+                }
+                i
+            });
+            if end > start && sql.is_char_boundary(start) && sql.is_char_boundary(end) {
+                let replacement = match name_l.as_str() {
+                    "now" | "current_timestamp" => "datetime('now')".to_string(),
+                    "current_date" => "date('now')".to_string(),
+                    "current_time" => "time('now')".to_string(),
+                    _ => String::new(),
+                };
+                if !replacement.is_empty() {
+                    return Ok(Some(AstRewrite {
+                        start,
+                        end,
+                        replacement,
+                    }));
+                }
+            }
+        }
+        let _ = tokens;
+        return Ok(None);
+    }
+
     if matches!(name_l.as_str(), "date_part" | "extract") && func.args.len() >= 2 {
         let field = string_const(&func.args[0])
             .or_else(|| column_name(&func.args[0]))
@@ -1854,6 +1893,230 @@ pub fn analyze_page_forms(sql: &str) -> Result<Vec<PageExpr>, String> {
     Ok(forms)
 }
 
+
+/// Textual fallback for PG datetime builtins (also AST-lowered when spans recover).
+/// Syntax residual for forms SQLite cannot parse, or that must be rewritten
+/// before native `postgres_compat` UDFs run.
+///
+/// Do **not** rewrite bare function names that `postgres_compat` already
+/// registers (`lpad`, `concat`, `char_length`, `now`, `split_part`, …).
+pub fn lower_pg_syntax(sql: &str) -> String {
+    let mut out = sql.to_string();
+
+    // --- regex match operators -------------------------------------------------
+    // col ~ 'pat'  /  col ~* 'pat'  /  col !~ 'pat'  /  col !~* 'pat'
+    // Prefer longest operators first (~* before ~).
+
+    // !~*
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*!~\*\s*('(?:''|[^'])*')",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!("NOT regexp_like({}, {}, 'i')", &c[1], &c[2])
+            })
+            .into_owned();
+    }
+    // ~*
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*~\*\s*('(?:''|[^'])*')",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!("regexp_like({}, {}, 'i')", &c[1], &c[2])
+            })
+            .into_owned();
+    }
+    // !~
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*!~\s*('(?:''|[^'])*')",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!("NOT regexp_like({}, {})", &c[1], &c[2])
+            })
+            .into_owned();
+    }
+    // ~
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*~\s*('(?:''|[^'])*')",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!("regexp_like({}, {})", &c[1], &c[2])
+            })
+            .into_owned();
+    }
+
+    // --- SIMILAR TO ------------------------------------------------------------
+    // Best-effort: map SQL SIMILAR patterns to a LIKE-ish regexp.
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)([a-z_][a-z0-9_$.]*|\))\s+NOT\s+SIMILAR\s+TO\s+('(?:''|[^'])*')",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let pat = similar_to_rust_regex(&c[2]);
+                format!("NOT regexp_like({}, '{}')", &c[1], pat.replace('\'', "''"))
+            })
+            .into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)([a-z_][a-z0-9_$.]*|\))\s+SIMILAR\s+TO\s+('(?:''|[^'])*')",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let pat = similar_to_rust_regex(&c[2]);
+                format!("regexp_like({}, '{}')", &c[1], pat.replace('\'', "''"))
+            })
+            .into_owned();
+    }
+
+    // --- FETCH FIRST / OFFSET n ROWS ------------------------------------------
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)\bFETCH\s+(?:FIRST|NEXT)\s+(\d+)\s+ROWS?\s+ONLY\b",
+    ) {
+        out = re.replace_all(&out, "LIMIT $1").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(r"(?i)\bOFFSET\s+(\d+)\s+ROWS\b") {
+        out = re.replace_all(&out, "OFFSET $1").into_owned();
+    }
+
+    // --- to_timestamp(epoch) (no native UDF) ----------------------------------
+    if let Ok(re) = regex::Regex::new(r"(?i)\bto_timestamp\s*\(\s*([^)]+?)\s*\)") {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!("datetime({}, 'unixepoch')", c[1].trim())
+            })
+            .into_owned();
+    }
+
+    // --- to_char (common formats only; no native UDF) -------------------------
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)\bto_char\s*\(\s*([^,]+?)\s*,\s*'([^']*)'\s*\)",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let source = c[1].trim();
+                let fmt = &c[2];
+                let sqlite_fmt = match fmt {
+                    "YYYY-MM-DD" | "yyyy-mm-dd" => "%Y-%m-%d",
+                    "YYYY-MM" | "yyyy-mm" => "%Y-%m",
+                    "YYYY" | "yyyy" => "%Y",
+                    "HH24:MI:SS" | "hh24:mi:ss" => "%H:%M:%S",
+                    "YYYY-MM-DD HH24:MI:SS" | "yyyy-mm-dd hh24:mi:ss" => "%Y-%m-%d %H:%M:%S",
+                    _ => "",
+                };
+                if sqlite_fmt.is_empty() {
+                    c[0].to_string()
+                } else {
+                    format!("strftime('{sqlite_fmt}', {source})")
+                }
+            })
+            .into_owned();
+    }
+
+    // --- substring(s FROM n [FOR len]) ----------------------------------------
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s+FOR\s+([^)]+?)\s*\)",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!(
+                    "substr({}, {}, {})",
+                    c[1].trim(),
+                    c[2].trim(),
+                    c[3].trim()
+                )
+            })
+            .into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s*\)",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!("substr({}, {})", c[1].trim(), c[2].trim())
+            })
+            .into_owned();
+    }
+
+    // --- position(needle IN haystack) -----------------------------------------
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)\bposition\s*\(\s*([^)]+?)\s+IN\s+([^)]+?)\s*\)",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!("strpos({}, {})", c[2].trim(), c[1].trim())
+            })
+            .into_owned();
+    }
+
+    // --- trim(BOTH|LEADING|TRAILING [chars] FROM s) ---------------------------
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)\btrim\s*\(\s*(both|leading|trailing)(?:\s+((?:'[^']*'|[^)\s]+)))?\s+from\s+([^)]+?)\s*\)",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                let side = c[1].to_ascii_lowercase();
+                let chars = c.get(2).map(|m| m.as_str().trim()).filter(|s| !s.is_empty());
+                let src = c[3].trim();
+                let func = match side.as_str() {
+                    "leading" => "ltrim",
+                    "trailing" => "rtrim",
+                    _ => "btrim",
+                };
+                if let Some(ch) = chars {
+                    format!("{func}({src}, {ch})")
+                } else {
+                    format!("{func}({src})")
+                }
+            })
+            .into_owned();
+    }
+
+    // --- nested properties->'a'->>'b' -----------------------------------------
+    if let Ok(re) = regex::Regex::new(
+        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*->\s*'((?:''|[^'])*)'\s*->>\s*'((?:''|[^'])*)'",
+    ) {
+        out = re
+            .replace_all(&out, |c: &regex::Captures<'_>| {
+                format!(
+                    "page_property(page_property({}, '{}'), '{}')",
+                    &c[1], &c[2], &c[3]
+                )
+            })
+            .into_owned();
+    }
+
+    out
+}
+
+fn similar_to_rust_regex(quoted_pat: &str) -> String {
+    // Strip surrounding quotes; convert SIMILAR TO metacharacters to Rust regex.
+    let inner = quoted_pat
+        .trim()
+        .trim_matches('\'')
+        .replace("''", "'");
+    let mut out = String::with_capacity(inner.len() * 2);
+    out.push('^');
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            '.' | '*' | '+' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(chars[i]);
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out.push('$');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2076,6 +2339,71 @@ mod tests {
         let _ = try_ast_lower(sql);
         let sql2 = "SELECT properties->'active' FROM pages";
         let _ = try_ast_lower(sql2);
+    }
+
+
+
+    #[test]
+    fn lowers_pg_numeric_funcs() {
+        // Numeric functions are native UDFs — residual is a no-op.
+        assert_eq!(lower_pg_syntax("SELECT power(2, 3)"), "SELECT power(2, 3)");
+        assert_eq!(lower_pg_syntax("SELECT mod(10, 3)"), "SELECT mod(10, 3)");
+
+    }
+
+    #[test]
+    fn lowers_pg_regex_and_similar() {
+        assert_eq!(
+            lower_pg_syntax("SELECT * FROM pages WHERE name ~ 'Roy'"),
+            "SELECT * FROM pages WHERE regexp_like(name, 'Roy')"
+        );
+        assert_eq!(
+            lower_pg_syntax("SELECT * FROM pages WHERE name ~* 'roy'"),
+            "SELECT * FROM pages WHERE regexp_like(name, 'roy', 'i')"
+        );
+        assert!(
+            lower_pg_syntax("SELECT * FROM pages WHERE name SIMILAR TO 'A%'")
+                .contains("regexp_like"),
+            "SIMILAR TO"
+        );
+        assert_eq!(
+            lower_pg_syntax("SELECT * FROM pages FETCH FIRST 10 ROWS ONLY"),
+            "SELECT * FROM pages LIMIT 10"
+        );
+        assert!(
+            lower_pg_syntax("SELECT properties->'a'->>'b' FROM pages")
+                .contains("page_property(page_property"),
+            "nested properties"
+        );
+    }
+
+    #[test]
+    fn lowers_pg_string_funcs() {
+        // Syntax-only residual; function names stay for postgres_compat UDFs.
+        assert_eq!(
+            lower_pg_syntax("SELECT position('x' IN name)"),
+            "SELECT strpos(name, 'x')"
+        );
+        assert_eq!(
+            lower_pg_syntax("SELECT substring(name FROM 1 FOR 3)"),
+            "SELECT substr(name, 1, 3)"
+        );
+        assert_eq!(
+            lower_pg_syntax("SELECT trim(both 'x' from name)"),
+            "SELECT btrim(name, 'x')"
+        );
+
+    }
+
+    #[test]
+    fn lowers_pg_now_datetime() {
+        // now() is a postgres_compat UDF; residual must not rewrite it.
+        assert!(lower_pg_syntax("SELECT now()").contains("now()"));
+        assert!(
+            lower_pg_syntax("SELECT to_timestamp(0)").contains("unixepoch"),
+            "to_timestamp"
+        );
+
     }
 
     #[test]

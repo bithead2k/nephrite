@@ -25,7 +25,10 @@ echo "$zipfile"
 [[ -f "$zipfile" ]] && { mv "$zipfile" patches/; unzip "patches/$zipfile"; }
 patchfile=$(ls -1 *.patch)
 echo "$patchfile"
-patch -p1 < "$patchfile"
-rm $patchfile
-
-
+[[ -f "$patchfile" ]] && { patch -p1 < "$patchfile"; rm $patchfile; }
+fixfile=$(ls -1 fix-* 2>/dev/null)
+echo "$fixfile"
+[[ -f "$fixfile" ]] || exit
+chmod +x "$fixfile"
+"./$fixfile"
+mv "$fixfile" patches/

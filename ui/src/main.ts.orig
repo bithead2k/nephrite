@@ -55,6 +55,7 @@ import {
 } from "./context-menu";
 import {
   clearScrollSync,
+  CURSOR_SYNC_DELAY_MS,
   rebindScrollSync,
   setEditorDocumentEnd,
   syncEditorCursorMovement,
@@ -143,6 +144,8 @@ const PREVIEW_DELAY_MS = 1_000;
 
 const LAST_VAULT_KEY = "nephrite.lastVault";
 const VIM_KEY = "nephrite.vim";
+const PREVIEW_CSS_KEY = "nephrite.previewCss.v1";
+const DEFAULT_PREVIEW_CSS = "/* Nephrite page styles \u2014 edit in Preferences. Scoped to .preview */\n\n.preview {\n  line-height: 1.55;\n  color: var(--text);\n}\n\n.preview a {\n  color: var(--accent);\n  text-decoration: underline;\n  text-underline-offset: 2px;\n}\n\n.preview a:hover {\n  color: #9ee4c8;\n}\n\n.preview hr {\n  border: none;\n  border-top: 1px solid var(--border);\n  margin: 1.25em 0;\n}\n\n.preview ul,\n.preview ol {\n  margin: 0.55em 0 0.55em 1.35em;\n  padding: 0;\n}\n\n.preview li {\n  margin: 0.25em 0;\n}\n\n.preview li > ul,\n.preview li > ol {\n  margin-top: 0.2em;\n}\n\n.preview img {\n  max-width: 100%;\n  height: auto;\n  border-radius: 6px;\n}\n\n.preview table {\n  width: 100%;\n  border-collapse: collapse;\n  margin: 0.9em 0;\n  font-size: 0.92em;\n  display: block;\n  overflow-x: auto;\n}\n\n.preview th,\n.preview td {\n  border: 1px solid var(--border);\n  padding: 0.45em 0.7em;\n  text-align: left;\n  vertical-align: top;\n}\n\n.preview th {\n  background: #1a2330;\n  font-weight: 650;\n  color: #dff8ec;\n}\n\n.preview tr:nth-child(even) td {\n  background: color-mix(in srgb, #1a2330 55%, transparent);\n}\n\n.preview tr:hover td {\n  background: color-mix(in srgb, var(--accent) 10%, transparent);\n}\n\n.preview input[type=\"checkbox\"] {\n  margin-right: 0.4em;\n}\n";
 const EXTERNAL_BROWSER_KEY = "nephrite.externalLinksInBrowser";
 const VIEW_KEY = "nephrite.viewMode";
 const EXPANDED_KEY = "nephrite.expandedFolders";
@@ -550,6 +553,15 @@ async function renderShell() {
               <button type="button" id="task-scope-save">Save task scope</button>
             </section>
             <section class="preferences-section">
+              <strong>Page CSS</strong>
+              <small>Styles the Markdown preview. Prefer selectors under <code>.preview</code>. Saved in this browser profile.</small>
+              <textarea id="preview-css-editor" class="preferences-css" spellcheck="false" rows="12"></textarea>
+              <div class="preferences-css-actions">
+                <button type="button" id="preview-css-save">Save page CSS</button>
+                <button type="button" id="preview-css-reset">Reset to default</button>
+              </div>
+            </section>
+            <section class="preferences-section">
               <strong>Plugins</strong>
               <div id="preferences-plugins" class="preferences-plugins"></div>
               <button type="button" id="preferences-plugin-reload">Reload plugins</button>
@@ -730,6 +742,9 @@ async function renderShell() {
   $("preferences-automation-create").addEventListener("click", () => void createExampleAutomationConfig());
   $("preferences-hotkeys").addEventListener("click", showHotkeysPanel);
   $("preferences-close").addEventListener("click", closePreferences);
+  $("preview-css-save").addEventListener("click", savePreviewCssFromEditor);
+  $("preview-css-reset").addEventListener("click", resetPreviewCss);
+  applyPreviewCss();
   $("feature-close").addEventListener("click", closeFeaturePanel);
   $("feature-panel").addEventListener("mousedown", (event) => {
     if (event.target === $("feature-panel")) closeFeaturePanel();
@@ -935,10 +950,48 @@ function setActiveActivity(activity: ActivityId | null) {
   });
 }
 
+
+function getPreviewCss(): string {
+  const raw = localStorage.getItem(PREVIEW_CSS_KEY);
+  if (raw == null || raw.trim() === "") return DEFAULT_PREVIEW_CSS;
+  return raw;
+}
+
+function applyPreviewCss(css: string = getPreviewCss()) {
+  let el = document.getElementById("nephrite-user-preview-css") as HTMLStyleElement | null;
+  if (!el) {
+    el = document.createElement("style");
+    el.id = "nephrite-user-preview-css";
+    document.head.appendChild(el);
+  }
+  el.textContent = css;
+}
+
+function loadPreviewCssEditor() {
+  const editor = document.getElementById("preview-css-editor") as HTMLTextAreaElement | null;
+  if (editor) editor.value = getPreviewCss();
+}
+
+function savePreviewCssFromEditor() {
+  const editor = document.getElementById("preview-css-editor") as HTMLTextAreaElement | null;
+  if (!editor) return;
+  localStorage.setItem(PREVIEW_CSS_KEY, editor.value);
+  applyPreviewCss(editor.value);
+  setTransientStatus("Page CSS saved", "#5ecf9a");
+}
+
+function resetPreviewCss() {
+  localStorage.removeItem(PREVIEW_CSS_KEY);
+  applyPreviewCss(DEFAULT_PREVIEW_CSS);
+  loadPreviewCssEditor();
+  setTransientStatus("Page CSS reset to default", "#5ecf9a");
+}
+
 function togglePreferences() {
   const popover = $("preferences-popover");
   const opening = popover.classList.contains("hidden");
   popover.classList.toggle("hidden", !opening);
+  if (opening) loadPreviewCssEditor();
   $("btn-preferences").setAttribute("aria-expanded", opening ? "true" : "false");
   $("btn-preferences").classList.toggle("active", opening);
   if (opening) {
@@ -2595,37 +2648,52 @@ function jumpToWikilinkFragment(
   const edScroll = editor?.scrollElement() ?? null;
   const previewHost = document.getElementById("preview-host");
 
-  const apply = () => {
-    // Editor: caret to section (source / split).
-    if (editor) {
-      const doc = editor.getDoc();
-      if (heading) {
-        const line = findMarkdownHeadingLine(doc, heading);
-        if (line != null) editor.goToLine(line);
-      } else if (block) {
-        const line = findMarkdownBlockLine(doc, block);
-        if (line != null) editor.goToLine(line);
-      }
+  const applyEditor = () => {
+    if (!editor) return;
+    const doc = editor.getDoc();
+    if (heading) {
+      const line = findMarkdownHeadingLine(doc, heading);
+      if (line != null) editor.goToLine(line);
+    } else if (block) {
+      const line = findMarkdownBlockLine(doc, block);
+      if (line != null) editor.goToLine(line);
     }
-    // Preview: element target — not proportional sync (different content height).
+  };
+
+  const applyPreview = () => {
+    // Element-based scroll on #preview-host (not ratio sync — different content height).
     if (heading) scrollPreviewToHeading(heading);
     else if (block) scrollPreviewToBlock(block);
   };
 
-  // Suppress editor↔preview sympathy so goToLine does not pull preview by ratio
-  // and so preview scrollIntoView is not half-undone.
-  if (edScroll && previewHost) {
-    withoutScrollSync(edScroll, () => withoutScrollSync(previewHost, apply));
-  } else if (edScroll) {
-    withoutScrollSync(edScroll, apply);
-  } else if (previewHost) {
-    withoutScrollSync(previewHost, apply);
-  } else {
-    apply();
-  }
+  // Editor jump under suppress so goToLine does not schedule ratio sync unchecked.
+  if (edScroll) withoutScrollSync(edScroll, applyEditor);
+  else applyEditor();
+
+  // Preview: set scrollTop now, then again after cursor-sync delay so we win the race.
+  const runPreview = () => {
+    if (previewHost) withoutScrollSync(previewHost, applyPreview);
+    else applyPreview();
+  };
+  runPreview();
+  window.setTimeout(runPreview, CURSOR_SYNC_DELAY_MS + 30);
+  window.setTimeout(runPreview, CURSOR_SYNC_DELAY_MS + 100);
 }
 
-/** Scroll preview pane to an ATX heading by visible text (centered). */
+/**
+ * Scroll `#preview-host` so `el` sits ~35% from the top (readable, not edge-clipped).
+ * Uses scrollTop math against the real scroller — not scrollIntoView (wrong ancestor / sync fights).
+ */
+function scrollChildIntoPreviewHost(host: HTMLElement, el: HTMLElement) {
+  const hostRect = host.getBoundingClientRect();
+  const elRect = el.getBoundingClientRect();
+  const delta = elRect.top - hostRect.top;
+  const next = host.scrollTop + delta - host.clientHeight * 0.35;
+  const max = Math.max(0, host.scrollHeight - host.clientHeight);
+  host.scrollTop = Math.max(0, Math.min(next, max));
+}
+
+/** Scroll preview pane to an ATX heading by visible text. */
 function scrollPreviewToHeading(heading: string) {
   const host = document.getElementById("preview-host");
   if (!host) return;
@@ -2634,7 +2702,7 @@ function scrollPreviewToHeading(heading: string) {
   const headings = host.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6");
   for (const el of headings) {
     if (normalizeHeadingKey(el.textContent || "") === want) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      scrollChildIntoPreviewHost(host, el);
       return;
     }
   }
@@ -2642,7 +2710,7 @@ function scrollPreviewToHeading(heading: string) {
   const byId =
     host.querySelector<HTMLElement>(`#${cssEscape(slug)}`) ||
     host.querySelector<HTMLElement>(`[id^="${cssEscape(slug)}"]`);
-  byId?.scrollIntoView({ behavior: "smooth", block: "center" });
+  if (byId) scrollChildIntoPreviewHost(host, byId);
 }
 
 function scrollPreviewToBlock(blockId: string) {
@@ -2655,12 +2723,12 @@ function scrollPreviewToBlock(blockId: string) {
     host.querySelector<HTMLElement>(`#user-content-${cssEscape(want)}`) ||
     host.querySelector<HTMLElement>(`[id*="${cssEscape(want)}"]`);
   if (byId) {
-    byId.scrollIntoView({ behavior: "smooth", block: "center" });
+    scrollChildIntoPreviewHost(host, byId);
     return;
   }
   for (const el of host.querySelectorAll<HTMLElement>("p, li, blockquote, h1, h2, h3, h4, h5, h6")) {
     if ((el.textContent || "").toLowerCase().includes("^" + want)) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      scrollChildIntoPreviewHost(host, el);
       return;
     }
   }
@@ -3178,6 +3246,200 @@ function showPluginView(title: string, result: PluginViewResult) {
     pre.textContent = content;
     body.appendChild(pre);
   }
+}
+
+
+/** Collect CSS that should apply to an exported/print page. */
+function collectExportCss(): string {
+  const chunks: string[] = [];
+  // User Page CSS from Preferences (injected style tag), if present.
+  const user = document.getElementById("nephrite-user-preview-css");
+  if (user?.textContent?.trim()) {
+    chunks.push(user.textContent);
+  }
+  // Always add print-oriented chrome so tables/props survive without full app CSS.
+  chunks.push(`
+html, body {
+  background: #fff;
+  color: #111;
+  font: 12pt/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  margin: 0;
+  padding: 0;
+}
+.preview, .print-export {
+  max-width: 100%;
+  padding: 0.5in;
+  box-sizing: border-box;
+}
+.preview a { color: #0b5; text-decoration: underline; }
+.preview table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  font-size: 0.95em;
+}
+.preview th, .preview td {
+  border: 1px solid #888;
+  padding: 0.35em 0.55em;
+  text-align: left;
+  vertical-align: top;
+}
+.preview th { background: #eee; font-weight: 650; }
+.preview pre, .preview code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+.preview pre {
+  background: #f4f4f4;
+  padding: 0.6em 0.8em;
+  border-radius: 4px;
+  overflow: visible;
+  white-space: pre-wrap;
+}
+.preview blockquote {
+  margin: 0.6em 0;
+  padding-left: 0.8em;
+  border-left: 3px solid #999;
+  color: #333;
+}
+.preview img { max-width: 100%; height: auto; }
+.props-block {
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  margin: 0 0 1em;
+  padding: 0.4em 0.6em;
+  background: #fafafa;
+}
+.props-summary { font-weight: 650; cursor: default; }
+.props-rows { display: grid; gap: 0.25em; margin-top: 0.4em; }
+.prop-row { display: grid; grid-template-columns: 10rem 1fr; gap: 0.5em; }
+.prop-key { color: #444; font-weight: 600; }
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .preview, .print-export { padding: 0; }
+  a[href]::after { content: ""; }
+}
+`);
+  return chunks.join("\n\n");
+}
+
+/**
+ * Ask whether to include YAML frontmatter in the export.
+ * Resolves true/false, or null if the user cancels.
+ */
+function promptIncludeFrontmatter(): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    const host = document.createElement("div");
+    host.className = "export-pdf-modal";
+    host.setAttribute("role", "dialog");
+    host.setAttribute("aria-modal", "true");
+    host.setAttribute("aria-labelledby", "export-pdf-title");
+    host.innerHTML = `
+      <div class="export-pdf-card">
+        <h2 id="export-pdf-title">Export to PDF</h2>
+        <p>Uses the system print dialog — choose “Save as PDF” as the printer. Page CSS from Preferences is applied.</p>
+        <label class="export-pdf-check">
+          <input type="checkbox" id="export-pdf-frontmatter" checked />
+          <span>Include YAML frontmatter (Properties)</span>
+        </label>
+        <div class="export-pdf-actions">
+          <button type="button" id="export-pdf-cancel">Cancel</button>
+          <button type="button" id="export-pdf-go" class="primary">Print / Save PDF…</button>
+        </div>
+      </div>
+    `;
+    const finish = (value: boolean | null) => {
+      host.remove();
+      resolve(value);
+    };
+    host.addEventListener("click", (event) => {
+      if (event.target === host) finish(null);
+    });
+    host.querySelector("#export-pdf-cancel")?.addEventListener("click", () => finish(null));
+    host.querySelector("#export-pdf-go")?.addEventListener("click", () => {
+      const box = host.querySelector("#export-pdf-frontmatter") as HTMLInputElement | null;
+      finish(Boolean(box?.checked));
+    });
+    document.addEventListener(
+      "keydown",
+      function onKey(event: KeyboardEvent) {
+        if (event.key === "Escape") {
+          document.removeEventListener("keydown", onKey);
+          finish(null);
+        }
+      },
+    );
+    document.body.appendChild(host);
+    (host.querySelector("#export-pdf-go") as HTMLButtonElement | null)?.focus();
+  });
+}
+
+function printHtmlAsPdf(title: string, bodyHtml: string, css: string) {
+  const iframe = document.createElement("iframe");
+  iframe.setAttribute("aria-hidden", "true");
+  iframe.style.cssText =
+    "position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;pointer-events:none";
+  document.body.appendChild(iframe);
+  const doc = iframe.contentDocument;
+  const win = iframe.contentWindow;
+  if (!doc || !win) {
+    iframe.remove();
+    setTransientStatus("Could not open print view", "#e07070");
+    return;
+  }
+  const safeTitle = title.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  doc.open();
+  doc.write(
+    `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${safeTitle}</title>` +
+      `<style>${css}</style></head>` +
+      `<body class="preview print-export">${bodyHtml}</body></html>`,
+  );
+  doc.close();
+  const trigger = () => {
+    try {
+      win.focus();
+      win.print();
+    } finally {
+      window.setTimeout(() => iframe.remove(), 1500);
+    }
+  };
+  // Images/fonts may still be settling; print after a paint.
+  if (doc.readyState === "complete") {
+    requestAnimationFrame(() => setTimeout(trigger, 50));
+  } else {
+    iframe.addEventListener("load", () => requestAnimationFrame(() => setTimeout(trigger, 50)), {
+      once: true,
+    });
+  }
+}
+
+async function exportCurrentPagePdf() {
+  if (!currentPath || currentFileKind !== "markdown") {
+    setTransientStatus("Open a markdown note to export", "#e07070");
+    return;
+  }
+  const include = await promptIncludeFrontmatter();
+  if (include == null) return;
+
+  let markdown = "";
+  if (editor && currentFileKind === "markdown") {
+    markdown = editor.getDoc();
+  } else {
+    setTransientStatus("Editor has no markdown content", "#e07070");
+    return;
+  }
+
+  const bodyHtml = renderPreview(markdown, {
+    includeFrontmatter: include,
+    openFrontmatter: include,
+  });
+  const title =
+    currentPath.split("/").pop()?.replace(/\.md$/i, "") || currentPath || "note";
+  printHtmlAsPdf(title, bodyHtml, collectExportCss());
+  setTransientStatus(
+    include ? "Print dialog opened (with frontmatter)" : "Print dialog opened (body only)",
+    "#5ecf9a",
+  );
 }
 
 function showCommandBar() {

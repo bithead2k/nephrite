@@ -6,16 +6,34 @@ marked.setOptions({
   breaks: true,
 });
 
+export type RenderPreviewOptions = {
+  /** When false, omit the Properties / YAML block entirely. Default true. */
+  includeFrontmatter?: boolean;
+  /**
+   * When true, force the Properties <details> open (useful for print/PDF).
+   * Default false.
+   */
+  openFrontmatter?: boolean;
+};
+
 /**
  * Render for the preview pane only — never a write-back path.
  * Frontmatter is stripped and shown as a property table; body is Markdown.
  */
-export function renderPreview(markdown: string): string {
+export function renderPreview(
+  markdown: string,
+  options: RenderPreviewOptions = {},
+): string {
+  const includeFrontmatter = options.includeFrontmatter !== false;
   const { yaml, body, hasFrontmatter } = splitFrontmatter(markdown);
 
   let html = "";
-  if (hasFrontmatter && yaml != null) {
-    html += renderPropertiesHtml(yaml);
+  if (includeFrontmatter && hasFrontmatter && yaml != null) {
+    let props = renderPropertiesHtml(yaml);
+    if (options.openFrontmatter) {
+      props = props.replace("<details ", "<details open ");
+    }
+    html += props;
   }
 
   // Protect code spans/fences: script source containing wikilink strings must
