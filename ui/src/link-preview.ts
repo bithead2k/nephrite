@@ -1,3 +1,8 @@
+/**
+ * Wikilink hover preview — stays open while the pointer is over the
+ * link *or* the popup (same rules as Kanban card previews). Full note
+ * render including SQL/dataview; one-shot, no live editing.
+ */
 import { invoke } from "@tauri-apps/api/core";
 import { makeEngineContext } from "./dv-context";
 import { executeBlocksInPreview } from "./dv-engine";
@@ -12,7 +17,7 @@ type BindOptions = {
 };
 
 const SHOW_DELAY_MS = 300;
-const HIDE_DELAY_MS = 140;
+const HIDE_DELAY_MS = 220;
 const VIEWPORT_MARGIN = 12;
 
 let popup: HTMLElement | null = null;
@@ -27,9 +32,16 @@ export function bindLinkPreviews(root: ParentNode, options: BindOptions): void {
   root.querySelectorAll<HTMLAnchorElement>("a.preview-wikilink[data-wikilink]")
     .forEach((link) => {
       if (link.dataset.linkPreviewBound === "1") return;
+      // Embeds are expanded in-place; don't also open a hover card on them.
+      if (link.classList.contains("embed")) return;
       link.dataset.linkPreviewBound = "1";
       link.addEventListener("mouseenter", () => scheduleShow(link, options));
-      link.addEventListener("mouseleave", scheduleHide);
+      link.addEventListener("mouseleave", (event) => {
+        // Moving into the popup must not dismiss.
+        const next = event.relatedTarget as Node | null;
+        if (next && popup?.contains(next)) return;
+        scheduleHide();
+      });
       link.addEventListener("focus", () => scheduleShow(link, options, 0));
       link.addEventListener("blur", scheduleHide);
     });
@@ -143,7 +155,12 @@ function ensurePopup(): HTMLElement {
       hideTimer = null;
     }
   });
-  popup.addEventListener("mouseleave", scheduleHide);
+  popup.addEventListener("mouseleave", (event) => {
+    const next = event.relatedTarget as Node | null;
+    // Back onto the triggering link — keep open.
+    if (next && activeLink && (next === activeLink || activeLink.contains(next))) return;
+    scheduleHide();
+  });
   popup.addEventListener("click", (event) => {
     const link = (event.target as Element).closest<HTMLAnchorElement>(
       "a.preview-wikilink[data-wikilink]",

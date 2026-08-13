@@ -31,8 +31,8 @@ export async function hydrateNoteEmbeds(
     ),
   );
   await Promise.all(embeds.map(async (link) => {
-    // An earlier hydrator (for example Excalidraw) may already have replaced it.
-    if (!link.isConnected && root !== link.parentNode) return;
+    // Skip only if this node was already removed/replaced by another hydrator.
+    if (!root.contains(link)) return;
     const target = link.dataset.wikilink?.trim();
     if (!target) return;
     const { note, heading, block } = splitWikilinkTarget(target);

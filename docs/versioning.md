@@ -58,9 +58,11 @@ When the app crate exists, it imports or re-exports the same `PROJECT_VERSION`�
 
 ## Current release
 
-**`PROJECT_VERSION` = `0.2`** — the first public 0.2 milestone. Opening an index
-written by the earlier internal 2.0 development version performs a clean,
-disposable rebuild because the stored major differs.
+**`PROJECT_VERSION` = `0.3`** — the current public milestone. This is a minor
+upgrade from 0.2, so opening an existing 0.2 index does not force a rebuild.
+When the earlier 0.2 milestone opened an index written by the internal 2.0
+development version, it performed a clean, disposable rebuild because the
+stored major differed.
 
 ## Release notes
 

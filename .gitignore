@@ -10,3 +10,5 @@ src-tauri/target
 .idea
 *.db
 *.db-*
+*.orig
+*.rej

@@ -7,14 +7,18 @@ import { DeferredDocumentWork, type TimerHandle } from "../ui/src/edit-scheduler
 import { frontmatterForDecorations } from "../ui/src/yaml-booleans";
 import {
   evaluateDql,
+  expandSqlNoteRefs,
   extractScriptBlocks,
   lowerDqlFunctionAliases,
+  makeThisNote,
   type DvPage,
 } from "../ui/src/dv-engine";
 import { rowToDvPage } from "../ui/src/dv-context";
-import { renderPropertiesHtml } from "../ui/src/frontmatter";
+import { renderPropertiesHtml, splitFrontmatter } from "../ui/src/frontmatter";
 import { formatQueryUri } from "../ui/src/query-uri";
 import { renderPreview } from "../ui/src/preview";
+import { extractBlock, extractHeadingSection } from "../ui/src/note-embed";
+import { planPreviewUpdate, splitMarkdownBlocks } from "../ui/src/preview-blocks";
 import { planTemplateApplication } from "../ui/src/template-application";
 import { renderTemplater } from "../ui/src/templater";
 import { formatTimestampPart } from "../ui/src/timestamp-shortcuts";
@@ -790,6 +794,69 @@ test("executable fences render as code elements the executor can discover", () =
   assert.match(html, /<code class="language-dataviewjs">/);
   assert.match(html, /SELECT title FROM pages/);
   assert.equal(extractScriptBlocks(markdown).length, 2);
+});
+
+test("Obsidian note embeds render as hydration targets", () => {
+  const html = renderPreview("Before\n\n![[journals/2026_08_08#Interstitial]]\n\nAfter");
+  assert.match(html, /class="preview-wikilink embed"/);
+  assert.match(html, /data-wikilink="journals\/2026_08_08#Interstitial"/);
+  assert.doesNotMatch(html, /!\[\[/);
+});
+
+test("note transclusion selects heading sections and block IDs without leaking markers", () => {
+  const markdown = [
+    "# First",
+    "alpha",
+    "",
+    "## Interstitial",
+    "selected text",
+    "",
+    "paragraph carrying a block id ^chosen",
+    "",
+    "## Next",
+    "not selected",
+  ].join("\n");
+  assert.equal(
+    extractHeadingSection(markdown, "Interstitial"),
+    "## Interstitial\nselected text\n\nparagraph carrying a block id ^chosen",
+  );
+  assert.equal(extractBlock(markdown, "chosen"), "paragraph carrying a block id");
+});
+
+test("incremental preview planning preserves fences and invalidates YAML-only edits", () => {
+  const body = ["intro", "", "```sql", "SELECT '';", "", "FROM pages", "```", "", "tail"].join("\n");
+  assert.equal(splitMarkdownBlocks(body).length, 3);
+  const before = `---\nactive: false\n---\n${body}`;
+  const after = `---\nactive: true\n---\n${body}`;
+  assert.deepEqual(planPreviewUpdate(before, after, splitFrontmatter), {
+    kind: "yaml",
+    blocks: splitMarkdownBlocks(body),
+  });
+});
+
+test("current-note SQL and Dataview context preserve page ownership", () => {
+  const page = rowToDvPage({
+    path: "people/O'Brien.md",
+    name: "O'Brien.md",
+    folder: "people",
+    mtime_ms: 0,
+    properties: { tags: ["recruiter"] },
+  });
+  const current = makeThisNote(page, {
+    currentPath: page.path,
+    currentSource: "---\ntags: [recruiter]\n---\nBody",
+    loadPages: async () => [page],
+    loadPage: async () => page,
+    runSql: async () => ({ columns: [], rows: [] }),
+    resolveLink: () => {},
+  });
+  assert.equal(current.path, "people/O'Brien.md");
+  assert.deepEqual(current.tags, ["recruiter"]);
+  assert.equal(current.file.path, "people/O'Brien.md");
+  assert.equal(
+    expandSqlNoteRefs("SELECT this.file.path, this.path, {{active.path}}", "people/O'Brien.md"),
+    "SELECT 'people/O''Brien.md', 'people/O''Brien.md', 'people/O''Brien.md'",
+  );
 });
 
 test("Kanban lane resizing responds continuously from the first pixel", () => {

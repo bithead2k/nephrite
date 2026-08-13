@@ -14,7 +14,7 @@ use crate::error::{IndexError, Result};
 
 /// The only version that matters. Bump here for releases.
 /// Cargo workspace version should match as `MAJOR.MINOR.0`.
-pub const PROJECT_VERSION: Version = Version { major: 0, minor: 2 };
+pub const PROJECT_VERSION: Version = Version { major: 0, minor: 3 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
@@ -34,9 +34,10 @@ impl Version {
 
     /// The prototype called the same release line `2.0` before the public
     /// version was corrected to `0.2`. This is a label migration, not an index
-    /// epoch change, so it must not turn startup into a complete vault rebuild.
+    /// epoch change. Keep recognizing it throughout the public 0.x line so a
+    /// user can upgrade directly from that prototype to a later minor release.
     pub fn is_legacy_02_renumbering(self, stored: Version) -> bool {
-        self == Version::new(0, 2) && stored == Version::new(2, 0)
+        self.major == 0 && self.minor >= 2 && stored == Version::new(2, 0)
     }
 }
 
@@ -77,6 +78,8 @@ mod tests {
         assert!(!Version::new(0, 2).requires_rebuild(Version::new(0, 1)));
         assert!(!Version::new(0, 1).requires_rebuild(Version::new(0, 1)));
         assert!(!Version::new(0, 2).requires_rebuild(Version::new(2, 0)));
+        assert!(!Version::new(0, 3).requires_rebuild(Version::new(2, 0)));
+        assert!(Version::new(1, 0).requires_rebuild(Version::new(2, 0)));
     }
 
     #[test]

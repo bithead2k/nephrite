@@ -153,15 +153,21 @@ fn register_text(connection: &rusqlite::Connection) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     connection
-        .create_scalar_function("octet_length", 1, SAFE, |context| match context.get_raw(0) {
-            ValueRef::Blob(value) | ValueRef::Text(value) => Ok(value.len() as i64),
-            value => Ok(value_text(value)?.map(|value| value.len() as i64).unwrap_or(0)),
+        .create_scalar_function("octet_length", 1, SAFE, |context| {
+            match context.get_raw(0) {
+                ValueRef::Blob(value) | ValueRef::Text(value) => Ok(value.len() as i64),
+                value => Ok(value_text(value)?
+                    .map(|value| value.len() as i64)
+                    .unwrap_or(0)),
+            }
         })
         .map_err(|error| error.to_string())?;
     connection
         .create_scalar_function("bit_length", 1, SAFE, |context| match context.get_raw(0) {
             ValueRef::Blob(value) | ValueRef::Text(value) => Ok((value.len() * 8) as i64),
-            value => Ok(value_text(value)?.map(|value| (value.len() * 8) as i64).unwrap_or(0)),
+            value => Ok(value_text(value)?
+                .map(|value| (value.len() * 8) as i64)
+                .unwrap_or(0)),
         })
         .map_err(|error| error.to_string())?;
     connection
@@ -198,7 +204,7 @@ fn register_text(connection: &rusqlite::Connection) -> Result<(), String> {
     for name in ["concat_ws", "ws_concat"] {
         connection
             .create_scalar_function(name, -1, SAFE, |context| {
-                if context.len() == 0 || matches!(context.get_raw(0), ValueRef::Null) {
+                if context.is_empty() || matches!(context.get_raw(0), ValueRef::Null) {
                     return Ok(None);
                 }
                 let separator = context.get::<String>(0)?;
@@ -220,13 +226,12 @@ fn register_text(connection: &rusqlite::Connection) -> Result<(), String> {
                 .chars()
                 .flat_map(|character| {
                     if character.is_alphanumeric() {
-                        let mapped = if in_word {
+                        if in_word {
                             character.to_lowercase().collect::<Vec<_>>()
                         } else {
                             in_word = true;
                             character.to_uppercase().collect::<Vec<_>>()
-                        };
-                        mapped
+                        }
                     } else {
                         in_word = false;
                         vec![character]
@@ -392,10 +397,12 @@ fn register_text(connection: &rusqlite::Connection) -> Result<(), String> {
             let to = context.get::<String>(2)?.chars().collect::<Vec<_>>();
             Ok(source
                 .chars()
-                .filter_map(|character| match from.iter().position(|value| *value == character) {
-                    Some(index) => to.get(index).copied(),
-                    None => Some(character),
-                })
+                .filter_map(
+                    |character| match from.iter().position(|value| *value == character) {
+                        Some(index) => to.get(index).copied(),
+                        None => Some(character),
+                    },
+                )
                 .collect::<String>())
         })
         .map_err(|error| error.to_string())?;
@@ -459,28 +466,28 @@ fn register_numeric(connection: &rusqlite::Connection) -> Result<(), String> {
     for name in ["power", "pow"] {
         connection
             .create_scalar_function(name, 2, SAFE, |context| {
-                Ok(context
-                    .get::<f64>(0)?
-                    .powf(context.get::<f64>(1)?))
+                Ok(context.get::<f64>(0)?.powf(context.get::<f64>(1)?))
             })
             .map_err(|error| error.to_string())?;
     }
     connection
-        .create_scalar_function("log", 1, SAFE, |context| {
-            Ok(context.get::<f64>(0)?.log10())
-        })
+        .create_scalar_function("log", 1, SAFE, |context| Ok(context.get::<f64>(0)?.log10()))
         .map_err(|error| error.to_string())?;
     connection
         .create_scalar_function("log", 2, SAFE, |context| {
-            Ok(context
-                .get::<f64>(1)?
-                .log(context.get::<f64>(0)?))
+            Ok(context.get::<f64>(1)?.log(context.get::<f64>(0)?))
         })
         .map_err(|error| error.to_string())?;
     connection
         .create_scalar_function("sign", 1, SAFE, |context| {
             let value = context.get::<f64>(0)?;
-            Ok(if value > 0.0 { 1 } else if value < 0.0 { -1 } else { 0 })
+            Ok(if value > 0.0 {
+                1
+            } else if value < 0.0 {
+                -1
+            } else {
+                0
+            })
         })
         .map_err(|error| error.to_string())?;
     connection
@@ -649,7 +656,9 @@ fn register_regex(connection: &rusqlite::Connection) -> Result<(), String> {
             };
             let regex = regex_with_flags(&pattern, &flags)?;
             Ok(if flags.contains('g') {
-                regex.replace_all(&source, replacement.as_str()).into_owned()
+                regex
+                    .replace_all(&source, replacement.as_str())
+                    .into_owned()
             } else {
                 regex.replace(&source, replacement.as_str()).into_owned()
             })
@@ -773,7 +782,10 @@ fn register_binary(connection: &rusqlite::Connection) -> Result<(), String> {
         .create_scalar_function("decode", 2, SAFE, |context| {
             let source = context.get::<String>(0)?;
             match context.get::<String>(1)?.to_ascii_lowercase().as_str() {
-                "base64" => BASE64.decode(source).map(Value::Blob).map_err(function_error),
+                "base64" => BASE64
+                    .decode(source)
+                    .map(Value::Blob)
+                    .map_err(function_error),
                 "hex" => hex::decode(source).map(Value::Blob).map_err(function_error),
                 "escape" => Ok(Value::Blob(source.into_bytes())),
                 format => Err(function_error(format!("unsupported encoding: {format}"))),
@@ -793,7 +805,12 @@ fn register_binary(connection: &rusqlite::Connection) -> Result<(), String> {
 }
 
 fn register_datetime(connection: &rusqlite::Connection) -> Result<(), String> {
-    for name in ["clock_timestamp", "statement_timestamp", "transaction_timestamp", "now"] {
+    for name in [
+        "clock_timestamp",
+        "statement_timestamp",
+        "transaction_timestamp",
+        "now",
+    ] {
         connection
             .create_scalar_function(name, 0, INNOCUOUS, |_| {
                 Ok(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f+00").to_string())
@@ -869,25 +886,129 @@ fn register_system(connection: &rusqlite::Connection) -> Result<(), String> {
 }
 
 pub const SUPPORTED_FUNCTIONS: &[&str] = &[
-    "abs", "avg", "bool_and", "bool_or", "coalesce", "count", "every", "length", "lower",
-    "max", "min", "nullif", "random", "replace", "round", "string_agg", "substr", "sum", "upper",
-    "array_append", "array_cat", "array_dims", "array_length", "array_lower",
-    "array_ndims", "array_position", "array_positions", "array_prepend", "array_remove",
-    "array_replace", "array_reverse", "array_sort", "array_to_string", "array_upper",
-    "ascii", "bit_length", "btrim", "cardinality", "casefold", "cbrt", "char_length",
-    "character_length", "chr", "clock_timestamp", "concat", "concat_ws", "ws_concat", "current_database",
-    "current_schema", "current_user", "date_part", "decode", "degrees", "div", "encode",
-    "ends_with", "exp", "extract", "factorial", "gcd", "initcap", "json_build_array",
-    "json_build_object", "json_pretty", "json_strip_nulls", "json_typeof", "jsonb_build_array",
-    "jsonb_build_object", "jsonb_strip_nulls", "jsonb_typeof", "lcm", "left", "ln", "log",
-    "log10", "lpad", "ltrim", "make_date", "make_time", "mod", "now", "num_nonnulls", "num_nulls",
-    "octet_length", "overlay", "pg_client_encoding",
-    "pg_typeof", "pi", "pow", "power", "quote_ident", "quote_literal", "quote_nullable",
-    "radians", "regexp_count", "regexp_like", "regexp_replace", "regexp_split_to_array",
-    "regexp_substr", "repeat", "reverse", "right", "rpad", "rtrim", "session_user", "sha256", "sign",
-    "split_part", "sqrt", "starts_with", "statement_timestamp", "string_to_array", "strpos",
-    "to_bin", "to_hex", "to_json", "to_jsonb", "to_oct", "transaction_timestamp", "translate",
-    "trim_array", "trunc", "version",
+    "abs",
+    "avg",
+    "bool_and",
+    "bool_or",
+    "coalesce",
+    "count",
+    "every",
+    "length",
+    "lower",
+    "max",
+    "min",
+    "nullif",
+    "random",
+    "replace",
+    "round",
+    "string_agg",
+    "substr",
+    "sum",
+    "upper",
+    "array_append",
+    "array_cat",
+    "array_dims",
+    "array_length",
+    "array_lower",
+    "array_ndims",
+    "array_position",
+    "array_positions",
+    "array_prepend",
+    "array_remove",
+    "array_replace",
+    "array_reverse",
+    "array_sort",
+    "array_to_string",
+    "array_upper",
+    "ascii",
+    "bit_length",
+    "btrim",
+    "cardinality",
+    "casefold",
+    "cbrt",
+    "char_length",
+    "character_length",
+    "chr",
+    "clock_timestamp",
+    "concat",
+    "concat_ws",
+    "ws_concat",
+    "current_database",
+    "current_schema",
+    "current_user",
+    "date_part",
+    "decode",
+    "degrees",
+    "div",
+    "encode",
+    "ends_with",
+    "exp",
+    "extract",
+    "factorial",
+    "gcd",
+    "initcap",
+    "json_build_array",
+    "json_build_object",
+    "json_pretty",
+    "json_strip_nulls",
+    "json_typeof",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "jsonb_strip_nulls",
+    "jsonb_typeof",
+    "lcm",
+    "left",
+    "ln",
+    "log",
+    "log10",
+    "lpad",
+    "ltrim",
+    "make_date",
+    "make_time",
+    "mod",
+    "now",
+    "num_nonnulls",
+    "num_nulls",
+    "octet_length",
+    "overlay",
+    "pg_client_encoding",
+    "pg_typeof",
+    "pi",
+    "pow",
+    "power",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "radians",
+    "regexp_count",
+    "regexp_like",
+    "regexp_replace",
+    "regexp_split_to_array",
+    "regexp_substr",
+    "repeat",
+    "reverse",
+    "right",
+    "rpad",
+    "rtrim",
+    "session_user",
+    "sha256",
+    "sign",
+    "split_part",
+    "sqrt",
+    "starts_with",
+    "statement_timestamp",
+    "string_to_array",
+    "strpos",
+    "to_bin",
+    "to_hex",
+    "to_json",
+    "to_jsonb",
+    "to_oct",
+    "transaction_timestamp",
+    "translate",
+    "trim_array",
+    "trunc",
+    "version",
 ];
 
 pub fn register(connection: &rusqlite::Connection) -> Result<(), String> {

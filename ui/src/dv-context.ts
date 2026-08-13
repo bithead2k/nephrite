@@ -6,6 +6,7 @@ type PageRow = {
   name: string;
   folder: string;
   mtime_ms: number;
+  size_bytes?: number;
   properties: Record<string, unknown>;
 };
 
@@ -34,7 +35,15 @@ export function makeEngineContext(
       const pages = await loadPages();
       return pages.find((candidate) => candidate.path === path) ?? null;
     },
-    runSql: (sql) => invoke<SqlQueryResult>("query_vault_sql", { sql }),
+    runSql: (sql) => {
+      // Defense in depth if callers skip expandSqlNoteRefs.
+      const pathLit = currentPath.replace(/'/g, "''");
+      let expanded = sql
+        .replace(/\bthis\.file\.path\b/gi, `'${pathLit}'`)
+        .replace(/\bthis\.path\b/gi, `'${pathLit}'`)
+        .replace(/\{\{\s*active\.path\s*\}\}/gi, `'${pathLit}'`);
+      return invoke<SqlQueryResult>("query_vault_sql", { sql: expanded });
+    },
     resolveLink,
   };
 }
@@ -69,6 +78,8 @@ export function rowToDvPage(row: PageRow): DvPage {
       mtime,
       ctime: null,
       day: mtime,
+      size: row.size_bytes ?? null,
+      bytes: row.size_bytes ?? null,
     },
   };
   return page;

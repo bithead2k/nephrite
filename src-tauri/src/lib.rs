@@ -1,6 +1,6 @@
-mod state;
-mod postgres_compat;
 mod page_sql;
+mod postgres_compat;
+mod state;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
@@ -134,12 +134,18 @@ fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, Str
     if !plugin_root.is_dir() {
         return Ok(Vec::new());
     }
-    let canonical_plugin_root = plugin_root.canonicalize().map_err(|error| error.to_string())?;
+    let canonical_plugin_root = plugin_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
     let mut plugins = Vec::new();
     let entries = std::fs::read_dir(&plugin_root).map_err(|error| error.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
-        if !entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
             continue;
         }
         let manifest_path = entry.path().join("manifest.json");
@@ -157,24 +163,38 @@ fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, Str
             ));
         }
         let main = manifest.main.unwrap_or_else(|| "main.js".to_string());
-        let canonical_entry = entry.path().canonicalize().map_err(|error| error.to_string())?;
+        let canonical_entry = entry
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
         let main_path = canonical_entry.join(main.replace('/', std::path::MAIN_SEPARATOR_STR));
         let canonical_main = main_path
             .canonicalize()
             .map_err(|error| format!("{}: {error}", main_path.display()))?;
-        if !canonical_main.starts_with(&canonical_plugin_root) || !canonical_main.starts_with(&canonical_entry) {
-            return Err(format!("Plugin main file escapes its folder: {}", manifest.id));
+        if !canonical_main.starts_with(&canonical_plugin_root)
+            || !canonical_main.starts_with(&canonical_entry)
+        {
+            return Err(format!(
+                "Plugin main file escapes its folder: {}",
+                manifest.id
+            ));
         }
         let metadata = std::fs::metadata(&canonical_main).map_err(|error| error.to_string())?;
         if metadata.len() > MAX_PLUGIN_SOURCE_BYTES {
-            return Err(format!("Plugin {} exceeds the 2 MiB source limit", manifest.id));
+            return Err(format!(
+                "Plugin {} exceeds the 2 MiB source limit",
+                manifest.id
+            ));
         }
         let permissions = manifest.permissions.unwrap_or_default();
         if let Some(permission) = permissions
             .iter()
             .find(|permission| !PLUGIN_PERMISSIONS.contains(&permission.as_str()))
         {
-            return Err(format!("Plugin {} requests unknown permission: {permission}", manifest.id));
+            return Err(format!(
+                "Plugin {} requests unknown permission: {permission}",
+                manifest.id
+            ));
         }
         plugins.push(PluginDescriptor {
             id: manifest.id,
@@ -674,12 +694,7 @@ fn start_vault_watcher(
                 eprintln!("native vault watcher unavailable: {error}");
                 while watcher_generation.load(Ordering::Acquire) == generation {
                     std::thread::sleep(WATCH_SAFETY_RECONCILE);
-                    if !reconcile_and_emit(
-                        &app,
-                        &index,
-                        &watcher_generation,
-                        generation,
-                    ) {
+                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
                         return;
                     }
                 }
@@ -687,7 +702,10 @@ fn start_vault_watcher(
             }
         };
         if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
-            eprintln!("native vault watcher could not watch {}: {error}", root.display());
+            eprintln!(
+                "native vault watcher could not watch {}: {error}",
+                root.display()
+            );
             return;
         }
 
@@ -787,8 +805,10 @@ fn list_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
 fn list_attachments(state: State<'_, AppState>) -> Result<Vec<AttachmentRow>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
-    let mut statement = index.connection().prepare(
-        "SELECT f.path, f.name, f.file_kind,
+    let mut statement = index
+        .connection()
+        .prepare(
+            "SELECT f.path, f.name, f.file_kind,
                 COALESCE(a.mime_type, 'application/octet-stream'), f.size_bytes,
                 a.width, a.height,
                 COUNT(DISTINCT l.path),
@@ -798,23 +818,26 @@ fn list_attachments(state: State<'_, AppState>) -> Result<Vec<AttachmentRow>, St
            LEFT JOIN links l ON l.target_path = f.path
           WHERE f.file_kind NOT IN ('markdown', 'canvas', 'excalidraw')
           GROUP BY f.path
-          ORDER BY f.path COLLATE NOCASE"
-    ).map_err(|error| error.to_string())?;
-    let rows = statement.query_map([], |row| {
-        let reference_count: i64 = row.get(7)?;
-        Ok(AttachmentRow {
-            path: row.get(0)?,
-            name: row.get(1)?,
-            file_kind: row.get(2)?,
-            mime_type: row.get(3)?,
-            size_bytes: row.get(4)?,
-            width: row.get(5)?,
-            height: row.get(6)?,
-            reference_count,
-            orphaned: reference_count == 0,
-            text_indexed: row.get::<_, i64>(8)? != 0,
+          ORDER BY f.path COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            let reference_count: i64 = row.get(7)?;
+            Ok(AttachmentRow {
+                path: row.get(0)?,
+                name: row.get(1)?,
+                file_kind: row.get(2)?,
+                mime_type: row.get(3)?,
+                size_bytes: row.get(4)?,
+                width: row.get(5)?,
+                height: row.get(6)?,
+                reference_count,
+                orphaned: reference_count == 0,
+                text_indexed: row.get::<_, i64>(8)? != 0,
+            })
         })
-    }).map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
 }
@@ -897,8 +920,7 @@ fn search_yaml_properties(
             })
         })
         .map_err(|error| error.to_string())?;
-    rows
-        .collect::<std::result::Result<Vec<_>, _>>()
+    rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
 }
 
@@ -945,13 +967,22 @@ fn search_vault(
     for row in rows {
         let mut result = row.map_err(|error| error.to_string())?;
         if let Ok(content) = std::fs::read_to_string(index.vault_root().join(&result.path)) {
-            result.line = content.lines().position(|line| {
-                let lower = line.to_lowercase();
-                terms.iter().all(|term| lower.contains(term))
-            }).map(|line| line + 1).or_else(|| content.lines().position(|line| {
-                let lower = line.to_lowercase();
-                terms.iter().any(|term| lower.contains(term))
-            }).map(|line| line + 1));
+            result.line = content
+                .lines()
+                .position(|line| {
+                    let lower = line.to_lowercase();
+                    terms.iter().all(|term| lower.contains(term))
+                })
+                .map(|line| line + 1)
+                .or_else(|| {
+                    content
+                        .lines()
+                        .position(|line| {
+                            let lower = line.to_lowercase();
+                            terms.iter().any(|term| lower.contains(term))
+                        })
+                        .map(|line| line + 1)
+                });
         }
         results.push(result);
     }
@@ -1022,11 +1053,13 @@ fn graph_data(state: State<'_, AppState>) -> Result<GraphData, String> {
         )
         .map_err(|error| error.to_string())?;
     let edges = edge_statement
-        .query_map([], |row| Ok(GraphEdge {
-            source: row.get(0)?,
-            target: row.get(1)?,
-            embeds: row.get::<_, i64>(2)? != 0,
-        }))
+        .query_map([], |row| {
+            Ok(GraphEdge {
+                source: row.get(0)?,
+                target: row.get(1)?,
+                embeds: row.get::<_, i64>(2)? != 0,
+            })
+        })
         .map_err(|error| error.to_string())?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -1146,6 +1179,7 @@ pub struct PageRow {
     pub name: String,
     pub folder: String,
     pub mtime_ms: i64,
+    pub size_bytes: i64,
     /// JSON object of frontmatter / properties when available
     pub properties: serde_json::Value,
 }
@@ -1193,28 +1227,46 @@ fn list_tasks(
                ORDER BY t.completed, COALESCE(t.due, '9999-12-31'), t.path COLLATE NOCASE, t.line";
     let mut statement = index.connection().prepare(sql).map_err(|e| e.to_string())?;
     let completed_value = completed.map(|value| if value { 1_i64 } else { 0_i64 });
-    let scope = scope.unwrap_or(TaskScope { folders: Vec::new(), tags: Vec::new(), property: String::new() });
-    let scope_enabled = if scope.folders.is_empty() && scope.tags.is_empty() && scope.property.is_empty() { 0_i64 } else { 1_i64 };
+    let scope = scope.unwrap_or(TaskScope {
+        folders: Vec::new(),
+        tags: Vec::new(),
+        property: String::new(),
+    });
+    let scope_enabled =
+        if scope.folders.is_empty() && scope.tags.is_empty() && scope.property.is_empty() {
+            0_i64
+        } else {
+            1_i64
+        };
     let folders = serde_json::to_string(&scope.folders).map_err(|error| error.to_string())?;
     let tags = serde_json::to_string(&scope.tags).map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(rusqlite::params![completed_value, scope_enabled, folders, tags, scope.property], |row| {
-            Ok(TaskRow {
-                path: row.get(0)?,
-                task_id: row.get(1)?,
-                status: row.get(2)?,
-                status_char: row.get(3)?,
-                text: row.get(4)?,
-                raw_line: row.get(5)?,
-                line: row.get(6)?,
-                completed: row.get::<_, i64>(7)? != 0,
-                due: row.get(8)?,
-                scheduled: row.get(9)?,
-                priority: row.get(10)?,
-                recurrence: row.get(11)?,
-                tags: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
-            })
-        })
+        .query_map(
+            rusqlite::params![
+                completed_value,
+                scope_enabled,
+                folders,
+                tags,
+                scope.property
+            ],
+            |row| {
+                Ok(TaskRow {
+                    path: row.get(0)?,
+                    task_id: row.get(1)?,
+                    status: row.get(2)?,
+                    status_char: row.get(3)?,
+                    text: row.get(4)?,
+                    raw_line: row.get(5)?,
+                    line: row.get(6)?,
+                    completed: row.get::<_, i64>(7)? != 0,
+                    due: row.get(8)?,
+                    scheduled: row.get(9)?,
+                    priority: row.get(10)?,
+                    recurrence: row.get(11)?,
+                    tags: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+                })
+            },
+        )
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
@@ -1272,8 +1324,12 @@ fn set_task_completed(
 }
 
 fn task_line_with_status(line: &str, status: char) -> Result<String, String> {
-    let open = line.find('[').ok_or_else(|| "Task checkbox is no longer present".to_string())?;
-    let close = line[open + 1..].find(']').map(|value| open + 1 + value)
+    let open = line
+        .find('[')
+        .ok_or_else(|| "Task checkbox is no longer present".to_string())?;
+    let close = line[open + 1..]
+        .find(']')
+        .map(|value| open + 1 + value)
         .ok_or_else(|| "Task checkbox is no longer present".to_string())?;
     let mut output = line.to_string();
     output.replace_range(open + 1..close, &status.to_string());
@@ -1287,7 +1343,8 @@ fn recurring_task_lines(
 ) -> Result<(String, String), String> {
     let mut completed = task_line_with_status(line, 'x')?;
     if !completed.contains('✅') {
-        let block = regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
+        let block =
+            regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
         if let Some(found) = block.find(&completed) {
             completed.insert_str(found.start(), &format!(" ✅ {}", today.format("%Y-%m-%d")));
         } else {
@@ -1295,29 +1352,33 @@ fn recurring_task_lines(
         }
     }
     let mut next = task_line_with_status(line, ' ')?;
-    let done = regex::Regex::new(r"\s*✅\s*\d{4}-\d{2}-\d{2}").map_err(|error| error.to_string())?;
+    let done =
+        regex::Regex::new(r"\s*✅\s*\d{4}-\d{2}-\d{2}").map_err(|error| error.to_string())?;
     next = done.replace_all(&next, "").into_owned();
     let date = regex::Regex::new(r"(📅|⏳|🛫)\s*(\d{4}-\d{2}-\d{2})")
         .map_err(|error| error.to_string())?;
     let when_done = recurrence.to_ascii_lowercase().contains("when done");
     let mut shifted = false;
-    next = date.replace_all(&next, |captures: &regex::Captures<'_>| {
-        let source = if when_done {
-            today
-        } else {
-            NaiveDate::parse_from_str(&captures[2], "%Y-%m-%d").unwrap_or(today)
-        };
-        match next_recurrence_date(source, recurrence) {
-            Ok(value) => {
-                shifted = true;
-                format!("{} {}", &captures[1], value.format("%Y-%m-%d"))
+    next = date
+        .replace_all(&next, |captures: &regex::Captures<'_>| {
+            let source = if when_done {
+                today
+            } else {
+                NaiveDate::parse_from_str(&captures[2], "%Y-%m-%d").unwrap_or(today)
+            };
+            match next_recurrence_date(source, recurrence) {
+                Ok(value) => {
+                    shifted = true;
+                    format!("{} {}", &captures[1], value.format("%Y-%m-%d"))
+                }
+                Err(_) => captures[0].to_string(),
             }
-            Err(_) => captures[0].to_string(),
-        }
-    }).into_owned();
+        })
+        .into_owned();
     if !shifted {
         let date = next_recurrence_date(today, recurrence)?;
-        let block = regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
+        let block =
+            regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
         if let Some(found) = block.find(&next) {
             next.insert_str(found.start(), &format!(" 📅 {}", date.format("%Y-%m-%d")));
         } else {
@@ -1329,7 +1390,11 @@ fn recurring_task_lines(
 
 fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, String> {
     let normalized = recurrence.to_ascii_lowercase().replace("when done", "");
-    let value = normalized.trim().strip_prefix("every ").unwrap_or(normalized.trim()).trim();
+    let value = normalized
+        .trim()
+        .strip_prefix("every ")
+        .unwrap_or(normalized.trim())
+        .trim();
     if value == "weekday" || value == "weekdays" {
         let mut next = date + ChronoDuration::days(1);
         while matches!(next.weekday(), Weekday::Sat | Weekday::Sun) {
@@ -1338,13 +1403,19 @@ fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, 
         return Ok(next);
     }
     let weekdays = [
-        ("monday", Weekday::Mon), ("tuesday", Weekday::Tue),
-        ("wednesday", Weekday::Wed), ("thursday", Weekday::Thu),
-        ("friday", Weekday::Fri), ("saturday", Weekday::Sat), ("sunday", Weekday::Sun),
+        ("monday", Weekday::Mon),
+        ("tuesday", Weekday::Tue),
+        ("wednesday", Weekday::Wed),
+        ("thursday", Weekday::Thu),
+        ("friday", Weekday::Fri),
+        ("saturday", Weekday::Sat),
+        ("sunday", Weekday::Sun),
     ];
     if let Some((_, weekday)) = weekdays.iter().find(|(name, _)| value == *name) {
         let mut next = date + ChronoDuration::days(1);
-        while next.weekday() != *weekday { next += ChronoDuration::days(1); }
+        while next.weekday() != *weekday {
+            next += ChronoDuration::days(1);
+        }
         return Ok(next);
     }
     let words = value.split_whitespace().collect::<Vec<_>>();
@@ -1364,11 +1435,15 @@ fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, 
 
 fn add_calendar_months(date: NaiveDate, months: i64) -> Result<NaiveDate, String> {
     let month_index = date.year() as i64 * 12 + date.month0() as i64 + months;
-    let year = i32::try_from(month_index.div_euclid(12)).map_err(|_| "Recurrence year is out of range")?;
-    let month = u32::try_from(month_index.rem_euclid(12) + 1).map_err(|_| "Invalid recurrence month")?;
+    let year =
+        i32::try_from(month_index.div_euclid(12)).map_err(|_| "Recurrence year is out of range")?;
+    let month =
+        u32::try_from(month_index.rem_euclid(12) + 1).map_err(|_| "Invalid recurrence month")?;
     let mut day = date.day();
     while day > 0 {
-        if let Some(value) = NaiveDate::from_ymd_opt(year, month, day) { return Ok(value); }
+        if let Some(value) = NaiveDate::from_ymd_opt(year, month, day) {
+            return Ok(value);
+        }
         day -= 1;
     }
     Err("Could not calculate recurring date".into())
@@ -1381,23 +1456,37 @@ fn set_task_status(
     status: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let status = status.chars().next().ok_or_else(|| "Task status is empty".to_string())?;
+    let status = status
+        .chars()
+        .next()
+        .ok_or_else(|| "Task status is empty".to_string())?;
     if status == 'x' || status == 'X' {
         return set_task_completed(path, task_id, true, state);
     }
     let mut guard = state.index.lock();
     let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
-    let (start, end, indexed_line): (i64, i64, String) = index.connection().query_row(
-        "SELECT start_offset, end_offset, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
-        rusqlite::params![path, task_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).map_err(|error| format!("Task is stale or missing: {error}"))?;
+    let (start, end, indexed_line): (i64, i64, String) = index
+        .connection()
+        .query_row(
+            "SELECT start_offset, end_offset, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
+            rusqlite::params![path, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("Task is stale or missing: {error}"))?;
     let absolute = vault_abs(index, &path)?;
     let mut content = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
     let from = usize::try_from(start).map_err(|_| "Invalid task offset".to_string())?;
     let to = usize::try_from(end).map_err(|_| "Invalid task offset".to_string())?;
-    let current = content.get(from..to).ok_or_else(|| "Task offsets are stale".to_string())?;
-    let eol = if current.ends_with("\r\n") { "\r\n" } else if current.ends_with('\n') { "\n" } else { "" };
+    let current = content
+        .get(from..to)
+        .ok_or_else(|| "Task offsets are stale".to_string())?;
+    let eol = if current.ends_with("\r\n") {
+        "\r\n"
+    } else if current.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
     if current.trim_end_matches(['\r', '\n']) != indexed_line {
         return Err("Task changed on disk; refresh before editing its status".into());
     }
@@ -1440,7 +1529,13 @@ fn replace_task_line(
     let current = content
         .get(from..to)
         .ok_or_else(|| "Task offsets are stale".to_string())?;
-    let eol = if current.ends_with("\r\n") { "\r\n" } else if current.ends_with('\n') { "\n" } else { "" };
+    let eol = if current.ends_with("\r\n") {
+        "\r\n"
+    } else if current.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
     if current.trim_end_matches(['\r', '\n']) != indexed_line {
         return Err("Task changed on disk; refresh before editing its metadata".into());
     }
@@ -1450,7 +1545,106 @@ fn replace_task_line(
 }
 
 /// Pages for Dataview-style queries. `source` examples: `"people"`, `"folder/sub"`, empty = all markdown.
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NoteFileMeta {
+    pub path: String,
+    pub bytes: i64,
+    pub user: Option<String>,
+    pub group: Option<String>,
+    pub mode: Option<u32>,
+    pub mtime_ms: Option<i64>,
+    pub ctime_ms: Option<i64>,
+}
+
+/// Filesystem metadata for the note-level `this.file` object (owner/size).
 #[tauri::command]
+fn note_file_meta(path: String, state: State<'_, AppState>) -> Result<NoteFileMeta, String> {
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let abs = vault_abs(index, &path)?;
+    let meta = std::fs::metadata(&abs).map_err(|e| e.to_string())?;
+    let bytes = meta.len() as i64;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    let ctime_ms = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = meta.uid();
+        let gid = meta.gid();
+        let mode = meta.mode();
+        Ok(NoteFileMeta {
+            path,
+            bytes,
+            user: Some(unix_user_name(uid)),
+            group: Some(unix_group_name(gid)),
+            mode: Some(mode),
+            mtime_ms,
+            ctime_ms,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(NoteFileMeta {
+            path,
+            bytes,
+            user: None,
+            group: None,
+            mode: None,
+            mtime_ms,
+            ctime_ms,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn unix_user_name(uid: u32) -> String {
+    if let Ok(output) = std::process::Command::new("getent")
+        .args(["passwd", &uid.to_string()])
+        .output()
+    {
+        if output.status.success() {
+            let line = String::from_utf8_lossy(&output.stdout);
+            if let Some(name) = line.split(':').next() {
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    uid.to_string()
+}
+
+#[cfg(unix)]
+fn unix_group_name(gid: u32) -> String {
+    if let Ok(output) = std::process::Command::new("getent")
+        .args(["group", &gid.to_string()])
+        .output()
+    {
+        if output.status.success() {
+            let line = String::from_utf8_lossy(&output.stdout);
+            if let Some(name) = line.split(':').next() {
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    gid.to_string()
+}
+
+#[tauri::command]
+
 fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<PageRow>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
@@ -1460,7 +1654,7 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
     let src = src.trim().trim_matches('"').trim_matches('\'').trim();
 
     let mut sql = String::from(
-        "SELECT f.path, f.name, f.parent_path, f.mtime_ms, fm.json
+        "SELECT f.path, f.name, f.parent_path, f.mtime_ms, f.size_bytes, fm.json
          FROM files f
          LEFT JOIN file_frontmatter fm ON fm.path = f.path
          WHERE f.file_kind = 'markdown'",
@@ -1479,18 +1673,21 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
                 let name: String = r.get(1)?;
                 let folder: String = r.get(2)?;
                 let mtime_ms: i64 = r.get(3)?;
-                let json: Option<String> = r.get(4)?;
-                Ok((path, name, folder, mtime_ms, json))
+                let size_bytes: i64 = r.get(4)?;
+                let json: Option<String> = r.get(5)?;
+                Ok((path, name, folder, mtime_ms, size_bytes, json))
             })
             .map_err(|e| e.to_string())?;
         for row in mapped {
-            let (path, name, folder, mtime_ms, json) = row.map_err(|e| e.to_string())?;
+            let (path, name, folder, mtime_ms, size_bytes, json) =
+                row.map_err(|e| e.to_string())?;
             let properties = page_properties(json.as_deref());
             rows_out.push(PageRow {
                 path,
                 name,
                 folder,
                 mtime_ms,
+                size_bytes,
                 properties,
             });
         }
@@ -1502,18 +1699,21 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
                 let name: String = r.get(1)?;
                 let folder: String = r.get(2)?;
                 let mtime_ms: i64 = r.get(3)?;
-                let json: Option<String> = r.get(4)?;
-                Ok((path, name, folder, mtime_ms, json))
+                let size_bytes: i64 = r.get(4)?;
+                let json: Option<String> = r.get(5)?;
+                Ok((path, name, folder, mtime_ms, size_bytes, json))
             })
             .map_err(|e| e.to_string())?;
         for row in mapped {
-            let (path, name, folder, mtime_ms, json) = row.map_err(|e| e.to_string())?;
+            let (path, name, folder, mtime_ms, size_bytes, json) =
+                row.map_err(|e| e.to_string())?;
             let properties = page_properties(json.as_deref());
             rows_out.push(PageRow {
                 path,
                 name,
                 folder,
                 mtime_ms,
+                size_bytes,
                 properties,
             });
         }
@@ -1734,6 +1934,11 @@ fn register_page_array_functions(connection: &rusqlite::Connection) -> Result<()
 
     connection
         .create_scalar_function("cardinality", 1, SAFE, |context| {
+            Ok(parse_page_array(context.get::<String>(0)?.as_str())?.len() as i64)
+        })
+        .map_err(|error| error.to_string())?;
+    connection
+        .create_scalar_function("jsonb_array_length", 1, SAFE, |context| {
             Ok(parse_page_array(context.get::<String>(0)?.as_str())?.len() as i64)
         })
         .map_err(|error| error.to_string())?;
@@ -1989,11 +2194,15 @@ fn run_readonly_sql(
                 let source = context.get::<String>(0)?;
                 let key = context.get::<String>(1)?;
                 let object = serde_json::from_str::<serde_json::Value>(&source).unwrap_or_default();
-                Ok(object.as_object().map(|m| m.contains_key(&key)).unwrap_or(false))
+                Ok(object
+                    .as_object()
+                    .map(|m| m.contains_key(&key))
+                    .unwrap_or(false))
             },
         )
         .map_err(|error| error.to_string())?;
-    let translated = page_sql::lower_page_sql(sql, translate_page_sql, translate_page_sql_residual)?;
+    let translated =
+        page_sql::lower_page_sql(sql, translate_page_sql, translate_page_sql_residual)?;
     let mut statement = connection
         .prepare(&translated)
         .map_err(|error| error.to_string())?;
@@ -2071,10 +2280,9 @@ fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
         .into_owned();
 
     // properties->>'key' and properties->'key'
-    let property_arrow = regex::Regex::new(
-        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*->>?\s*'((?:''|[^'])*)'",
-    )
-    .map_err(|error| error.to_string())?;
+    let property_arrow =
+        regex::Regex::new(r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*->>?\s*'((?:''|[^'])*)'")
+            .map_err(|error| error.to_string())?;
     translated = property_arrow
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("page_property({}, '{}')", &captures[1], &captures[2])
@@ -2093,10 +2301,9 @@ fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
         .into_owned();
 
     // properties ? 'key'
-    let property_exists = regex::Regex::new(
-        r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?\s*'((?:''|[^'])*)'",
-    )
-    .map_err(|error| error.to_string())?;
+    let property_exists =
+        regex::Regex::new(r"(?i)\b((?:[a-z_][a-z0-9_]*\.)?properties)\s*\?\s*'((?:''|[^'])*)'")
+            .map_err(|error| error.to_string())?;
     translated = property_exists
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("page_has_key({}, '{}')", &captures[1], &captures[2])
@@ -2237,10 +2444,7 @@ fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
                 .map(|m| m[1].to_string())
                 .collect::<Vec<_>>();
             let residue = string_literal.replace_all(&captures[2], "");
-            if !residue
-                .chars()
-                .all(|c| c.is_whitespace() || c == ',')
-            {
+            if !residue.chars().all(|c| c.is_whitespace() || c == ',') {
                 return captures[0].to_string();
             }
             if items.is_empty() {
@@ -2269,10 +2473,7 @@ fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
                 .map(|m| m[1].to_string())
                 .collect::<Vec<_>>();
             let residue = string_literal.replace_all(&captures[2], "");
-            if !residue
-                .chars()
-                .all(|c| c.is_whitespace() || c == ',')
-            {
+            if !residue.chars().all(|c| c.is_whitespace() || c == ',') {
                 return captures[0].to_string();
             }
             if items.is_empty() {
@@ -2346,15 +2547,12 @@ fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
 fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
     // PostgreSQL `::type` casts → strip (SQLite is dynamically typed)
     // Handles: 'Moe'::text, 1::int, col::varchar(10), expr::float8
-    let typecast = regex::Regex::new(
-        r"::\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?",
-    )
-    .map_err(|error| error.to_string())?;
+    let typecast = regex::Regex::new(r"::\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?")
+        .map_err(|error| error.to_string())?;
     let mut translated = typecast.replace_all(sql, "").into_owned();
     // Syntax residual only (operators, SQL-standard forms). Function names
     // stay intact for postgres_compat UDFs.
     translated = page_sql::lower_pg_syntax(&translated);
-
 
     // CAST(expr AS type) → (expr)  (SQLite ignores declared types)
     let cast_fn = regex::Regex::new(
@@ -2368,18 +2566,16 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
         .into_owned();
 
     // ARRAY constructor (not already consumed by page tag forms)
-    let array_constructor = regex::Regex::new(r"(?i)\bARRAY\s*\[([^\[\]]*)\]")
-        .map_err(|error| error.to_string())?;
+    let array_constructor =
+        regex::Regex::new(r"(?i)\bARRAY\s*\[([^\[\]]*)\]").map_err(|error| error.to_string())?;
     translated = array_constructor
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("page_array({})", &captures[1])
         })
         .into_owned();
 
-    let extract = regex::Regex::new(
-        r"(?i)\bEXTRACT\s*\(\s*([a-z_]+)\s+FROM\s+([^()]+?)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
+    let extract = regex::Regex::new(r"(?i)\bEXTRACT\s*\(\s*([a-z_]+)\s+FROM\s+([^()]+?)\s*\)")
+        .map_err(|error| error.to_string())?;
     translated = extract
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("date_part('{}', {})", &captures[1], &captures[2])
@@ -2413,22 +2609,9 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
     // PostgreSQL: (VALUES (...), ...) AS alias(col1, col2)
     // SQLite (bundled): VALUES columns are column1..columnN; table(col) alias form
     // is not always available — expand to SELECT columnN AS col FROM (VALUES ...) AS alias
-    // jsonb_array_length(x) / cardinality(x) → length(x)
-    let array_len = regex::Regex::new(
-        r"(?i)\b(?:jsonb_array_length|cardinality)\s*\(\s*([^)]+?)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
-    translated = array_len
-        .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            format!("length({})", captures[1].trim())
-        })
-        .into_owned();
-
     // to_char(x, format) — common ISO-ish formats only
-    let to_char = regex::Regex::new(
-        r"(?i)\bto_char\s*\(\s*([^,]+?)\s*,\s*'([^']*)'\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
+    let to_char = regex::Regex::new(r"(?i)\bto_char\s*\(\s*([^,]+?)\s*,\s*'([^']*)'\s*\)")
+        .map_err(|error| error.to_string())?;
     translated = to_char
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             let source = captures[1].trim();
@@ -2450,19 +2633,15 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
         .into_owned();
 
     // strpos(haystack, needle) / position(needle in haystack) → instr
-    let strpos = regex::Regex::new(
-        r"(?i)\bstrpos\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
+    let strpos = regex::Regex::new(r"(?i)\bstrpos\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)")
+        .map_err(|error| error.to_string())?;
     translated = strpos
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("instr({}, {})", captures[1].trim(), captures[2].trim())
         })
         .into_owned();
-    let position = regex::Regex::new(
-        r"(?i)\bposition\s*\(\s*([^)]+?)\s+IN\s+([^)]+?)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
+    let position = regex::Regex::new(r"(?i)\bposition\s*\(\s*([^)]+?)\s+IN\s+([^)]+?)\s*\)")
+        .map_err(|error| error.to_string())?;
     translated = position
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("instr({}, {})", captures[2].trim(), captures[1].trim())
@@ -2484,10 +2663,8 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
             )
         })
         .into_owned();
-    let substr_from = regex::Regex::new(
-        r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
+    let substr_from = regex::Regex::new(r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s*\)")
+        .map_err(|error| error.to_string())?;
     translated = substr_from
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             format!("substr({}, {})", captures[1].trim(), captures[2].trim())
@@ -2495,10 +2672,8 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
         .into_owned();
 
     // date_trunc('unit', source) → SQLite date/strftime
-    let date_trunc = regex::Regex::new(
-        r"(?i)\bdate_trunc\s*\(\s*'([^']+)'\s*,\s*([^)]+?)\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
+    let date_trunc = regex::Regex::new(r"(?i)\bdate_trunc\s*\(\s*'([^']+)'\s*,\s*([^)]+?)\s*\)")
+        .map_err(|error| error.to_string())?;
     translated = date_trunc
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
             let unit = captures[1].to_ascii_lowercase();
@@ -2518,8 +2693,8 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
     let not_distinct = regex::Regex::new(r"(?i)\bIS\s+NOT\s+DISTINCT\s+FROM\b")
         .map_err(|error| error.to_string())?;
     translated = not_distinct.replace_all(&translated, "IS").into_owned();
-    let is_distinct = regex::Regex::new(r"(?i)\bIS\s+DISTINCT\s+FROM\b")
-        .map_err(|error| error.to_string())?;
+    let is_distinct =
+        regex::Regex::new(r"(?i)\bIS\s+DISTINCT\s+FROM\b").map_err(|error| error.to_string())?;
     translated = is_distinct.replace_all(&translated, "IS NOT").into_owned();
 
     translated = lower_values_table_alias(&translated);
@@ -2985,7 +3160,10 @@ fn validate_git_paths(paths: &[String]) -> Result<(), String> {
     if paths.is_empty() {
         return Err("Select at least one path".into());
     }
-    if paths.iter().any(|path| path.is_empty() || path.contains('\0')) {
+    if paths
+        .iter()
+        .any(|path| path.is_empty() || path.contains('\0'))
+    {
         return Err("Invalid Git path".into());
     }
     Ok(())
@@ -3016,7 +3194,11 @@ fn git_operation(root: &Path) -> Option<String> {
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let git_dir = {
         let path = PathBuf::from(raw);
-        if path.is_absolute() { path } else { root.join(path) }
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
     };
     if git_dir.join("MERGE_HEAD").exists() {
         Some("merge".into())
@@ -3107,23 +3289,43 @@ fn git_sync_status(state: State<'_, AppState>) -> Result<GitSyncStatus, String> 
     let detached = !branch.status.success();
     let upstream_output = git_output(
         &root,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
     )?;
     let upstream = upstream_output
         .status
         .success()
-        .then(|| String::from_utf8_lossy(&upstream_output.stdout).trim().to_string())
+        .then(|| {
+            String::from_utf8_lossy(&upstream_output.stdout)
+                .trim()
+                .to_string()
+        })
         .filter(|value| !value.is_empty());
-    let remote = upstream.as_deref().and_then(|value| value.split('/').next()).map(str::to_string);
+    let remote = upstream
+        .as_deref()
+        .and_then(|value| value.split('/').next())
+        .map(str::to_string);
     let remote_url = remote.as_deref().and_then(|name| {
         let output = git_output(&root, &["remote", "get-url", name]).ok()?;
-        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
     });
     let (ahead, behind) = if upstream.is_some() {
-        let output = git_output(&root, &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])?;
+        let output = git_output(
+            &root,
+            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        )?;
         if output.status.success() {
             let counts = String::from_utf8_lossy(&output.stdout);
-            let mut values = counts.split_whitespace().filter_map(|value| value.parse::<usize>().ok());
+            let mut values = counts
+                .split_whitespace()
+                .filter_map(|value| value.parse::<usize>().ok());
             (values.next().unwrap_or(0), values.next().unwrap_or(0))
         } else {
             (0, 0)
@@ -3131,7 +3333,14 @@ fn git_sync_status(state: State<'_, AppState>) -> Result<GitSyncStatus, String> 
     } else {
         (0, 0)
     };
-    Ok(GitSyncStatus { remote, upstream, remote_url, ahead, behind, detached })
+    Ok(GitSyncStatus {
+        remote,
+        upstream,
+        remote_url,
+        ahead,
+        behind,
+        detached,
+    })
 }
 
 #[tauri::command]
@@ -3252,10 +3461,7 @@ fn git_restore(paths: Vec<String>, state: State<'_, AppState>) -> Result<String,
 #[tauri::command]
 fn git_branches(state: State<'_, AppState>) -> Result<GitBranches, String> {
     let root = vault_root(&state)?;
-    let output = git_success(
-        &root,
-        &["branch", "--format=%(HEAD)%00%(refname:short)"],
-    )?;
+    let output = git_success(&root, &["branch", "--format=%(HEAD)%00%(refname:short)"])?;
     let mut current = None;
     let mut branches = Vec::new();
     for line in output.lines() {
@@ -3326,7 +3532,9 @@ fn git_commit_staged(message: String, state: State<'_, AppState>) -> Result<Stri
 }
 
 fn validate_git_commit(value: &str) -> Result<(), String> {
-    if (4..=64).contains(&value.len()) && value.chars().all(|character| character.is_ascii_hexdigit()) {
+    if (4..=64).contains(&value.len())
+        && value.chars().all(|character| character.is_ascii_hexdigit())
+    {
         Ok(())
     } else {
         Err("Invalid Git commit identifier".into())
@@ -3334,14 +3542,26 @@ fn validate_git_commit(value: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn git_commit_details(hash: String, state: State<'_, AppState>) -> Result<GitCommitDetails, String> {
+fn git_commit_details(
+    hash: String,
+    state: State<'_, AppState>,
+) -> Result<GitCommitDetails, String> {
     validate_git_commit(&hash)?;
     let root = vault_root(&state)?;
     let format = "%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1f%P%x1e";
     let format_argument = format!("--format={format}");
     let output = git_output(
         &root,
-        &["show", "--date=iso-strict", &format_argument, "--patch", "--stat", "--no-ext-diff", "--no-color", &hash],
+        &[
+            "show",
+            "--date=iso-strict",
+            &format_argument,
+            "--patch",
+            "--stat",
+            "--no-ext-diff",
+            "--no-color",
+            &hash,
+        ],
     )?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -3356,7 +3576,12 @@ fn git_commit_details(hash: String, state: State<'_, AppState>) -> Result<GitCom
         timestamp: fields.next().unwrap_or_default().to_string(),
         subject: fields.next().unwrap_or_default().to_string(),
         body: fields.next().unwrap_or_default().trim().to_string(),
-        parents: fields.next().unwrap_or_default().split_whitespace().map(str::to_string).collect(),
+        parents: fields
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
         patch: patch.trim_start().to_string(),
     })
 }
@@ -3372,21 +3597,33 @@ fn git_file_history(
     let count = limit.unwrap_or(100).clamp(1, 250).to_string();
     let output = git_output(
         &root,
-        &["log", "--follow", "--date=iso-strict", "--format=%H%x1f%h%x1f%an%x1f%ad%x1f%s", "-n", &count, "--", &path],
+        &[
+            "log",
+            "--follow",
+            "--date=iso-strict",
+            "--format=%H%x1f%h%x1f%an%x1f%ad%x1f%s",
+            "-n",
+            &count,
+            "--",
+            &path,
+        ],
     )?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| {
-        let mut fields = line.splitn(5, '\u{1f}');
-        Some(GitCommit {
-            hash: fields.next()?.to_string(),
-            short_hash: fields.next()?.to_string(),
-            author: fields.next()?.to_string(),
-            timestamp: fields.next()?.to_string(),
-            subject: fields.next()?.to_string(),
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(5, '\u{1f}');
+            Some(GitCommit {
+                hash: fields.next()?.to_string(),
+                short_hash: fields.next()?.to_string(),
+                author: fields.next()?.to_string(),
+                timestamp: fields.next()?.to_string(),
+                subject: fields.next()?.to_string(),
+            })
         })
-    }).collect())
+        .collect())
 }
 
 #[tauri::command]
@@ -3398,7 +3635,10 @@ fn git_restore_from_commit(
     validate_git_commit(&hash)?;
     validate_git_paths(std::slice::from_ref(&path))?;
     let root = vault_root(&state)?;
-    git_success(&root, &["restore", "--source", &hash, "--worktree", "--", &path])
+    git_success(
+        &root,
+        &["restore", "--source", &hash, "--worktree", "--", &path],
+    )
 }
 
 #[tauri::command]
@@ -3411,7 +3651,11 @@ fn git_resolve_conflict(
     let root = vault_root(&state)?;
     match resolution.as_str() {
         "ours" | "theirs" => {
-            let flag = if resolution == "ours" { "--ours" } else { "--theirs" };
+            let flag = if resolution == "ours" {
+                "--ours"
+            } else {
+                "--theirs"
+            };
             git_success(&root, &["checkout", flag, "--", &path])?;
             git_success(&root, &["add", "--", &path])
         }
@@ -3426,7 +3670,10 @@ fn git_continue(state: State<'_, AppState>) -> Result<String, String> {
     match git_operation(&root).as_deref() {
         Some("merge") => git_success(&root, &["-c", "core.editor=true", "merge", "--continue"]),
         Some("rebase") => git_success(&root, &["-c", "core.editor=true", "rebase", "--continue"]),
-        Some("cherry-pick") => git_success(&root, &["-c", "core.editor=true", "cherry-pick", "--continue"]),
+        Some("cherry-pick") => git_success(
+            &root,
+            &["-c", "core.editor=true", "cherry-pick", "--continue"],
+        ),
         Some("revert") => git_success(&root, &["-c", "core.editor=true", "revert", "--continue"]),
         _ => Err("No Git merge, rebase, cherry-pick, or revert is in progress".into()),
     }
@@ -3701,6 +3948,7 @@ pub fn run() {
             write_file,
             resolve_wikilink,
             list_pages,
+            note_file_meta,
             query_vault_sql,
             list_tasks,
             set_task_completed,
@@ -3746,15 +3994,17 @@ pub fn run() {
 #[cfg(test)]
 mod sql_query_tests {
     use super::{
-        fts_query, is_conflict_status, next_recurrence_date, page_properties,
-        recurring_task_lines, run_readonly_sql, search_yaml_properties,
-        translate_page_sql, vault_search_terms,
+        fts_query, is_conflict_status, next_recurrence_date, page_properties, recurring_task_lines,
+        run_readonly_sql, search_yaml_properties, translate_page_sql, vault_search_terms,
     };
     use chrono::NaiveDate;
 
     #[test]
     fn full_text_terms_are_quoted_and_prefixed() {
-        assert_eq!(fts_query("PostgreSQL migration"), "\"postgresql\"* AND \"migration\"*");
+        assert_eq!(
+            fts_query("PostgreSQL migration"),
+            "\"postgresql\"* AND \"migration\"*"
+        );
         assert_eq!(fts_query("  #jobs  "), "\"jobs\"*");
     }
 
@@ -3781,7 +4031,10 @@ mod sql_query_tests {
         let results = search_yaml_properties(&connection, &terms, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "people/Divya Nidhi.md");
-        assert_eq!(results[0].snippet, "[[HIT]]company: Deloitte Consulting LLP[[/HIT]]");
+        assert_eq!(
+            results[0].snippet,
+            "[[HIT]]company: Deloitte Consulting LLP[[/HIT]]"
+        );
     }
 
     #[test]
@@ -3801,12 +4054,17 @@ mod sql_query_tests {
             "- [ ] Invoice 🔁 every month 📅 2026-01-31 ^invoice",
             "every month",
             today,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(completed.contains("[x]") && completed.contains("✅ 2026-08-12"));
         assert!(next.contains("[ ]") && next.contains("📅 2026-02-28"));
         assert!(next.ends_with("^invoice"));
         assert_eq!(
-            next_recurrence_date(NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(), "every weekday").unwrap(),
+            next_recurrence_date(
+                NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(),
+                "every weekday"
+            )
+            .unwrap(),
             NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
         );
     }
@@ -3819,8 +4077,7 @@ mod sql_query_tests {
 
     #[test]
     fn yaml_title_remains_an_ordinary_page_property() {
-        let properties =
-            page_properties(Some(r#"{"title":"YAML title","status":"active"}"#));
+        let properties = page_properties(Some(r#"{"title":"YAML title","status":"active"}"#));
         assert_eq!(properties["status"], "active");
         assert_eq!(properties["title"], "YAML title");
     }
@@ -3913,7 +4170,7 @@ mod sql_query_tests {
                 "SELECT a.name FROM (VALUES ('Moe'::text), ('Larry'), ('Curly')) AS a(name)"
             )
             .unwrap(),
-            "SELECT a.name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS a(name)"
+            "SELECT a.name FROM (SELECT column1 AS name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS _nephrite_values) AS a"
         );
         assert_eq!(
             translate_page_sql("SELECT 1::int AS n").unwrap(),
@@ -3924,9 +4181,15 @@ mod sql_query_tests {
     #[test]
     fn lowers_jsonb_array_length() {
         let out = translate_page_sql("SELECT jsonb_array_length(tags) FROM pages").unwrap();
-        assert!(out.contains("length(tags)"), "array length not lowered: {out}");
+        assert!(
+            out.contains("jsonb_array_length(tags)"),
+            "array length function was corrupted: {out}"
+        );
         let out2 = translate_page_sql("SELECT cardinality(tags) FROM pages").unwrap();
-        assert!(out2.contains("length(tags)"), "cardinality not lowered: {out2}");
+        assert!(
+            out2.contains("cardinality(tags)"),
+            "cardinality function was corrupted: {out2}"
+        );
     }
 
     #[test]
@@ -4055,17 +4318,11 @@ mod sql_query_tests {
             "SELECT page_property(p.properties, 'company') AS company FROM pages p WHERE page_property(p.properties, 'active') IS NOT NULL"
         );
         assert_eq!(
-            translate_page_sql(
-                "SELECT * FROM pages p WHERE p.aliases @> ARRAY['Data']"
-            )
-            .unwrap(),
+            translate_page_sql("SELECT * FROM pages p WHERE p.aliases @> ARRAY['Data']").unwrap(),
             "SELECT * FROM pages p WHERE (page_has_tag(p.aliases, 'Data'))"
         );
         assert_eq!(
-            translate_page_sql(
-                "SELECT * FROM pages p WHERE 'recruiter' = ANY(p.tags)"
-            )
-            .unwrap(),
+            translate_page_sql("SELECT * FROM pages p WHERE 'recruiter' = ANY(p.tags)").unwrap(),
             "SELECT * FROM pages p WHERE page_has_tag(p.tags, 'recruiter')"
         );
         assert_eq!(
@@ -4083,16 +4340,13 @@ mod sql_query_tests {
             "SELECT 1 FROM pages WHERE (page_has_key(properties, 'a') OR page_has_key(properties, 'b'))"
         );
         assert_eq!(
-            translate_page_sql(
-                "SELECT 1 FROM pages WHERE jsonb_exists(properties, 'company')"
-            )
-            .unwrap(),
+            translate_page_sql("SELECT 1 FROM pages WHERE jsonb_exists(properties, 'company')")
+                .unwrap(),
             "SELECT 1 FROM pages WHERE page_has_key(properties, 'company')"
         );
-        let ilike_out = translate_page_sql(
-            "SELECT path FROM pages WHERE properties->>'name' ILIKE '%roy%'"
-        )
-        .unwrap();
+        let ilike_out =
+            translate_page_sql("SELECT path FROM pages WHERE properties->>'name' ILIKE '%roy%'")
+                .unwrap();
         assert!(
             ilike_out.contains("lower(page_property(properties, 'name')) LIKE lower('%roy%')"),
             "ILIKE not lowered: {ilike_out}"
@@ -4119,7 +4373,10 @@ mod sql_query_tests {
     fn executes_postgres_page_property_and_tag_types() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
-            .execute("CREATE TABLE pages(properties TEXT, tags TEXT, aliases TEXT)", [])
+            .execute(
+                "CREATE TABLE pages(properties TEXT, tags TEXT, aliases TEXT)",
+                [],
+            )
             .unwrap();
         connection
             .execute(

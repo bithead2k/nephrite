@@ -1,5 +1,6 @@
 import { marked } from "marked";
 import { renderPropertiesHtml, splitFrontmatter } from "./frontmatter";
+import { blockHash, splitMarkdownBlocks } from "./preview-blocks";
 
 marked.setOptions({
   gfm: true,
@@ -36,14 +37,17 @@ export function renderPreview(
     html += props;
   }
 
-  // Protect code spans/fences: script source containing wikilink strings must
-  // reach the evaluator verbatim. Only prose wikilinks are rendered here.
-  const withLinks = replaceWikilinksOutsideCode(body);
-
-  // Fenced code blocks should not be mangled further
+  // Fence-aware blocks: trivial edits can replace a single .md-block node.
   try {
-    const rendered = marked.parse(withLinks, { async: false }) as string;
-    html += renderTocMarkers(renderCallouts(rendered));
+    const blocks = splitMarkdownBlocks(body);
+    for (let index = 0; index < blocks.length; index++) {
+      const block = blocks[index];
+      const withLinks = replaceWikilinksOutsideCode(block);
+      const rendered = marked.parse(withLinks, { async: false }) as string;
+      const inner = renderTocMarkers(renderCallouts(rendered));
+      const hash = blockHash(block);
+      html += `<div class="md-block" data-block-index="${index}" data-block-hash="${hash}">${inner}</div>`;
+    }
   } catch {
     html += `<pre class="preview-error">${escapeHtml(body)}</pre>`;
   }
@@ -192,4 +196,18 @@ function escapeHtml(s: string): string {
 
 function escapeAttr(s: string): string {
   return escapeHtml(s).replace(/'/g, "&#39;");
+}
+
+
+/** Render a single markdown block to the same wrapper shape as renderPreview. */
+export function renderBlockHtml(block: string, index: number): string {
+  const withLinks = replaceWikilinksOutsideCode(block);
+  try {
+    const rendered = marked.parse(withLinks, { async: false }) as string;
+    const inner = renderTocMarkers(renderCallouts(rendered));
+    const hash = blockHash(block);
+    return `<div class="md-block" data-block-index="${index}" data-block-hash="${hash}">${inner}</div>`;
+  } catch {
+    return `<div class="md-block" data-block-index="${index}" data-block-hash="${blockHash(block)}"><pre class="preview-error">${escapeHtml(block)}</pre></div>`;
+  }
 }

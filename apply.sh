@@ -23,10 +23,11 @@ zipfile=$(ls -1 *.zip 2> /dev/null)
 # [[ ! -f "$zipfile" ]] && { echo "Can't find a patch zip file."; exit 1; }
 echo "$zipfile"
 [[ -f "$zipfile" ]] && { mv "$zipfile" patches/; unzip "patches/$zipfile"; }
-patchfile=$(ls -1 *.patch)
+patchfile=$(ls -1 *.patch 2>/dev/null)
 echo "$patchfile"
 [[ -f "$patchfile" ]] && { patch -p1 < "$patchfile"; rm $patchfile; }
-fixfile=$(ls -1 fix-* 2>/dev/null)
+fixfile=$(ls -1 *fix-* 2>/dev/null)
+[[ "$fixfile" == "" ]] && fixfile=$(ls -1 0*.py 2>/dev/null)
 echo "$fixfile"
 [[ -f "$fixfile" ]] || exit
 chmod +x "$fixfile"

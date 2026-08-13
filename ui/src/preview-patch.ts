@@ -18,7 +18,9 @@ export function previewPatchWindow(
     suffix < current.length - prefix &&
     suffix < next.length - prefix &&
     current[current.length - 1 - suffix] === next[next.length - 1 - suffix]
-  ) suffix++;
+  ) {
+    suffix++;
+  }
 
   return {
     prefix,
@@ -35,8 +37,9 @@ export type PreviewPatchResult = {
 };
 
 /**
- * Preserve equal top-level preview nodes (and their listeners/state), replacing
- * only the contiguous region whose rendered HTML changed.
+ * Preserve equal top-level preview nodes, replacing only the contiguous region
+ * whose rendered HTML changed. Keys are whitespace-normalized so renderer jitter
+ * does not invalidate the whole tree.
  */
 export function patchPreviewHtml(
   root: HTMLElement,
@@ -45,15 +48,15 @@ export function patchPreviewHtml(
 ): PreviewPatchResult {
   const template = document.createElement("template");
   template.innerHTML = html;
-  const currentNodes = Array.from(root.children);
-  const nextNodes = Array.from(template.content.children);
+  const currentNodes = Array.from(root.children) as HTMLElement[];
+  const nextNodes = Array.from(template.content.children) as HTMLElement[];
   const nextKeys = nextNodes.map((node) => previewNodeKey(node.outerHTML));
   nextNodes.forEach((node, index) => {
-    (node as HTMLElement).dataset.previewKey = nextKeys[index];
+    node.dataset.previewKey = nextKeys[index];
   });
 
   if (forceFull || currentNodes.length === 0) {
-    root.replaceChildren(template.content);
+    root.replaceChildren(...nextNodes);
     return {
       preserved: 0,
       removed: currentNodes.length,
@@ -63,8 +66,7 @@ export function patchPreviewHtml(
   }
 
   const window = previewPatchWindow(
-    currentNodes.map((node) =>
-      (node as HTMLElement).dataset.previewKey || previewNodeKey(node.outerHTML)),
+    currentNodes.map((node) => node.dataset.previewKey || previewNodeKey(node.outerHTML)),
     nextKeys,
   );
   if (window.prefix === currentNodes.length && window.prefix === nextNodes.length) {
@@ -90,11 +92,14 @@ export function patchPreviewHtml(
   };
 }
 
-/** Stable, non-cryptographic identity for rendered source HTML. */
+/** Stable identity for rendered source HTML (whitespace-normalized). */
 function previewNodeKey(source: string): string {
+  // Collapse incidental whitespace so tiny renderer jitter does not invalidate
+  // every top-level node and force a near-full DOM rebuild (visible flash).
+  const normalized = source.replace(/\s+/g, " ").trim();
   let hash = 0x811c9dc5;
-  for (let index = 0; index < source.length; index++) {
-    hash ^= source.charCodeAt(index);
+  for (let index = 0; index < normalized.length; index++) {
+    hash ^= normalized.charCodeAt(index);
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(36);

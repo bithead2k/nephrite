@@ -1,6 +1,6 @@
 # Nephrite
 
-**PROJECT_VERSION 0.2** — knowledge that doesn’t fracture.
+**PROJECT_VERSION 0.3** — knowledge that doesn’t fracture.
 
 Open-source, local-first knowledge app. Markdown is storage; the SQLite index is disposable. Opens an existing Obsidian vault without import or conversion.
 
@@ -43,7 +43,7 @@ License: [AGPL-3.0](LICENSE)
 ## Requirements
 
 - Rust 1.77+
-- Node 20+
+- Node 20.19+
 - Linux: WebKitGTK 4.1 dev packages (see Tauri prereqs)
 - macOS: Xcode CLT; Windows: WebView2
 

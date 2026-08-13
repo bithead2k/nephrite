@@ -188,9 +188,7 @@ impl VaultIndex {
         let mut statement = self
             .conn
             .prepare("SELECT path, mtime_ms, size_bytes FROM files")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get(0)?, (row.get(1)?, row.get(2)?)))
-        })?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?;
         for row in rows {
             let (path, metadata) = row?;
             indexed.insert(path, metadata);
@@ -272,7 +270,7 @@ impl VaultIndex {
                     stats.updated += 1;
                 }
             }
-            if stats.scanned % 50 == 0 || stats.scanned == total {
+            if stats.scanned.is_multiple_of(50) || stats.scanned == total {
                 progress(
                     ProgressPhase::Index,
                     stats.scanned,
@@ -445,7 +443,13 @@ impl VaultIndex {
             tx.execute(
                 "INSERT INTO attachment_metadata(path, mime_type, width, height, text_indexed)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![rel, mime_type, width, height, if text_attachment { 1 } else { 0 }],
+                params![
+                    rel,
+                    mime_type,
+                    width,
+                    height,
+                    if text_attachment { 1 } else { 0 }
+                ],
             )?;
         }
 
@@ -589,17 +593,35 @@ impl VaultIndex {
         } else if kind == FK::Canvas {
             let value: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
             let mut canvas_text = Vec::new();
-            for node in value.get("nodes").and_then(|nodes| nodes.as_array()).into_iter().flatten() {
-                let node_id = node.get("id").and_then(|item| item.as_str()).unwrap_or_default();
+            for node in value
+                .get("nodes")
+                .and_then(|nodes| nodes.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let node_id = node
+                    .get("id")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default();
                 if node_id.is_empty() {
                     continue;
                 }
-                let node_type = node.get("type").and_then(|item| item.as_str()).unwrap_or("text");
+                let node_type = node
+                    .get("type")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("text");
                 let file_path = node.get("file").and_then(|item| item.as_str());
-                let text = node.get("text").or_else(|| node.get("label")).or_else(|| node.get("url"))
+                let text = node
+                    .get("text")
+                    .or_else(|| node.get("label"))
+                    .or_else(|| node.get("url"))
                     .and_then(|item| item.as_str());
-                if let Some(value) = text { canvas_text.push(value); }
-                if let Some(value) = file_path { canvas_text.push(value); }
+                if let Some(value) = text {
+                    canvas_text.push(value);
+                }
+                if let Some(value) = file_path {
+                    canvas_text.push(value);
+                }
                 tx.execute(
                     "INSERT INTO canvas_nodes(path, node_id, node_type, file_path, text, x, y, width, height)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -612,15 +634,31 @@ impl VaultIndex {
                     ],
                 )?;
             }
-            for edge in value.get("edges").and_then(|edges| edges.as_array()).into_iter().flatten() {
-                let edge_id = edge.get("id").and_then(|item| item.as_str()).unwrap_or_default();
-                let from_node = edge.get("fromNode").and_then(|item| item.as_str()).unwrap_or_default();
-                let to_node = edge.get("toNode").and_then(|item| item.as_str()).unwrap_or_default();
+            for edge in value
+                .get("edges")
+                .and_then(|edges| edges.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let edge_id = edge
+                    .get("id")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default();
+                let from_node = edge
+                    .get("fromNode")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default();
+                let to_node = edge
+                    .get("toNode")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default();
                 if edge_id.is_empty() || from_node.is_empty() || to_node.is_empty() {
                     continue;
                 }
                 let label = edge.get("label").and_then(|item| item.as_str());
-                if let Some(value) = label { canvas_text.push(value); }
+                if let Some(value) = label {
+                    canvas_text.push(value);
+                }
                 tx.execute(
                     "INSERT INTO canvas_edges(path, edge_id, from_node, to_node, label)
                      VALUES (?1,?2,?3,?4,?5)",
@@ -680,12 +718,7 @@ impl VaultIndex {
             }
             true
         }) {
-            let entry = entry.map_err(|e| {
-                IndexError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            let entry = entry.map_err(|e| IndexError::Io(std::io::Error::other(e.to_string())))?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -697,12 +730,9 @@ impl VaultIndex {
             if should_skip_rel(&rel) {
                 continue;
             }
-            let meta = entry.metadata().map_err(|e| {
-                IndexError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            let meta = entry
+                .metadata()
+                .map_err(|e| IndexError::Io(std::io::Error::other(e.to_string())))?;
             let mtime_ms = mtime_to_ms(meta.modified().ok());
             let size = meta.len() as i64;
             out.push((rel, mtime_ms, size));
@@ -715,9 +745,7 @@ impl VaultIndex {
         // Build stem → paths map
         let mut by_stem: HashMap<String, Vec<String>> = HashMap::new();
         {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT path, stem FROM files")?;
+            let mut stmt = self.conn.prepare("SELECT path, stem FROM files")?;
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
@@ -725,7 +753,10 @@ impl VaultIndex {
                 by_stem.entry(stem).or_default().push(path.clone());
                 by_stem.entry(path.clone()).or_default().push(path.clone());
                 if let Some(name) = path.rsplit('/').next() {
-                    by_stem.entry(name.to_string()).or_default().push(path.clone());
+                    by_stem
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(path.clone());
                 }
                 if let Some(no_ext) = path.strip_suffix(".md") {
                     by_stem.entry(no_ext.to_string()).or_default().push(path);
@@ -759,7 +790,25 @@ impl VaultIndex {
     /// Count rows helper for tests / CLI.
     pub fn count(&self, table: &str) -> Result<i64> {
         // only allow known tables
-        let allowed = ["files", "links", "tasks", "tags", "headings", "properties"];
+        let allowed = [
+            "files",
+            "attachment_metadata",
+            "aliases",
+            "headings",
+            "blocks",
+            "links",
+            "tags",
+            "tasks",
+            "properties",
+            "file_frontmatter",
+            "inline_fields",
+            "footnotes",
+            "canvas_nodes",
+            "canvas_edges",
+            "kanban_boards",
+            "kanban_columns",
+            "kanban_cards",
+        ];
         if !allowed.contains(&table) {
             return Ok(0);
         }
@@ -827,20 +876,49 @@ fn hash_str(s: &str) -> String {
 fn is_text_attachment(extension: &str) -> bool {
     matches!(
         extension,
-        "txt" | "text" | "csv" | "tsv" | "json" | "jsonl" | "xml" | "html" |
-        "htm" | "css" | "js" | "ts" | "toml" | "ini" | "conf" | "log" | "sql" |
-        "sh" | "py" | "rs" | "go" | "java" | "c" | "h" | "cpp" | "hpp"
+        "txt"
+            | "text"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "jsonl"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "js"
+            | "ts"
+            | "toml"
+            | "ini"
+            | "conf"
+            | "log"
+            | "sql"
+            | "sh"
+            | "py"
+            | "rs"
+            | "go"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
     )
 }
 
 fn attachment_metadata(path: &Path, extension: &str) -> (String, Option<i64>, Option<i64>) {
     let mime = mime_for_extension(extension).to_string();
     let dimensions = if mime.starts_with("image/") {
-        fs::read(path).ok().and_then(|bytes| image_dimensions(&bytes, extension))
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| image_dimensions(&bytes, extension))
     } else {
         None
     };
-    (mime, dimensions.map(|value| value.0), dimensions.map(|value| value.1))
+    (
+        mime,
+        dimensions.map(|value| value.0),
+        dimensions.map(|value| value.1),
+    )
 }
 
 fn mime_for_extension(extension: &str) -> &'static str {
@@ -883,16 +961,26 @@ fn mime_for_extension(extension: &str) -> &'static str {
 
 fn image_dimensions(bytes: &[u8], extension: &str) -> Option<(i64, i64)> {
     let pair = match extension {
-        "png" if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" => {
-            Some((u32::from_be_bytes(bytes[16..20].try_into().ok()?), u32::from_be_bytes(bytes[20..24].try_into().ok()?)))
-        }
+        "png" if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" => Some((
+            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+        )),
         "gif" if bytes.len() >= 10 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") => {
-            Some((u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32, u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32))
+            Some((
+                u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32,
+                u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32,
+            ))
         }
-        "bmp" if bytes.len() >= 26 && &bytes[..2] == b"BM" => {
-            Some((u32::from_le_bytes(bytes[18..22].try_into().ok()?), u32::from_le_bytes(bytes[22..26].try_into().ok()?)))
-        }
-        "webp" if bytes.len() >= 30 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" && &bytes[12..16] == b"VP8X" => {
+        "bmp" if bytes.len() >= 26 && &bytes[..2] == b"BM" => Some((
+            u32::from_le_bytes(bytes[18..22].try_into().ok()?),
+            u32::from_le_bytes(bytes[22..26].try_into().ok()?),
+        )),
+        "webp"
+            if bytes.len() >= 30
+                && &bytes[..4] == b"RIFF"
+                && &bytes[8..12] == b"WEBP"
+                && &bytes[12..16] == b"VP8X" =>
+        {
             let width = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
             let height = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
             Some((width, height))
@@ -921,7 +1009,22 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         if length < 2 || offset + length > bytes.len() {
             return None;
         }
-        if matches!(marker, 0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf) && length >= 7 {
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) && length >= 7
+        {
             let height = u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().ok()?) as u32;
             let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32;
             return Some((width, height));
@@ -1068,21 +1171,30 @@ Link to [[Other]]
         )
         .unwrap();
         let (index, _) = VaultIndex::open(vault).unwrap();
-        let nodes: i64 = index.connection().query_row(
-            "SELECT COUNT(*) FROM canvas_nodes WHERE path = 'Planning.canvas'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        let edges: i64 = index.connection().query_row(
-            "SELECT COUNT(*) FROM canvas_edges WHERE path = 'Planning.canvas'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        let matches: i64 = index.connection().query_row(
-            "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'checklist'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let nodes: i64 = index
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM canvas_nodes WHERE path = 'Planning.canvas'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let edges: i64 = index
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM canvas_edges WHERE path = 'Planning.canvas'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let matches: i64 = index
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'checklist'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(nodes, 2);
         assert_eq!(edges, 1);
         assert_eq!(matches, 1);
@@ -1121,7 +1233,11 @@ Link to [[Other]]
         assert!(!stats.full_rebuild);
         assert_eq!(stats.updated, 1);
         assert_eq!(stats.unchanged, 1);
-        assert_eq!(migrated.get_meta("project_version").unwrap().as_deref(), Some("0.2"));
+        let current_version = PROJECT_VERSION.to_string();
+        assert_eq!(
+            migrated.get_meta("project_version").unwrap().as_deref(),
+            Some(current_version.as_str())
+        );
         assert_eq!(migrated.count("canvas_nodes").unwrap(), 1);
     }
 }

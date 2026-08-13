@@ -668,7 +668,8 @@ This section records the current implementation state and recent design decision
 * Markdown remains authoritative. Preview/index transformations must never rewrite source unless the user edits it.
 * Vault opening displays action text and progress while checking or rebuilding the index.
 * The project is AGPL-3.0-only.
-* `PROJECT_VERSION` is currently `0.2`; Cargo and npm package versions are `0.2.0`.
+* `PROJECT_VERSION` is currently `0.3`; Cargo and npm package versions are `0.3.0`.
+* Version 0.3 is a minor upgrade from 0.2 and does not force an index rebuild.
 * Version 0.2 rebuilds indexes from the earlier internal 2.0 development version because the stored major differs.
 
 ### Editor and Vim Integration

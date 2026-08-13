@@ -7,6 +7,8 @@ import {
   type CtxAction,
   type CtxTarget,
 } from "../ui/src/context-menu";
+import { hydrateNoteEmbeds } from "../ui/src/note-embed";
+import { renderPreview } from "../ui/src/preview";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -103,4 +105,36 @@ test("Escape closes a mounted command bar without executing an action", () => {
   );
   assert.equal(closed, true);
   assert.equal(executed, false);
+});
+
+test("the main preview hydration path expands an Obsidian heading embed", async () => {
+  document.body.replaceChildren();
+  const root = document.createElement("main");
+  root.innerHTML = renderPreview("![[Target#Details]]");
+  document.body.append(root);
+
+  Object.defineProperty(dom.window, "__TAURI_INTERNALS__", {
+    configurable: true,
+    value: {
+      invoke: async (command: string) => {
+        if (command === "resolve_wikilink") return "notes/Target.md";
+        if (command === "read_file") {
+          return {
+            path: "notes/Target.md",
+            content: "# Intro\nIgnore me\n\n## Details\nEmbedded body\n\n## Next\nStop here",
+            mtime_ms: 0,
+            size_bytes: 0,
+          };
+        }
+        throw new Error(`Unexpected command: ${command}`);
+      },
+    },
+  });
+
+  await hydrateNoteEmbeds(root, "notes/Source.md", { openLink: () => {} });
+  const embed = root.querySelector<HTMLElement>(".note-embed");
+  assert.ok(embed);
+  assert.match(embed.textContent || "", /Details\s+Embedded body/);
+  assert.doesNotMatch(embed.textContent || "", /Ignore me|Stop here/);
+  assert.equal(root.querySelector("a.preview-wikilink.embed"), null);
 });

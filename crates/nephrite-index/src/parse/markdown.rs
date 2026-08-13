@@ -400,14 +400,11 @@ fn extract_tags_and_links(
     let mut i = 0;
     while i < bytes.len() {
         let embed = bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[';
-        let start = if embed {
-            i
-        } else if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            i
-        } else {
+        if !(embed || bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'[') {
             i += 1;
             continue;
-        };
+        }
+        let start = i;
         let open = if embed { i + 1 } else { i };
         if open + 1 >= bytes.len() || bytes[open] != b'[' || bytes[open + 1] != b'[' {
             i += 1;
@@ -439,8 +436,7 @@ fn extract_tags_and_links(
     }
 
     // Tags #foo / #foo/bar (not inside headings we already handled similarly)
-    let mut chars = line.char_indices().peekable();
-    while let Some((idx, c)) = chars.next() {
+    for (idx, c) in line.char_indices() {
         if c != '#' {
             continue;
         }
@@ -553,13 +549,13 @@ fn yaml_value_to_json(value: &serde_yaml::Value) -> serde_json::Value {
             }
         }
         Value::String(value) => serde_json::Value::String(value.clone()),
-        Value::Sequence(values) => serde_json::Value::Array(
-            values.iter().map(yaml_value_to_json).collect(),
-        ),
+        Value::Sequence(values) => {
+            serde_json::Value::Array(values.iter().map(yaml_value_to_json).collect())
+        }
         Value::Mapping(values) => {
             let mut object = serde_json::Map::new();
             // YAML merge keys are defaults: explicit keys in this map win.
-            if let Some(merged) = values.get(&Value::String("<<".to_string())) {
+            if let Some(merged) = values.get(Value::String("<<".to_string())) {
                 merge_yaml_defaults(&mut object, merged);
             }
             for (key, value) in values {
@@ -588,7 +584,10 @@ fn yaml_key_to_string(value: &serde_yaml::Value) -> String {
     }
 }
 
-fn merge_yaml_defaults(object: &mut serde_json::Map<String, serde_json::Value>, value: &serde_yaml::Value) {
+fn merge_yaml_defaults(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    value: &serde_yaml::Value,
+) {
     let mappings: Vec<&serde_yaml::Mapping> = match value {
         serde_yaml::Value::Mapping(mapping) => vec![mapping],
         serde_yaml::Value::Sequence(values) => values
@@ -608,11 +607,7 @@ fn merge_yaml_defaults(object: &mut serde_json::Map<String, serde_json::Value>, 
     }
 }
 
-fn flatten_json_properties(
-    path: &str,
-    value: &serde_json::Value,
-    leaves: &mut Vec<PropertyLeaf>,
-) {
+fn flatten_json_properties(path: &str, value: &serde_json::Value, leaves: &mut Vec<PropertyLeaf>) {
     if !path.is_empty() {
         push_json_property(leaves, path, value);
     }
@@ -645,20 +640,16 @@ fn push_json_property(leaves: &mut Vec<PropertyLeaf>, path: &str, value: &serde_
         .to_string();
     let (value_type, value_text, value_num, value_bool) = match value {
         serde_json::Value::Null => ("null", None, None, None),
-        serde_json::Value::Bool(value) => (
-            "boolean",
-            Some(value.to_string()),
-            None,
-            Some(*value),
-        ),
-        serde_json::Value::Number(value) => (
-            "number",
-            Some(value.to_string()),
-            value.as_f64(),
-            None,
-        ),
+        serde_json::Value::Bool(value) => ("boolean", Some(value.to_string()), None, Some(*value)),
+        serde_json::Value::Number(value) => {
+            ("number", Some(value.to_string()), value.as_f64(), None)
+        }
         serde_json::Value::String(value) => (
-            if value.starts_with("[[") { "link" } else { "string" },
+            if value.starts_with("[[") {
+                "link"
+            } else {
+                "string"
+            },
             Some(value.clone()),
             None,
             None,
@@ -674,14 +665,17 @@ fn push_json_property(leaves: &mut Vec<PropertyLeaf>, path: &str, value: &serde_
         value_num,
         value_bool,
         value_json: serde_json::to_string(value).ok(),
-        is_leaf: !matches!(value, serde_json::Value::Array(_) | serde_json::Value::Object(_)),
+        is_leaf: !matches!(
+            value,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_)
+        ),
     });
 }
 
 fn collect_json_tags(value: &serde_json::Value, tags: &mut Vec<String>) {
     match value {
         serde_json::Value::String(value) => {
-            for tag in value.split(|character| character == ',' || character == ' ') {
+            for tag in value.split([',', ' ']) {
                 let tag = tag.trim().trim_start_matches('#');
                 if !tag.is_empty() {
                     tags.push(tag.to_string());
@@ -947,7 +941,7 @@ fn append_nested(root: &mut BTreeMap<String, YamlVal>, path: &str, val: YamlVal)
 fn collect_tags_from_val(val: &YamlVal, tags: &mut Vec<String>) {
     match val {
         YamlVal::Str(s) => {
-            for part in s.split(|c| c == ',' || c == ' ') {
+            for part in s.split([',', ' ']) {
                 let t = part.trim().trim_start_matches('#');
                 if !t.is_empty() {
                     tags.push(t.to_string());

@@ -22,6 +22,11 @@ export type DvPage = {
     mtime: Date | null;
     ctime: Date | null;
     day: Date | null;
+    /** Size in bytes when known (index or filesystem). */
+    bytes?: number | null;
+    size?: number | null;
+    user?: string | null;
+    group?: string | null;
   };
   [key: string]: unknown;
 };
@@ -235,6 +240,111 @@ function luxonish(d: Date | null): Date | null {
   return d;
 }
 
+export type NoteFileInfo = {
+  path: string;
+  name: string;
+  folder: string;
+  link: string;
+  mtime: Date | null;
+  ctime: Date | null;
+  mdate: Date | null;
+  cdate: Date | null;
+  day: Date | null;
+  extension: string;
+  basename: string;
+  bytes: number | null;
+  size: number | null;
+  user: string | null;
+  group: string | null;
+  permissions: {
+    readable: boolean;
+    writable: boolean;
+    mode: number | null;
+  };
+};
+
+export type ThisNote = DvPage & {
+  file: NoteFileInfo;
+  path: string;
+  mdate: Date | null;
+  cdate: Date | null;
+  mtime: Date | null;
+  ctime: Date | null;
+  bytes?: number | null;
+  user?: string | null;
+  group?: string | null;
+};
+
+
+/** Build the note-level `this` object for DataviewJS. */
+export type NoteFileMeta = {
+  path: string;
+  bytes: number;
+  user?: string | null;
+  group?: string | null;
+  mode?: number | null;
+  mtime_ms?: number | null;
+  ctime_ms?: number | null;
+};
+
+export function makeThisNote(
+  page: DvPage,
+  ctx: EngineContext,
+  meta?: NoteFileMeta | null,
+): ThisNote {
+  const path = page.path || ctx.currentPath;
+  const name = page.file?.name || path.replace(/^.*\//, "").replace(/\.md$/i, "");
+  const folder = page.file?.folder ?? (path.includes("/") ? path.replace(/\/[^/]+$/, "") : "");
+  const extension = (path.match(/\.([^.]+)$/) || [, ""])[1] || "md";
+  const basename = name;
+  let mtime = page.file?.mtime ?? null;
+  let ctime = page.file?.ctime ?? null;
+  if (meta?.mtime_ms != null) mtime = new Date(meta.mtime_ms);
+  if (meta?.ctime_ms != null) ctime = new Date(meta.ctime_ms);
+  const pageBytes =
+    typeof page.file?.bytes === "number"
+      ? page.file.bytes
+      : typeof page.file?.size === "number"
+        ? page.file.size
+        : null;
+  const bytes = meta?.bytes ?? pageBytes;
+  const file: NoteFileInfo = {
+    path,
+    name,
+    folder,
+    link: page.file?.link || `[[${path.replace(/\.md$/i, "")}]]`,
+    mtime,
+    ctime,
+    mdate: mtime,
+    cdate: ctime,
+    day: page.file?.day ?? mtime,
+    extension,
+    basename,
+    bytes,
+    size: bytes,
+    user: meta?.user ?? null,
+    group: meta?.group ?? null,
+    permissions: {
+      readable: true,
+      writable: true,
+      mode: meta?.mode ?? null,
+    },
+  };
+  return {
+    ...page,
+    path,
+    file,
+    mdate: mtime,
+    cdate: ctime,
+    mtime,
+    ctime,
+    bytes,
+    user: meta?.user ?? null,
+    group: meta?.group ?? null,
+  };
+}
+
+
 export async function runScriptBlock(
   code: string,
   container: HTMLElement,
@@ -256,8 +366,19 @@ export async function runScriptBlock(
     (await ctx.loadPage(ctx.currentPath)) ?? stubPage(ctx.currentPath),
   );
 
+  // Note-level `this` (Obsidian Dataview-style). Bound as AsyncFunction `this`
+  // and also available as the explicit `note` argument.
+  let fileMeta: NoteFileMeta | null = null;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    fileMeta = await invoke<NoteFileMeta>("note_file_meta", { path: ctx.currentPath });
+  } catch {
+    fileMeta = null;
+  }
+  const thisNote = makeThisNote(current, ctx, fileMeta);
+
   const dv: DvApi = {
-    current: () => current,
+    current: () => thisNote,
     pages: (_source?: string) => {
       // sync facade — populated before AsyncFunction runs via preloaded
       return wrapList((dv as unknown as { _pages: DvPage[] })._pages || []);
@@ -427,6 +548,7 @@ export async function runScriptBlock(
           "date",
           "choice",
           "luxonish",
+          "note",
           `"use strict";\nreturn (${expression});`,
         );
       } catch {
@@ -438,6 +560,7 @@ export async function runScriptBlock(
           "date",
           "choice",
           "luxonish",
+          "note",
           `"use strict";\n${expression}`,
         );
       }
@@ -449,17 +572,19 @@ export async function runScriptBlock(
         "date",
         "choice",
         "luxonish",
+        "note",
         `"use strict";\n${code}`,
       );
     }
     const result = await fn.call(
-      current,
+      thisNote,
       dv,
       dateformat,
       dur,
       dv.date,
       choice,
       luxonish,
+      thisNote,
     );
     if (inline && outputs.length === 0 && result !== undefined) {
       pushHtml(stringifyInline(result));
@@ -572,6 +697,37 @@ export async function runDqlBlock(
 }
 
 /** Execute native read-only vault SQL and render it like every other query table. */
+
+/**
+ * Expand note-level references in page SQL before execution.
+ * Supports Dataview-style `this.file.path` / `this.path` and automation-style
+ * `{{active.path}}` placeholders. Values are single-quoted SQL string literals.
+ */
+export function expandSqlNoteRefs(sql: string, currentPath: string): string {
+  const lit = sqlStringLiteral(currentPath);
+  const folder = currentPath.includes("/")
+    ? currentPath.replace(/\/[^/]+$/, "")
+    : "";
+  const title = currentPath
+    .replace(/^.*\//, "")
+    .replace(/\.md$/i, "");
+  const folderLit = sqlStringLiteral(folder);
+  const titleLit = sqlStringLiteral(title);
+
+  return sql
+    .replace(/\bthis\.file\.path\b/gi, lit)
+    .replace(/\bthis\.path\b/gi, lit)
+    .replace(/\bthis\.file\.folder\b/gi, folderLit)
+    .replace(/\bthis\.file\.name\b/gi, titleLit)
+    .replace(/\{\{\s*active\.path\s*\}\}/gi, lit)
+    .replace(/\{\{\s*active\.folder\s*\}\}/gi, folderLit)
+    .replace(/\{\{\s*active\.title\s*\}\}/gi, titleLit);
+}
+
+function sqlStringLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 export async function runSqlBlock(
   code: string,
   container: HTMLElement,
@@ -579,7 +735,8 @@ export async function runSqlBlock(
 ): Promise<void> {
   queryDiagnostic("sql.invoke", { path: ctx.currentPath });
   try {
-    const result = await ctx.runSql(code);
+    const expanded = expandSqlNoteRefs(code, ctx.currentPath);
+    const result = await ctx.runSql(expanded);
     container.innerHTML = `<table class="dv-table sql-table"><thead><tr>${result.columns.map(
       (column) => `<th>${esc(column)}</th>`,
     ).join("")}</tr></thead><tbody>${result.rows.map((row) =>
@@ -833,6 +990,17 @@ function esc(s: string): string {
  * Replace script fences in HTML preview with placeholder divs, then execute.
  * Works on the original markdown to find blocks and inject into a container.
  */
+
+/** Run script fences found under a single preview subtree (e.g. one .md-block). */
+export async function executeBlocksInSubtree(
+  markdownSlice: string,
+  subtree: HTMLElement,
+  ctx: EngineContext,
+  shouldContinue: () => boolean = () => true,
+): Promise<void> {
+  return executeBlocksInPreview(markdownSlice, subtree, ctx, shouldContinue);
+}
+
 export async function executeBlocksInPreview(
   markdownBody: string,
   previewEl: HTMLElement,
@@ -905,14 +1073,20 @@ export async function executeBlocksInPreview(
     await runBlock(lang || "dataviewjs", source, mount);
   }
 
-  while (bi < blocks.length) {
-    if (!shouldContinue()) return;
-    const mount = document.createElement("div");
-    mount.className = "dv-block";
-    previewEl.appendChild(mount);
-    const block = blocks[bi++];
-    queryDiagnostic("executor.fallback", { index: bi - 1, lang: block.lang });
-    await runBlock(block.lang, block.code, mount);
+  // Intentionally no root-level fallback mounts.
+  // Older code appended leftover extractScriptBlocks() entries onto previewEl when
+  // the corresponding <pre><code> had already been turned into .dv-block in a
+  // *preserved* section. That stacked stale sql-error / result tables under the
+  // live query (e.g. ghost "near ID" next to a successful table).
+  // Blocks without a live <pre> are already rendered in a preserved .dv-block —
+  // leave them alone (surgical). Callers that replace an .md-block must run
+  // executeBlocksInPreview on that subtree so its new <pre> nodes execute.
+  if (bi < blocks.length) {
+    queryDiagnostic("executor.unmounted-blocks", {
+      remaining: blocks.length - bi,
+      total: blocks.length,
+      mounted: bi,
+    });
   }
   queryDiagnostic("executor.complete", { blocks: bi });
 }

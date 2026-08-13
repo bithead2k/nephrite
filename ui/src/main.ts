@@ -3,10 +3,11 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { NephriteEditor, type FoldRange } from "./editor";
-import { hydrateTableOfContents, renderPreview } from "./preview";
+import { hydrateTableOfContents, renderBlockHtml, renderPreview } from "./preview";
+import { planPreviewUpdate } from "./preview-blocks";
 import { PreviewWorkerClient } from "./preview-worker-client";
 import { patchPreviewHtml } from "./preview-patch";
-import { findBooleanPropertyEdit, splitFrontmatter } from "./frontmatter";
+import { findBooleanPropertyEdit, renderPropertiesHtml, splitFrontmatter } from "./frontmatter";
 import { splitWikilinkTarget } from "./wikilinks";
 import {
   buildTree,
@@ -28,6 +29,7 @@ import {
 } from "./kanban";
 import {
   executeBlocksInPreview,
+  executeBlocksInSubtree,
 } from "./dv-engine";
 import { makeEngineContext } from "./dv-context";
 import * as hooks from "./hooks";
@@ -62,6 +64,7 @@ import {
   withoutScrollSync,
 } from "./scroll-sync";
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
+import { bindKanbanCardPreview, dismissKanbanCardPreview } from "./kanban-card-preview";
 import { findTaskCheckboxEdit } from "./tasks";
 import { VimPowerlineClient } from "./vim-powerline";
 import {
@@ -188,6 +191,9 @@ const previewWork = new DeferredDocumentWork(PREVIEW_DELAY_MS);
 const previewRenderer = new PreviewWorkerClient();
 const vaultPreviewRefresh = new RefreshGate();
 let previewRevision = 0;
+/** Last markdown body committed to the preview (for trivial block patches). */
+let lastPreviewBody: string | null = null;
+let lastPreviewPath: string | null = null;
 let statusHintTimer: number | null = null;
 let autosaveTimer: number | null = null;
 let saveQueue: Promise<void> = Promise.resolve();
@@ -1202,6 +1208,117 @@ async function renderRightPane(text: string, revision: number) {
   rememberPropertiesFoldState(previewEl);
   const path = currentPath;
   const requestedAt = performance.now();
+
+  // Trivial edit path: same block structure → re-render only dirty blocks on the
+  // main thread. Full worker parse is the fallback when the document DTD shifts.
+  if (path && path === lastPreviewPath && lastPreviewBody != null) {
+    const plan = planPreviewUpdate(lastPreviewBody, text, splitFrontmatter);
+    if (plan.kind === "noop") {
+      return;
+    }
+    if (plan.kind === "yaml") {
+      // Frontmatter-only: refresh props; re-render + re-run fence-bearing body blocks.
+      const host = document.getElementById("preview-host");
+      const scrollTop = host?.scrollTop ?? 0;
+      const scrollLeft = host?.scrollLeft ?? 0;
+      const { yaml, hasFrontmatter } = splitFrontmatter(text);
+      const existingProps = previewEl.querySelector(":scope > .props-block");
+      if (hasFrontmatter || (yaml && yaml.trim())) {
+        const tpl = document.createElement("template");
+        tpl.innerHTML = renderPropertiesHtml(yaml ?? "").trim();
+        const node = tpl.content.firstElementChild;
+        if (node && existingProps) existingProps.replaceWith(node);
+        else if (node && !existingProps) previewEl.insertBefore(node, previewEl.firstChild);
+      } else if (existingProps) {
+        existingProps.remove();
+      }
+      previewEl.querySelectorAll(".dv-block, .dv-inline").forEach((el) => el.remove());
+      for (let index = 0; index < plan.blocks.length; index++) {
+        const block = plan.blocks[index];
+        if (!/```(?:sql|dataview|dataviewjs|js|javascript)/i.test(block)) continue;
+        const node = previewEl.querySelector(
+          `:scope > .md-block[data-block-index="${index}"]`,
+        ) as HTMLElement | null;
+        if (!node) continue;
+        const tpl = document.createElement("template");
+        tpl.innerHTML = renderBlockHtml(block, index).trim();
+        const fresh = tpl.content.firstElementChild as HTMLElement | null;
+        if (!fresh) continue;
+        node.replaceWith(fresh);
+        const dynCtx = makeEngineContext(path, text, (target) => void openWikilink(target));
+        void executeBlocksInSubtree(block, fresh, dynCtx, () =>
+          isPreviewRevisionCurrent(path, revision),
+        );
+      }
+      lastPreviewBody = text;
+      previewEl.dataset.previewPath = path;
+      if (host) {
+        host.scrollTop = scrollTop;
+        host.scrollLeft = scrollLeft;
+      }
+      bindPreviewContent(previewEl, path);
+      queryDiagnostic("preview.yaml-patch", { path, revision });
+      requestAnimationFrame(() => setupScrollSync());
+      return;
+    }
+    if (plan.kind === "patch" && previewEl.querySelector(":scope > .md-block")) {
+      const host = document.getElementById("preview-host");
+      const scrollTop = host?.scrollTop ?? 0;
+      const scrollLeft = host?.scrollLeft ?? 0;
+      const commitStarted = performance.now();
+      let replaced = 0;
+      for (const index of plan.changed) {
+        const existing = previewEl.querySelector(
+          `:scope > .md-block[data-block-index="${index}"]`,
+        );
+        if (!existing) {
+          // DOM out of sync with plan → full fallback
+          replaced = -1;
+          break;
+        }
+        const wrapper = document.createElement("template");
+        wrapper.innerHTML = renderBlockHtml(plan.blocks[index], index).trim();
+        const node = wrapper.content.firstElementChild;
+        if (!node) {
+          replaced = -1;
+          break;
+        }
+        existing.replaceWith(node);
+        replaced++;
+      }
+      if (replaced >= 0) {
+        if (host) {
+          host.scrollTop = scrollTop;
+          host.scrollLeft = scrollLeft;
+        }
+        lastPreviewBody = text;
+        previewEl.dataset.previewPath = path;
+        queryDiagnostic("preview.block-patch", {
+          path,
+          revision,
+          changed: plan.changed,
+          htmlCommitMs: Number((performance.now() - commitStarted).toFixed(1)),
+          roundTripMs: Number((performance.now() - requestedAt).toFixed(1)),
+        });
+        // Bind only; skip full dynamic re-run unless a dirty block has code fences.
+        bindPreviewContent(previewEl, path);
+        // Scoped dynamics: only re-execute fences inside the replaced .md-block nodes.
+        const dynCtx = makeEngineContext(path, text, (target) => void openWikilink(target));
+        for (const index of plan.changed) {
+          const node = previewEl.querySelector(
+            `:scope > .md-block[data-block-index="${index}"]`,
+          ) as HTMLElement | null;
+          if (!node?.querySelector("pre > code")) continue;
+          void executeBlocksInSubtree(plan.blocks[index], node, dynCtx, () =>
+            isPreviewRevisionCurrent(path, revision),
+          );
+        }
+        requestAnimationFrame(() => setupScrollSync());
+        return;
+      }
+    }
+  }
+
   let markup;
   try {
     markup = await previewRenderer.render(text);
@@ -1219,12 +1336,18 @@ async function renderRightPane(text: string, revision: number) {
     return;
   }
   const commitStarted = performance.now();
-  const patch = patchPreviewHtml(
-    previewEl,
-    markup.html,
-    previewEl.dataset.previewPath !== path,
-  );
-  previewEl.dataset.previewPath = path;
+  const forceFull = previewEl.dataset.previewPath !== path;
+  const host = document.getElementById("preview-host");
+  const scrollTop = host?.scrollTop ?? 0;
+  const scrollLeft = host?.scrollLeft ?? 0;
+  const patch = patchPreviewHtml(previewEl, markup.html, forceFull);
+  previewEl.dataset.previewPath = path ?? "";
+  lastPreviewBody = text;
+  lastPreviewPath = path;
+  if (host) {
+    host.scrollTop = scrollTop;
+    host.scrollLeft = scrollLeft;
+  }
   const htmlCommitMs = performance.now() - commitStarted;
   queryDiagnostic("preview.worker.complete", {
     path,
@@ -1245,8 +1368,16 @@ async function renderRightPane(text: string, revision: number) {
       codeElements: previewEl.querySelectorAll("pre > code").length,
       current: isPreviewRevisionCurrent(path, revision),
     });
-    bindPreviewContent(previewEl, path, false);
-    void renderDynamicPreview(text, path, revision, previewEl);
+    bindPreviewContent(previewEl, path);
+    void (async () => {
+      try {
+        await renderDynamicPreview(text, path, revision, previewEl);
+      } finally {
+        void hydrateNoteEmbeds(previewEl, path, {
+          openLink: (target) => void openWikilink(target),
+        }).catch((error) => console.warn("[note embed]", error));
+      }
+    })();
   } else {
     hydrateTableOfContents(previewEl);
   }
@@ -1326,7 +1457,7 @@ function bindExternalLinks(root: ParentNode) {
   });
 }
 
-function bindPreviewContent(root: HTMLElement, path: string, hydrate = true) {
+function bindPreviewContent(root: HTMLElement, path: string) {
   bindPropertiesFoldState(root, path);
   bindQueryUriLinks(root);
   bindExternalLinks(root);
@@ -1379,15 +1510,14 @@ function bindPreviewContent(root: HTMLElement, path: string, hydrate = true) {
       if (target) void openWikilink(target);
     });
   });
-  if (hydrate) {
-    void hydrateMarkdownImages(root, path)
-      .catch((error) => console.warn("[markdown image]", error));
-    void hydrateExcalidrawEmbeds(root, path, (drawingPath) => void openNote(drawingPath))
-      .then(() => hydrateNoteEmbeds(root, path, {
-        openLink: (target) => void openWikilink(target),
-      }))
-      .catch((error) => console.warn("[embed]", error));
-  }
+  // Embeds always — independent calls so one failure cannot skip the others.
+  void hydrateMarkdownImages(root, path)
+    .catch((error) => console.warn("[markdown image]", error));
+  void hydrateExcalidrawEmbeds(root, path, (drawingPath) => void openNote(drawingPath))
+    .catch((error) => console.warn("[excalidraw embed]", error));
+  void hydrateNoteEmbeds(root, path, {
+    openLink: (target) => void openWikilink(target),
+  }).catch((error) => console.warn("[note embed]", error));
   bindLinkPreviews(root, {
     fromPath: path,
     openLink: (target) => void openWikilink(target),
@@ -1449,6 +1579,7 @@ function isPreviewRevisionCurrent(path: string, revision: number): boolean {
 }
 
 function renderKanbanBoard(board: KanbanBoard) {
+  dismissKanbanCardPreview();
   const host = $("kanban");
   host.innerHTML = "";
   if (!board.isKanban || board.columns.length === 0) {
@@ -1643,6 +1774,10 @@ function renderKanbanBoard(board: KanbanBoard) {
       cardEl.addEventListener("dragend", () => cardEl.classList.remove("dragging"));
 
       cardEl.appendChild(label);
+      bindKanbanCardPreview(cardEl, card, {
+        fromPath: currentPath,
+        openLink: (target) => void openWikilink(target),
+      });
       list.appendChild(cardEl);
     });
 
@@ -2418,21 +2553,46 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Serializes openNote so tab clicks cannot interleave read/setDoc/save. */
+let openNoteChain: Promise<void> = Promise.resolve();
+let openNoteGeneration = 0;
+
 async function openNote(
   path: string,
   opts?: { skipDirtyPrompt?: boolean; fromSession?: boolean },
 ) {
+  const run = openNoteChain.then(() => openNoteSerialized(path, opts));
+  openNoteChain = run.catch((error) => {
+    console.error("[openNote]", error);
+  });
+  return run;
+}
+
+async function openNoteSerialized(
+  path: string,
+  opts?: { skipDirtyPrompt?: boolean; fromSession?: boolean },
+) {
   dismissLinkPreview();
+  dismissKanbanCardPreview();
+  // Cancel pending autosave before any await so it cannot fire mid-switch.
+  if (autosaveTimer != null) {
+    window.clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }
   if (!opts?.skipDirtyPrompt && dirty && currentPath) {
+    const savingPath = currentPath;
     await saveFile(true);
-    if (dirty) {
-      const discard = confirm(`Automatic save of ${currentPath} failed. Discard changes?`);
+    if (dirty && currentPath === savingPath) {
+      const discard = confirm(`Automatic save of ${savingPath} failed. Discard changes?`);
       if (!discard) return;
       dirty = false;
     }
   }
   rememberEditorFolds();
+  const generation = ++openNoteGeneration;
   const file = await invoke<OpenFile>("read_file", { path });
+  // A newer openNote won the race — do not clobber editor/path.
+  if (generation !== openNoteGeneration) return;
   currentPath = file.path;
   currentFileKind = mdFilesAll.find((entry) => entry.path === file.path)?.file_kind ??
     (file.path.toLowerCase().endsWith(".excalidraw") ? "excalidraw" :
@@ -2459,6 +2619,7 @@ async function openNote(
     try {
       drawingDocument = parseExcalidrawDocument(file.path, file.content);
       const drawingView = await ensureExcalidrawView();
+      if (generation !== openNoteGeneration) return;
       drawingView.open(file.path, drawingDocument.scene, (scene) => {
         if (currentPath !== file.path || currentFileKind !== "excalidraw") return;
         drawingContent = drawingDocument?.serialize(scene) ?? scene;
@@ -2782,25 +2943,45 @@ function scheduleAutosave() {
   }, AUTOSAVE_DELAY_MS);
 }
 
+type PendingSave = {
+  path: string;
+  kind: string;
+  content: string;
+  documentRevision: number | null;
+  automatic: boolean;
+};
+
 function saveFile(automatic = false): Promise<void> {
   if (autosaveTimer != null) {
     window.clearTimeout(autosaveTimer);
     autosaveTimer = null;
   }
-  const operation = saveQueue.then(() => performSave(automatic));
-  // Keep the queue usable even if an unexpected error escapes performSave.
+  // Snapshot identity + body NOW — never re-read currentPath/editor after await,
+  // or a tab switch can write journal text into another note.
+  if (!currentPath) return Promise.resolve();
+  if (currentFileKind === "markdown" && !editor) return Promise.resolve();
+  const pending: PendingSave = {
+    path: currentPath,
+    kind: currentFileKind,
+    content:
+      currentFileKind === "excalidraw"
+        ? drawingContent
+        : currentFileKind === "canvas"
+          ? canvasContent
+          : editor!.getDoc(),
+    documentRevision:
+      currentFileKind === "markdown" ? editor!.getDocumentRevision() : null,
+    automatic,
+  };
+  const operation = saveQueue.then(() => performSave(pending));
   saveQueue = operation.catch((error) => {
     console.error("[save queue]", error);
   });
   return operation;
 }
 
-async function performSave(automatic: boolean) {
-  if (!currentPath || (currentFileKind === "markdown" && !editor)) return;
-  const path = currentPath;
-  const kind = currentFileKind;
-  const content = kind === "excalidraw" ? drawingContent : kind === "canvas" ? canvasContent : editor!.getDoc();
-  const documentRevision = kind === "markdown" ? editor!.getDocumentRevision() : null;
+async function performSave(pending: PendingSave) {
+  const { path, kind, content, documentRevision, automatic } = pending;
   try {
     await invoke("write_file", { path, content });
   } catch (error) {
@@ -2810,13 +2991,14 @@ async function performSave(automatic: boolean) {
     if (!automatic) window.alert(`Save failed: ${message}`);
     return;
   }
-  const unchanged = currentPath === path && currentFileKind === kind && (
-    kind === "excalidraw"
+  const unchanged =
+    currentPath === path &&
+    currentFileKind === kind &&
+    (kind === "excalidraw"
       ? drawingContent === content
       : kind === "canvas"
         ? canvasContent === content
-      : editor?.getDocumentRevision() === documentRevision
-  );
+        : editor?.getDocumentRevision() === documentRevision);
   if (unchanged) dirty = false;
   updateChrome();
   await runAutomationLifecycle("onNoteSave");

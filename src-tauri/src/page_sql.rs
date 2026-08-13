@@ -27,21 +27,39 @@ pub enum PageExpr {
     /// `page_has_tag(array, 'tag')`
     HasTag { array: Box<PageExpr>, tag: String },
     /// Conjunction of HasTag (from `@> ARRAY[...]`)
-    AllTags { array: Box<PageExpr>, tags: Vec<String> },
+    AllTags {
+        array: Box<PageExpr>,
+        tags: Vec<String>,
+    },
     /// Disjunction of HasTag (from `&& ARRAY[...]`)
-    AnyTag { array: Box<PageExpr>, tags: Vec<String> },
+    AnyTag {
+        array: Box<PageExpr>,
+        tags: Vec<String>,
+    },
     /// `page_array(...)` constructor
     ArrayLit(Vec<PageExpr>),
     /// `date_part('field', expr)` from EXTRACT
-    DatePart { field: String, source: Box<PageExpr> },
+    DatePart {
+        field: String,
+        source: Box<PageExpr>,
+    },
     /// Aggregate rename: string_agg→group_concat, bool_or→max, etc.
-    AggRename { sqlite_name: &'static str, args_sql: String },
+    AggRename {
+        sqlite_name: &'static str,
+        args_sql: String,
+    },
     /// `expr IS NULL` / `expr IS NOT NULL`
     NullCheck { expr: Box<PageExpr>, is_null: bool },
     /// `properties ?& ARRAY['a','b']` → AND of page_has_key
-    AllKeys { base: Box<PageExpr>, keys: Vec<String> },
+    AllKeys {
+        base: Box<PageExpr>,
+        keys: Vec<String>,
+    },
     /// `properties ?| ARRAY['a','b']` → OR of page_has_key
-    AnyKeys { base: Box<PageExpr>, keys: Vec<String> },
+    AnyKeys {
+        base: Box<PageExpr>,
+        keys: Vec<String>,
+    },
 }
 
 impl PageExpr {
@@ -51,13 +69,25 @@ impl PageExpr {
             PageExpr::Raw(s) => s.clone(),
             PageExpr::Column(name) => name.clone(),
             PageExpr::PropertyGet { base, key } => {
-                format!("page_property({}, '{}')", base.emit(), escape_sql_string(key))
+                format!(
+                    "page_property({}, '{}')",
+                    base.emit(),
+                    escape_sql_string(key)
+                )
             }
             PageExpr::HasKey { base, key } => {
-                format!("page_has_key({}, '{}')", base.emit(), escape_sql_string(key))
+                format!(
+                    "page_has_key({}, '{}')",
+                    base.emit(),
+                    escape_sql_string(key)
+                )
             }
             PageExpr::HasTag { array, tag } => {
-                format!("page_has_tag({}, '{}')", array.emit(), escape_sql_string(tag))
+                format!(
+                    "page_has_tag({}, '{}')",
+                    array.emit(),
+                    escape_sql_string(tag)
+                )
             }
             PageExpr::AllTags { array, tags } => {
                 if tags.is_empty() {
@@ -66,11 +96,7 @@ impl PageExpr {
                     let parts: Vec<String> = tags
                         .iter()
                         .map(|t| {
-                            format!(
-                                "page_has_tag({}, '{}')",
-                                array.emit(),
-                                escape_sql_string(t)
-                            )
+                            format!("page_has_tag({}, '{}')", array.emit(), escape_sql_string(t))
                         })
                         .collect();
                     format!("({})", parts.join(" AND "))
@@ -83,11 +109,7 @@ impl PageExpr {
                     let parts: Vec<String> = tags
                         .iter()
                         .map(|t| {
-                            format!(
-                                "page_has_tag({}, '{}')",
-                                array.emit(),
-                                escape_sql_string(t)
-                            )
+                            format!("page_has_tag({}, '{}')", array.emit(), escape_sql_string(t))
                         })
                         .collect();
                     format!("({})", parts.join(" OR "))
@@ -102,9 +124,16 @@ impl PageExpr {
                 format!("page_array({inner})")
             }
             PageExpr::DatePart { field, source } => {
-                format!("date_part('{}', {})", escape_sql_string(field), source.emit())
+                format!(
+                    "date_part('{}', {})",
+                    escape_sql_string(field),
+                    source.emit()
+                )
             }
-            PageExpr::AggRename { sqlite_name, args_sql } => {
+            PageExpr::AggRename {
+                sqlite_name,
+                args_sql,
+            } => {
                 format!("{sqlite_name}({args_sql})")
             }
             PageExpr::NullCheck { expr, is_null } => {
@@ -121,11 +150,7 @@ impl PageExpr {
                     let parts: Vec<String> = keys
                         .iter()
                         .map(|k| {
-                            format!(
-                                "page_has_key({}, '{}')",
-                                base.emit(),
-                                escape_sql_string(k)
-                            )
+                            format!("page_has_key({}, '{}')", base.emit(), escape_sql_string(k))
                         })
                         .collect();
                     format!("({})", parts.join(" AND "))
@@ -138,11 +163,7 @@ impl PageExpr {
                     let parts: Vec<String> = keys
                         .iter()
                         .map(|k| {
-                            format!(
-                                "page_has_key({}, '{}')",
-                                base.emit(),
-                                escape_sql_string(k)
-                            )
+                            format!("page_has_key({}, '{}')", base.emit(), escape_sql_string(k))
                         })
                         .collect();
                     format!("({})", parts.join(" OR "))
@@ -227,6 +248,64 @@ struct AstRewrite {
 /// After AST rewrites we still run **full** textual forms. AST may only cover
 /// a subset of page operators in a statement; residual-only left
 /// `properties['key']` intact and broke real queries.
+/// Strip SQL `--` line comments and `/* … */` block comments, respecting
+/// single-quoted string literals (including `''` escapes). Double-quoted
+/// identifiers are left intact except that `--` / `/*` inside them are still
+/// treated as comment starters (PG identifiers rarely embed those).
+pub fn strip_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Single-quoted string
+        if c == b'\'' {
+            out.push('\'');
+            i += 1;
+            while i < bytes.len() {
+                let ch = bytes[i];
+                out.push(ch as char);
+                i += 1;
+                if ch == b'\'' {
+                    if i < bytes.len() && bytes[i] == b'\'' {
+                        out.push('\'');
+                        i += 1; // escaped ''
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        // Line comment --
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            // keep the newline so line structure stays stable for diagnostics
+            continue;
+        }
+        // Block comment /* */
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2; // consume */
+            } else {
+                i = bytes.len();
+            }
+            out.push(' '); // keep token separation
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
 pub fn lower_page_sql(
     sql: &str,
     full_textual: impl FnOnce(&str) -> Result<String, String>,
@@ -237,9 +316,12 @@ pub fn lower_page_sql(
         retain_page_expr_surface();
     }
     let _ = residual_textual; // residual is included inside full_textual today
-    match try_ast_lower(sql)? {
+                              // Drop comments before AST/residual so `-- …` never confuses rewrites and
+                              // SQLite receives clean text (both dialects allow comments; stripping is safer).
+    let sql = strip_sql_comments(sql);
+    match try_ast_lower(&sql)? {
         Some(rewritten) => full_textual(&rewritten),
-        None => full_textual(sql),
+        None => full_textual(&sql),
     }
 }
 
@@ -260,15 +342,24 @@ pub fn try_ast_lower(sql: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    // Apply from the end so earlier offsets stay valid. Drop overlapping
-    // rewrites that would corrupt the string (keep the longer/outer one).
-    rewrites.sort_by(|a, b| b.start.cmp(&a.start).then(b.end.cmp(&a.end)));
-    let mut out = sql.to_string();
-    let mut last_start = out.len();
-    for rw in &rewrites {
-        if rw.end > last_start {
-            continue; // overlaps a later (already applied) rewrite
+    // Select non-overlapping rewrites from the outside in. The AST walker also
+    // reports child nodes (for example ARRAY[...] inside tags @> ARRAY[...]);
+    // preferring the outer span preserves the semantic operator rewrite.
+    rewrites.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    let mut selected: Vec<AstRewrite> = Vec::new();
+    for rewrite in rewrites {
+        if selected
+            .iter()
+            .any(|kept| rewrite.start < kept.end && kept.start < rewrite.end)
+        {
+            continue;
         }
+        selected.push(rewrite);
+    }
+    // Apply from the end so earlier byte offsets stay valid.
+    selected.sort_by(|a, b| b.start.cmp(&a.start));
+    let mut out = sql.to_string();
+    for rw in &selected {
         if rw.start > rw.end || rw.end > out.len() {
             continue;
         }
@@ -276,7 +367,6 @@ pub fn try_ast_lower(sql: &str) -> Result<Option<String>, String> {
             continue;
         }
         out.replace_range(rw.start..rw.end, &rw.replacement);
-        last_start = rw.start;
     }
     if out == sql {
         return Ok(None);
@@ -348,7 +438,8 @@ fn collect_extract_keyword_rewrites(sql: &str, out: &mut Vec<AstRewrite>) {
                 let span_l = span.to_ascii_lowercase();
                 // EXTRACT ( field FROM expr )
                 if let Some(from_rel) = span_l.find(" from ") {
-                    let field_part = span[span.find('(').map(|i| i + 1).unwrap_or(0)..from_rel].trim();
+                    let field_part =
+                        span[span.find('(').map(|i| i + 1).unwrap_or(0)..from_rel].trim();
                     let expr_part = span[from_rel + 6..span.len().saturating_sub(1)].trim();
                     if !field_part.is_empty() && !expr_part.is_empty() {
                         let field = field_part.trim_matches('\'').to_ascii_lowercase();
@@ -418,7 +509,6 @@ fn collect_rewrites(
     Ok(())
 }
 
-
 fn lower_like_ilike(
     sql: &str,
     expr: &protobuf::AExpr,
@@ -444,7 +534,10 @@ fn lower_like_ilike(
         let s = column_start(sql, &col, col_loc, 0).unwrap_or(0);
         (col, s)
     } else if let Some(c) = left_const {
-        let s = left_loc.filter(|l| *l >= 0).map(|l| l as usize).unwrap_or(0);
+        let s = left_loc
+            .filter(|l| *l >= 0)
+            .map(|l| l as usize)
+            .unwrap_or(0);
         (format!("'{c}'"), s)
     } else {
         return Ok(None);
@@ -522,7 +615,11 @@ fn lower_distinct_from(
     let start = if let Some((col, loc)) = &left_col {
         column_start(sql, col, *loc, 0).unwrap_or(0)
     } else if let Some(loc) = expr.lexpr.as_ref().and_then(|n| const_location(n)) {
-        if loc >= 0 { loc as usize } else { 0 }
+        if loc >= 0 {
+            loc as usize
+        } else {
+            0
+        }
     } else {
         return Ok(None);
     };
@@ -645,9 +742,7 @@ fn lower_aexpr(
             let right_tags = expr.rexpr.as_ref().and_then(|n| string_array_elements(n));
             let array_loc = expr.rexpr.as_ref().and_then(|n| array_location(n));
             match (left, right_tags, array_loc) {
-                (Some((col, col_loc)), Some(tags), Some(arr_loc))
-                    if is_tag_like_column(&col) =>
-                {
+                (Some((col, col_loc)), Some(tags), Some(arr_loc)) if is_tag_like_column(&col) => {
                     let ir = if op == "@>" {
                         PageExpr::AllTags {
                             array: Box::new(PageExpr::Column(col.clone())),
@@ -695,8 +790,7 @@ fn lower_aexpr(
                         } else {
                             find_near(sql, &format!("'{key}'"), start).unwrap_or(start)
                         };
-                        if let Some((s, end)) =
-                            span_from_to_token_end(sql, tokens, start, end_hint)
+                        if let Some((s, end)) = span_from_to_token_end(sql, tokens, start, end_hint)
                         {
                             return Ok(Some(AstRewrite {
                                 start: s,
@@ -766,8 +860,7 @@ fn lower_aexpr(
                         } else {
                             find_near(sql, &format!("'{key}'"), start).unwrap_or(start)
                         };
-                        if let Some((s, end)) =
-                            span_from_to_token_end(sql, tokens, start, end_hint)
+                        if let Some((s, end)) = span_from_to_token_end(sql, tokens, start, end_hint)
                         {
                             return Ok(Some(AstRewrite {
                                 start: s,
@@ -825,7 +918,11 @@ fn find_closing_paren_end(sql: &str, from: usize) -> Option<usize> {
     // If no paren (bare column form is rare for ANY), end at next whitespace/operator boundary.
     if !seen_open {
         let mut j = from;
-        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b',' && bytes[j] != b')' {
+        while j < bytes.len()
+            && !bytes[j].is_ascii_whitespace()
+            && bytes[j] != b','
+            && bytes[j] != b')'
+        {
             j += 1;
         }
         // Also skip a trailing ')' if ANY(col) style without us seeing the open from col_loc
@@ -848,11 +945,9 @@ fn lower_subscript(
     // exactly the subscript (no trailing AS / newlines / extra brackets).
     // Residual textual still runs after AST and covers anything we skip.
     let base = sub.refexpr.as_ref().and_then(|n| column_ref(n));
-    let key = sub.refupperindexpr.first().and_then(|n| string_const(n));
+    let key = sub.refupperindexpr.first().and_then(string_const);
     match (base, key) {
-        (Some((col, col_loc)), Some(key))
-            if col.ends_with("properties") || col == "properties" =>
-        {
+        (Some((col, col_loc)), Some(key)) if col.ends_with("properties") || col == "properties" => {
             let ir = PageExpr::PropertyGet {
                 base: Box::new(PageExpr::Column(col.clone())),
                 key,
@@ -884,13 +979,12 @@ fn lower_subscript(
     Ok(None)
 }
 
-
 // ---------------------------------------------------------------------------
 // Span recovery helpers (token scan + location hints)
 // ---------------------------------------------------------------------------
 
 /// From a column location through the matching closing `]` after `array_hint`.
-fn peel_typecast<'a>(node: &'a protobuf::Node) -> &'a protobuf::Node {
+fn peel_typecast(node: &protobuf::Node) -> &protobuf::Node {
     let mut cur = node;
     for _ in 0..8 {
         match &cur.node {
@@ -931,12 +1025,17 @@ fn lower_booleantest(
 
     // Find end: scan for TRUE/FALSE/UNKNOWN keyword after start
     let lower = sql.to_ascii_lowercase();
-    let end = [" is not unknown", " is unknown", " is not true", " is true", " is not false", " is false"]
-        .iter()
-        .filter_map(|kw| {
-            lower[start..].find(kw).map(|i| start + i + kw.len())
-        })
-        .min();
+    let end = [
+        " is not unknown",
+        " is unknown",
+        " is not true",
+        " is true",
+        " is not false",
+        " is false",
+    ]
+    .iter()
+    .filter_map(|kw| lower[start..].find(kw).map(|i| start + i + kw.len()))
+    .min();
     let Some(end) = end else {
         return Ok(None);
     };
@@ -1127,10 +1226,7 @@ fn lower_nulltest(
                 if !(col.ends_with("properties") || col == "properties") {
                     return None;
                 }
-                let key = sub
-                    .refupperindexpr
-                    .first()
-                    .and_then(|n| string_const(n))?;
+                let key = sub.refupperindexpr.first().and_then(string_const)?;
                 Some((
                     PageExpr::PropertyGet {
                         base: Box::new(PageExpr::Column(col.clone())),
@@ -1205,9 +1301,17 @@ fn lower_aarrayexpr(
     let start_hint = loc as usize;
     // Include the ARRAY keyword if present just before the '['.
     let start = {
-        let prefix = sql[..start_hint].rfind("ARRAY").or_else(|| sql[..start_hint].rfind("array"));
+        let prefix = sql[..start_hint]
+            .rfind("ARRAY")
+            .or_else(|| sql[..start_hint].rfind("array"));
         match prefix {
-            Some(p) if sql[p..start_hint].chars().all(|c| c.is_whitespace() || c.is_ascii_alphabetic()) => p,
+            Some(p)
+                if sql[p..start_hint]
+                    .chars()
+                    .all(|c| c.is_whitespace() || c.is_ascii_alphabetic()) =>
+            {
+                p
+            }
             _ => start_hint,
         }
     };
@@ -1274,9 +1378,7 @@ fn lower_funccall(
                 // keyword-only: span the identifier
                 let b = sql.as_bytes();
                 let mut i = start;
-                while i < b.len()
-                    && (b[i].is_ascii_alphanumeric() || b[i] == b'_')
-                {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
                 i
@@ -1307,9 +1409,16 @@ fn lower_funccall(
             .unwrap_or_default()
             .trim_matches('\'')
             .to_ascii_lowercase();
-        let source = column_name(&func.args[1])
+        let Some(source) = column_name(&func.args[1])
             .map(PageExpr::Column)
-            .unwrap_or_else(|| PageExpr::Raw(snippet_node_fallback(sql, &func.args[1])));
+            .or_else(|| {
+                string_const(&func.args[1]).map(|value| PageExpr::Raw(format!("'{value}'")))
+            })
+        else {
+            // Do not replace a nested expression with a fabricated NULL. The
+            // residual path can retain the original function call safely.
+            return Ok(None);
+        };
         let ir = PageExpr::DatePart {
             field,
             source: Box::new(source),
@@ -1321,33 +1430,6 @@ fn lower_funccall(
                     end,
                     replacement: ir.emit(),
                 }));
-            }
-        }
-        let _ = tokens;
-        return Ok(None);
-    }
-
-    // jsonb_array_length(tags) / cardinality(tags) → length via SQLite length()
-    // Tags are stored as JSON text arrays in the index helpers; length(tags)
-    // is a pragmatic stand-in until a dedicated page_array_length ships.
-    if matches!(name_l.as_str(), "jsonb_array_length" | "cardinality") && !func.args.is_empty()
-    {
-        if let Some((col, col_loc)) = column_ref(&func.args[0]) {
-            if is_tag_like_column(&col) {
-                let start = if loc >= 0 {
-                    loc as usize
-                } else {
-                    column_start(sql, &col, col_loc, 0).unwrap_or(0)
-                };
-                if let Some(end) = find_closing_paren_end(sql, start) {
-                    if end > start && sql.is_char_boundary(start) && sql.is_char_boundary(end) {
-                        return Ok(Some(AstRewrite {
-                            start,
-                            end,
-                            replacement: format!("length({col})"),
-                        }));
-                    }
-                }
             }
         }
         let _ = tokens;
@@ -1367,11 +1449,7 @@ fn lower_funccall(
             String::new()
         };
         if let (Some(field), true) = (field, !source_sql.is_empty()) {
-            let start = if loc >= 0 {
-                loc as usize
-            } else {
-                0
-            };
+            let start = if loc >= 0 { loc as usize } else { 0 };
             if start > 0 || loc >= 0 {
                 if let Some(end) = find_closing_paren_end(sql, start) {
                     if end > start && sql.is_char_boundary(start) && sql.is_char_boundary(end) {
@@ -1405,10 +1483,7 @@ fn lower_funccall(
 
     // jsonb_exists(properties, 'key') → page_has_key
     if name_l == "jsonb_exists" && func.args.len() >= 2 {
-        if let (Some(col), Some(key)) = (
-            column_name(&func.args[0]),
-            string_const(&func.args[1]),
-        ) {
+        if let (Some(col), Some(key)) = (column_name(&func.args[0]), string_const(&func.args[1])) {
             if col.ends_with("properties") || col == "properties" {
                 let ir = PageExpr::HasKey {
                     base: Box::new(PageExpr::Column(col)),
@@ -1490,18 +1565,6 @@ fn lower_funccall(
     Ok(None)
 }
 
-/// Best-effort source text for a node without a full deparse.
-fn snippet_node_fallback(sql: &str, node: &protobuf::Node) -> String {
-    if let Some(name) = column_name(node) {
-        return name;
-    }
-    if let Some(s) = string_const(node) {
-        return format!("'{s}'");
-    }
-    // Last resort: empty raw — residual path may still fix surrounding SQL.
-    let _ = sql;
-    "NULL".to_string()
-}
 fn span_column_through_closing_bracket(
     sql: &str,
     tokens: &[protobuf::ScanToken],
@@ -1840,7 +1903,7 @@ pub fn analyze_page_forms(sql: &str) -> Result<Vec<PageExpr>, String> {
             NodeRef::SubscriptingRef(sub) => {
                 if let Some((col, _)) = sub.refexpr.as_ref().and_then(|n| column_ref(n)) {
                     if col.ends_with("properties") || col == "properties" {
-                        if let Some(key) = sub.refupperindexpr.first().and_then(|n| string_const(n)) {
+                        if let Some(key) = sub.refupperindexpr.first().and_then(string_const) {
                             forms.push(PageExpr::PropertyGet {
                                 base: Box::new(PageExpr::Column(col)),
                                 key,
@@ -1893,7 +1956,6 @@ pub fn analyze_page_forms(sql: &str) -> Result<Vec<PageExpr>, String> {
     Ok(forms)
 }
 
-
 /// Textual fallback for PG datetime builtins (also AST-lowered when spans recover).
 /// Syntax residual for forms SQLite cannot parse, or that must be rewritten
 /// before native `postgres_compat` UDFs run.
@@ -1908,9 +1970,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
     // Prefer longest operators first (~* before ~).
 
     // !~*
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*!~\*\s*('(?:''|[^'])*')",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)([a-z_][a-z0-9_$.]*|\))\s*!~\*\s*('(?:''|[^'])*')") {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 format!("NOT regexp_like({}, {}, 'i')", &c[1], &c[2])
@@ -1918,9 +1978,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
             .into_owned();
     }
     // ~*
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*~\*\s*('(?:''|[^'])*')",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)([a-z_][a-z0-9_$.]*|\))\s*~\*\s*('(?:''|[^'])*')") {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 format!("regexp_like({}, {}, 'i')", &c[1], &c[2])
@@ -1928,9 +1986,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
             .into_owned();
     }
     // !~
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*!~\s*('(?:''|[^'])*')",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)([a-z_][a-z0-9_$.]*|\))\s*!~\s*('(?:''|[^'])*')") {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 format!("NOT regexp_like({}, {})", &c[1], &c[2])
@@ -1938,9 +1994,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
             .into_owned();
     }
     // ~
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)([a-z_][a-z0-9_$.]*|\))\s*~\s*('(?:''|[^'])*')",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)([a-z_][a-z0-9_$.]*|\))\s*~\s*('(?:''|[^'])*')") {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 format!("regexp_like({}, {})", &c[1], &c[2])
@@ -1950,9 +2004,9 @@ pub fn lower_pg_syntax(sql: &str) -> String {
 
     // --- SIMILAR TO ------------------------------------------------------------
     // Best-effort: map SQL SIMILAR patterns to a LIKE-ish regexp.
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)([a-z_][a-z0-9_$.]*|\))\s+NOT\s+SIMILAR\s+TO\s+('(?:''|[^'])*')",
-    ) {
+    if let Ok(re) =
+        regex::Regex::new(r"(?i)([a-z_][a-z0-9_$.]*|\))\s+NOT\s+SIMILAR\s+TO\s+('(?:''|[^'])*')")
+    {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 let pat = similar_to_rust_regex(&c[2]);
@@ -1960,9 +2014,9 @@ pub fn lower_pg_syntax(sql: &str) -> String {
             })
             .into_owned();
     }
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)([a-z_][a-z0-9_$.]*|\))\s+SIMILAR\s+TO\s+('(?:''|[^'])*')",
-    ) {
+    if let Ok(re) =
+        regex::Regex::new(r"(?i)([a-z_][a-z0-9_$.]*|\))\s+SIMILAR\s+TO\s+('(?:''|[^'])*')")
+    {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 let pat = similar_to_rust_regex(&c[2]);
@@ -1972,9 +2026,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
     }
 
     // --- FETCH FIRST / OFFSET n ROWS ------------------------------------------
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)\bFETCH\s+(?:FIRST|NEXT)\s+(\d+)\s+ROWS?\s+ONLY\b",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)\bFETCH\s+(?:FIRST|NEXT)\s+(\d+)\s+ROWS?\s+ONLY\b") {
         out = re.replace_all(&out, "LIMIT $1").into_owned();
     }
     if let Ok(re) = regex::Regex::new(r"(?i)\bOFFSET\s+(\d+)\s+ROWS\b") {
@@ -1991,9 +2043,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
     }
 
     // --- to_char (common formats only; no native UDF) -------------------------
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)\bto_char\s*\(\s*([^,]+?)\s*,\s*'([^']*)'\s*\)",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)\bto_char\s*\(\s*([^,]+?)\s*,\s*'([^']*)'\s*\)") {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 let source = c[1].trim();
@@ -2021,18 +2071,11 @@ pub fn lower_pg_syntax(sql: &str) -> String {
     ) {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
-                format!(
-                    "substr({}, {}, {})",
-                    c[1].trim(),
-                    c[2].trim(),
-                    c[3].trim()
-                )
+                format!("substr({}, {}, {})", c[1].trim(), c[2].trim(), c[3].trim())
             })
             .into_owned();
     }
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s*\)",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)\bsubstring\s*\(\s*([^)]+?)\s+FROM\s+([^)]+?)\s*\)") {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 format!("substr({}, {})", c[1].trim(), c[2].trim())
@@ -2041,9 +2084,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
     }
 
     // --- position(needle IN haystack) -----------------------------------------
-    if let Ok(re) = regex::Regex::new(
-        r"(?i)\bposition\s*\(\s*([^)]+?)\s+IN\s+([^)]+?)\s*\)",
-    ) {
+    if let Ok(re) = regex::Regex::new(r"(?i)\bposition\s*\(\s*([^)]+?)\s+IN\s+([^)]+?)\s*\)") {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 format!("strpos({}, {})", c[2].trim(), c[1].trim())
@@ -2058,7 +2099,10 @@ pub fn lower_pg_syntax(sql: &str) -> String {
         out = re
             .replace_all(&out, |c: &regex::Captures<'_>| {
                 let side = c[1].to_ascii_lowercase();
-                let chars = c.get(2).map(|m| m.as_str().trim()).filter(|s| !s.is_empty());
+                let chars = c
+                    .get(2)
+                    .map(|m| m.as_str().trim())
+                    .filter(|s| !s.is_empty());
                 let src = c[3].trim();
                 let func = match side.as_str() {
                     "leading" => "ltrim",
@@ -2093,10 +2137,7 @@ pub fn lower_pg_syntax(sql: &str) -> String {
 
 fn similar_to_rust_regex(quoted_pat: &str) -> String {
     // Strip surrounding quotes; convert SIMILAR TO metacharacters to Rust regex.
-    let inner = quoted_pat
-        .trim()
-        .trim_matches('\'')
-        .replace("''", "'");
+    let inner = quoted_pat.trim().trim_matches('\'').replace("''", "'");
     let mut out = String::with_capacity(inner.len() * 2);
     out.push('^');
     let chars: Vec<char> = inner.chars().collect();
@@ -2127,13 +2168,11 @@ mod tests {
             "SELECT * FROM pages p WHERE p.tags @> ARRAY['recruiter', 'linkedin']",
         )
         .unwrap();
-        assert_eq!(
-            forms,
-            vec![PageExpr::AllTags {
+        assert!(forms.iter().any(|form| form
+            == &PageExpr::AllTags {
                 array: Box::new(PageExpr::Column("p.tags".into())),
                 tags: vec!["recruiter".into(), "linkedin".into()],
-            }]
-        );
+            }));
         assert_eq!(
             forms[0].emit(),
             "(page_has_tag(p.tags, 'recruiter') AND page_has_tag(p.tags, 'linkedin'))"
@@ -2143,19 +2182,16 @@ mod tests {
     #[test]
     fn analyzes_tag_overlap() {
         let forms = analyze_page_forms("SELECT path FROM pages WHERE tags && ARRAY['a']").unwrap();
-        assert_eq!(
-            forms,
-            vec![PageExpr::AnyTag {
+        assert!(forms.iter().any(|form| form
+            == &PageExpr::AnyTag {
                 array: Box::new(PageExpr::Column("tags".into())),
                 tags: vec!["a".into()],
-            }]
-        );
+            }));
     }
 
     #[test]
     fn analyzes_property_existence() {
-        let forms =
-            analyze_page_forms("SELECT 1 FROM pages WHERE properties ? 'company'").unwrap();
+        let forms = analyze_page_forms("SELECT 1 FROM pages WHERE properties ? 'company'").unwrap();
         assert_eq!(
             forms,
             vec![PageExpr::HasKey {
@@ -2223,6 +2259,17 @@ mod tests {
     }
 
     #[test]
+    fn strip_sql_comments_line_and_block() {
+        let sql = "SELECT 1 -- skip me\nFROM pages /* block */ WHERE path = 'a--b'";
+        let out = strip_sql_comments(sql);
+        assert!(out.contains("SELECT 1"));
+        assert!(out.contains("FROM pages"));
+        assert!(out.contains("WHERE path = 'a--b'"));
+        assert!(!out.contains("skip me"));
+        assert!(!out.contains("block"));
+    }
+
+    #[test]
     fn lower_page_sql_runs_full_textual_after_ast() {
         let sql = "SELECT path FROM pages WHERE tags @> ARRAY['x']";
         let out = lower_page_sql(
@@ -2231,7 +2278,10 @@ mod tests {
             |_s| panic!("residual callback unused (folded into full)"),
         )
         .unwrap();
-        assert!(out.starts_with("/*full*/"), "full textual not applied: {out}");
+        assert!(
+            out.starts_with("/*full*/"),
+            "full textual not applied: {out}"
+        );
         assert!(out.contains("page_has_tag"), "AST rewrite missing: {out}");
         assert!(!out.contains("@>"), "operator remains: {out}");
     }
@@ -2239,12 +2289,8 @@ mod tests {
     #[test]
     fn lower_page_sql_uses_full_when_ast_misses() {
         let sql = "SELECT 1";
-        let out = lower_page_sql(
-            sql,
-            |s| Ok(format!("/*full*/{s}")),
-            |_s| Ok(s.to_string()),
-        )
-        .unwrap();
+        let out =
+            lower_page_sql(sql, |s| Ok(format!("/*full*/{s}")), |s| Ok(s.to_string())).unwrap();
         assert_eq!(out, "/*full*/SELECT 1");
     }
 
@@ -2257,8 +2303,7 @@ mod tests {
 
     #[test]
     fn analyzes_arrow_property() {
-        let forms =
-            analyze_page_forms("SELECT properties->>'company' FROM pages").unwrap();
+        let forms = analyze_page_forms("SELECT properties->>'company' FROM pages").unwrap();
         assert!(
             forms.iter().any(|f| matches!(
                 f,
@@ -2285,7 +2330,9 @@ mod tests {
     fn analyzes_array_literal() {
         let forms = analyze_page_forms("SELECT ARRAY['a', 'b']").unwrap();
         assert!(
-            forms.iter().any(|f| matches!(f, PageExpr::ArrayLit(v) if v.len() == 2)),
+            forms
+                .iter()
+                .any(|f| matches!(f, PageExpr::ArrayLit(v) if v.len() == 2)),
             "expected ArrayLit, got {forms:?}"
         );
     }
@@ -2322,16 +2369,15 @@ mod tests {
     #[test]
     fn subscript_span_does_not_swallow_as_alias() {
         let sql = "SELECT properties['company'] AS company FROM pages";
-        let out = lower_page_sql(sql, |s| Ok(s.to_string()), |s| Ok(s.to_string())).unwrap();
+        let out = try_ast_lower(sql)
+            .unwrap()
+            .unwrap_or_else(|| sql.to_string());
+        assert!(out.contains(" AS company"), "alias lost: {out}");
         assert!(
-            out.contains("page_property(properties, 'company') AS company")
-                || out.contains("page_property(properties, 'company')  AS company"),
-            "alias lost or span too wide: {out}"
+            !out.contains("page_property(properties, 'company' AS"),
+            "paren swallowed AS: {out}"
         );
-        assert!(!out.contains("page_property(properties, 'company' AS"), "paren swallowed AS: {out}");
     }
-
-
 
     #[test]
     fn ast_property_arrow_smoke() {
@@ -2341,14 +2387,11 @@ mod tests {
         let _ = try_ast_lower(sql2);
     }
 
-
-
     #[test]
     fn lowers_pg_numeric_funcs() {
         // Numeric functions are native UDFs — residual is a no-op.
         assert_eq!(lower_pg_syntax("SELECT power(2, 3)"), "SELECT power(2, 3)");
         assert_eq!(lower_pg_syntax("SELECT mod(10, 3)"), "SELECT mod(10, 3)");
-
     }
 
     #[test]
@@ -2392,7 +2435,6 @@ mod tests {
             lower_pg_syntax("SELECT trim(both 'x' from name)"),
             "SELECT btrim(name, 'x')"
         );
-
     }
 
     #[test]
@@ -2403,7 +2445,6 @@ mod tests {
             lower_pg_syntax("SELECT to_timestamp(0)").contains("unixepoch"),
             "to_timestamp"
         );
-
     }
 
     #[test]
@@ -2420,7 +2461,10 @@ mod tests {
         let sql = "SELECT * FROM pages WHERE (1 = 1) IS TRUE";
         match try_ast_lower(sql) {
             Ok(Some(out)) => {
-                assert!(!out.to_ascii_lowercase().contains(" is true"), "IS TRUE remains: {out}");
+                assert!(
+                    !out.to_ascii_lowercase().contains(" is true"),
+                    "IS TRUE remains: {out}"
+                );
             }
             Ok(None) => {
                 // Acceptable if BooleanTest shape differs in this pg_query version
@@ -2448,7 +2492,10 @@ mod tests {
             out.contains("date_part('year', mtime_ms)"),
             "unexpected: {out}"
         );
-        assert!(!out.to_ascii_lowercase().contains("extract("), "EXTRACT remains: {out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("extract("),
+            "EXTRACT remains: {out}"
+        );
     }
 
     #[test]

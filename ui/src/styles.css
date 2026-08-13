@@ -2563,3 +2563,74 @@ body.resizing-panes .cm-editor {
   background: color-mix(in srgb, var(--accent, #5ecf9a) 35%, #1a2330);
   border-color: var(--accent, #5ecf9a);
 }
+
+
+/* Preview updates: avoid blank-frame flash on patch/rebuild */
+#preview-host {
+  scroll-behavior: auto;
+}
+#preview {
+  content-visibility: auto;
+  contain: layout style;
+}
+@supports (view-transition-name: none) {
+  #preview {
+    view-transition-name: nephrite-preview;
+  }
+}
+
+/* Logical preview sections for incremental DOM patching — no visual chrome */
+.preview > .md-section {
+  display: block;
+}
+
+
+/* —— Kanban card hover preview —— */
+.kanban-card-preview-popup {
+  position: fixed;
+  z-index: 1200;
+  width: min(420px, 92vw);
+  max-height: min(70vh, 560px);
+  overflow: auto;
+  padding: 0;
+  border: 1px solid var(--border, #3a3a42);
+  border-radius: 8px;
+  background: var(--bg-elevated, #1e1e24);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.kanban-card-preview-popup.visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+.kanban-card-preview-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0.55rem 0.85rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+  border-bottom: 1px solid var(--border, #3a3a42);
+  background: var(--bg-elevated, #1e1e24);
+}
+.kanban-card-preview-page {
+  padding: 0.75rem 0.9rem 1rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+.kanban-card-preview-page .props-block {
+  margin-bottom: 0.5rem;
+}
+.kanban-card-preview-loading,
+.kanban-card-preview-error {
+  padding: 0.85rem 1rem;
+  font-size: 0.9rem;
+  color: var(--muted, #9a9aa3);
+}
+.kanban-card-preview-error {
+  color: var(--danger, #e07070);
+}

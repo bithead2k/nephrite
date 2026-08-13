@@ -1,7 +1,0 @@
-//! File parsers that produce indexable facts.
-//! CM6/Lezer owns the editor-facing parse surface; this module extracts the
-//! source-positioned facts shared by every vault feature.
-
-mod markdown;
-
-pub use markdown::{parse_markdown, MarkdownFacts};
