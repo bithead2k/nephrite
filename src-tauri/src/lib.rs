@@ -95,9 +95,11 @@ pub struct PluginDescriptor {
     pub api_version: u32,
     pub min_app_version: Option<String>,
     pub source: String,
+    pub compatibility: String,
+    pub style: Option<String>,
 }
 
-const MAX_PLUGIN_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PLUGIN_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const PLUGIN_PERMISSIONS: &[&str] = &[
     "vault.read",
     "vault.write",
@@ -117,8 +119,6 @@ fn valid_plugin_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-/// Discover isolated plugins under `.nephrite/plugins/<id>/manifest.json`.
-/// The frontend never receives arbitrary host paths, only validated source.
 #[tauri::command]
 fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, String> {
     let root = {
@@ -130,7 +130,31 @@ fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, Str
             .canonicalize()
             .map_err(|error| error.to_string())?
     };
-    let plugin_root = root.join(".nephrite").join("plugins");
+    let mut plugins = discover_plugins(&root.join(".nephrite").join("plugins"), "nephrite")?;
+    let native_ids: HashSet<String> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
+    let enabled_obsidian: Option<HashSet<String>> =
+        std::fs::read_to_string(root.join(".obsidian").join("community-plugins.json"))
+            .ok()
+            .and_then(|source| serde_json::from_str::<Vec<String>>(&source).ok())
+            .map(|ids| ids.into_iter().collect());
+    let obsidian = discover_plugins(&root.join(".obsidian").join("plugins"), "obsidian")?;
+    plugins.extend(obsidian.into_iter().filter(|plugin| {
+        !native_ids.contains(&plugin.id)
+            && enabled_obsidian
+                .as_ref()
+                .map_or(true, |enabled| enabled.contains(&plugin.id))
+    }));
+    plugins.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    Ok(plugins)
+}
+
+/// Read validated, bundled plugin entrypoints. Both native Nephrite packages
+/// and already-installed Obsidian packages execute inside the same isolated
+/// frontend host; their compatibility name does not bypass permissions.
+fn discover_plugins(
+    plugin_root: &Path,
+    compatibility: &str,
+) -> Result<Vec<PluginDescriptor>, String> {
     if !plugin_root.is_dir() {
         return Ok(Vec::new());
     }
@@ -182,11 +206,25 @@ fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, Str
         let metadata = std::fs::metadata(&canonical_main).map_err(|error| error.to_string())?;
         if metadata.len() > MAX_PLUGIN_SOURCE_BYTES {
             return Err(format!(
-                "Plugin {} exceeds the 2 MiB source limit",
+                "Plugin {} exceeds the 16 MiB bundled source limit",
                 manifest.id
             ));
         }
-        let permissions = manifest.permissions.unwrap_or_default();
+        let permissions = manifest.permissions.unwrap_or_else(|| {
+            if compatibility == "obsidian" {
+                vec![
+                    "vault.read".into(),
+                    "vault.write".into(),
+                    "index.query".into(),
+                    "editor.read".into(),
+                    "editor.write".into(),
+                    "workspace.commands".into(),
+                    "workspace.views".into(),
+                ]
+            } else {
+                Vec::new()
+            }
+        });
         if let Some(permission) = permissions
             .iter()
             .find(|permission| !PLUGIN_PERMISSIONS.contains(&permission.as_str()))
@@ -206,9 +244,16 @@ fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, Str
             min_app_version: manifest.min_app_version,
             source: std::fs::read_to_string(&canonical_main)
                 .map_err(|error| format!("{}: {error}", canonical_main.display()))?,
+            compatibility: compatibility.to_string(),
+            style: {
+                let style_path = canonical_entry.join("styles.css");
+                std::fs::metadata(&style_path)
+                    .ok()
+                    .filter(|metadata| metadata.len() <= 2 * 1024 * 1024)
+                    .and_then(|_| std::fs::read_to_string(style_path).ok())
+            },
         });
     }
-    plugins.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
     Ok(plugins)
 }
 
@@ -4395,11 +4440,51 @@ pub fn run() {
 #[cfg(test)]
 mod sql_query_tests {
     use super::{
-        fts_query, is_conflict_status, next_recurrence_date, page_properties, recurring_task_lines,
-        run_readonly_sql, search_yaml_properties, translate_page_sql, translate_page_sql_residual,
-        vault_search_terms,
+        discover_plugins, fts_query, is_conflict_status, next_recurrence_date, page_properties,
+        recurring_task_lines, run_readonly_sql, search_yaml_properties, translate_page_sql,
+        translate_page_sql_residual, vault_search_terms,
     };
     use chrono::NaiveDate;
+
+    #[test]
+    fn discovers_native_and_obsidian_plugin_packages_with_distinct_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = directory.path().join("native").join("sample.native");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(
+            native.join("manifest.json"),
+            r#"{"id":"sample.native","name":"Native","version":"1.0","permissions":["vault.read"]}"#,
+        )
+        .unwrap();
+        std::fs::write(native.join("main.js"), "nephrite.onLoad(() => {});").unwrap();
+        let native_plugins =
+            discover_plugins(&directory.path().join("native"), "nephrite").unwrap();
+        assert_eq!(native_plugins[0].compatibility, "nephrite");
+        assert_eq!(native_plugins[0].permissions, ["vault.read"]);
+
+        let obsidian = directory.path().join("obsidian").join("sample-obsidian");
+        std::fs::create_dir_all(&obsidian).unwrap();
+        std::fs::write(
+            obsidian.join("manifest.json"),
+            r#"{"id":"sample-obsidian","name":"Obsidian","version":"2.0","minAppVersion":"1.5.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            obsidian.join("main.js"),
+            "const { Plugin } = require('obsidian'); module.exports = class extends Plugin {};",
+        )
+        .unwrap();
+        let obsidian_plugins =
+            discover_plugins(&directory.path().join("obsidian"), "obsidian").unwrap();
+        assert_eq!(obsidian_plugins[0].compatibility, "obsidian");
+        assert!(obsidian_plugins[0]
+            .permissions
+            .contains(&"vault.write".into()));
+        assert_eq!(
+            obsidian_plugins[0].min_app_version.as_deref(),
+            Some("1.5.0")
+        );
+    }
 
     #[test]
     fn full_text_terms_are_quoted_and_prefixed() {

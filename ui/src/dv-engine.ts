@@ -1,6 +1,7 @@
 import { marked } from "marked";
 import { bindQueryUriLinks, formatQueryUri } from "./query-uri";
 import { queryDiagnostic } from "./query-diagnostics";
+import { ObsidianApp, type AppFile } from "./app-api";
 
 /**
  * Nephrite JS view engine — DataviewJS-compatible surface for fenced blocks
@@ -599,6 +600,38 @@ export async function runScriptBlock(
   // once, then evaluate every source expression against that immutable snapshot.
   const all = (await ctx.loadPages()).map(normalizePage);
   (dv as unknown as { _pages: DvPage[] })._pages = all;
+  const app = new ObsidianApp({
+    listFiles: () => all.map((page): AppFile => ({
+      path: page.path,
+      name: page.file.name,
+      parent_path: page.file.folder,
+      file_kind: "markdown",
+      extension: "md",
+      basename: page.file.name,
+    })),
+    readFile: (path) => {
+      if (!ctx.readFile) throw new Error("Vault file access is unavailable in this view");
+      return ctx.readFile(path);
+    },
+    queryIndex: (sql) => ctx.runSql(sql),
+    pageMetadata: (path) => all.find((page) => linksEqual(page.path, path)) ?? null,
+    resolveLink: (link, sourcePath) => {
+      const page = findPage(all, link || sourcePath);
+      return page ? {
+        path: page.path,
+        name: page.file.name,
+        parent_path: page.file.folder,
+        file_kind: "markdown",
+        extension: "md",
+        basename: page.file.name,
+      } : null;
+    },
+    editorState: () => ({ path: ctx.currentPath, content: ctx.currentSource, selection: "" }),
+    openPath: (path) => ctx.resolveLink(path),
+    pluginInfo: (id) => id == null || id === "dataview" || id === "obsidian-dataview"
+      ? { id: "dataview", api: dv }
+      : null,
+  }, ["vault.read", "index.query", "editor.read"]);
 
   // Global helpers seen in vaults
   const dateformat = (d: unknown, fmt?: string) => {
@@ -679,6 +712,7 @@ export async function runScriptBlock(
           "luxonish",
           "note",
           "input",
+          "app",
           `"use strict";\nreturn (${expression});`,
         );
       } catch {
@@ -692,6 +726,7 @@ export async function runScriptBlock(
           "luxonish",
           "note",
           "input",
+          "app",
           `"use strict";\n${expression}`,
         );
       }
@@ -705,6 +740,7 @@ export async function runScriptBlock(
         "luxonish",
         "note",
         "input",
+        "app",
         `"use strict";\n${code}`,
       );
     }
@@ -718,6 +754,7 @@ export async function runScriptBlock(
       luxonish,
       thisNote,
       scriptInput,
+      app,
     );
     if (inline && outputs.length === 0 && result !== undefined) {
       pushHtml(stringifyInline(result));

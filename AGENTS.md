@@ -878,7 +878,7 @@ Fundamental Requirements — Status vs Gaps
 5. Tasks as a core facilityUsable partialIndexing of status, due/scheduled/start/done/created, recurrence, priority, tags; surgical checkbox edits; task dashboard with scoping. Gaps: fuller interactive editing UX, complete Obsidian Tasks syntax variants, richer grouping/views (by project, recurrence series, etc.), and tighter source-location navigation.
 6. Native template & automation engineEarly / limitedDeclarative .nephrite/automations.json (create/append/prepend/move/apply-template/open + lifecycle hooks) + safe Templater subset (tp.file.*, dates, frontmatter, prompts, includes, cursor). Gaps: no sandboxed execution of <%* JavaScript %>  (preserved with warning); no full user-defined JS functions or rich runtime; QuickAdd-style capture is only partially covered by the declarative layer.
 7. Excalidraw integrationDoneUpstream engine, vault files, embeds, editing, autosave, fonts bundled. Minor fidelity gaps possible with exotic Obsidian Excalidraw plugin files.
-8. Plugin architectureEarly v1Sandboxed iframe plugins under .nephrite/plugins/, manifest + permissions, limited host API (vault r/w, index.query, editor, commands, views). Gaps: no ES modules / package deps, narrow API surface, no settings UI or events model yet, no long-term stability guarantees, no Obsidian plugin compatibility (correctly non-goal for now).
+8. Plugin architectureCompatibility foundationThe compatibility target is importing the vast majority of plugins that use Obsidian's public API. Sandboxed iframe plugins use a shared permission-enforcing `NephriteApp` host. An inherited Obsidian `app` facade and `require("obsidian")` module cover common vault, metadata, workspace, command, settings, lifecycle, and file-manager primitives. Enabled `.obsidian/plugins/` packages are discovered directly. Gaps: main-preview processor wiring, complex workspace/settings projection, packaged CSS/assets, non-bundled dependencies, richer events, compatibility reporting, and long-term API stability.
 9. Git-friendly by designStrongHistory, restore, conflicts (ours/theirs), staging, upstream status, branches, patches. One explicit gap noted in code: full-file merge UI is not implemented.
 10. Open-source licensingDecidedAGPL-3.0-only. Consistent with the decision record.
 
@@ -891,7 +891,7 @@ Fundamental Requirements — Status vs Gaps
  - Phase 5 (Tasks) — Functional dashboard + surgical edits; advanced views, recurrence editing, and full syntax parity still needed.
  - Phase 6 (Templates & Automation) — Declarative + limited Templater only. Full native automation runtime + sandboxed JS is the largest product gap relative to the original vision.
  - Phase 7 (Excalidraw) — Done.
- - Phase 8 (Plugin API) — Scaffold exists; needs maturation before it can be considered a stable long-tail surface.
+ - Phase 8 (Plugin API) — Native permission host and broad Obsidian compatibility foundation exist. It needs renderer/view/event adapters and a published stability contract before most complex visual plugins can be considered portable.
 
 ## Additional Product Gaps Visible in the Worktree
 
@@ -901,7 +901,7 @@ Fundamental Requirements — Status vs Gaps
  - Block links, section embeds, rename/update of links — “Where practical” language in the docs; not yet at full Obsidian fidelity.
  - Templater JS — Intentionally limited for safety; the product vision wants sandboxed execution eventually. DataviewJS now has the full practical data/view API but still excludes Obsidian application internals.
  - Mobile — Explicit non-goal for initial release (architecture kept abstract).
- - Full Obsidian plugin API / Sync / proprietary formats — Correctly out of scope.
+ - Undocumented Obsidian internals, unrestricted Node/Electron access, Sync protocol, and proprietary formats remain out of scope. Public Obsidian plugin primitives are compatibility targets where they can delegate safely to Nephrite objects.
 
 ## Definition of Success (from AGENTS.md)
 
@@ -919,7 +919,7 @@ What still falls short for “mature local-first knowledge system” users:
 
  - DataviewJS scripts that depend on Obsidian application/plugin internals, or complex Templater scripts
  - Deep Tasks plugin workflows
- - Custom long-tail plugins that need richer host APIs
+ - Complex visual/editor plugins that need richer renderer, workspace, or event adapters
  - Very large vaults under continuous external mutation (reconcile robustness)
  - Pixel-perfect / 100 % syntax fidelity on every Obsidian edge case
   
@@ -927,7 +927,7 @@ What still falls short for “mature local-first knowledge system” users:
 
  - Deepen the automation/Templater runtime (sandboxed JS + richer declarative actions).
  - Task views + full syntax fidelity.
- - Plugin API surface expansion once the core abstractions stop moving.
+ - Wire Markdown processors, workspace views, settings, events, and packaged assets into the Obsidian compatibility host.
  - Continued preview/query/kanban hardening (the recent patch stream).
 
 The architecture and safety model are already aligned with the philosophy (“Markdown is storage. Everything else is a disposable interpretation”). The remaining work is mostly turning the solid foundations of v0.2 into the deeper, more complete product surfaces described in the original goals.

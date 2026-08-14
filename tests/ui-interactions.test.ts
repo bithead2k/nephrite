@@ -10,6 +10,7 @@ import {
 import { hydrateNoteEmbeds } from "../ui/src/note-embed";
 import { renderPreview } from "../ui/src/preview";
 import { applyAppearanceFonts, normalizeAppearanceFonts } from "../ui/src/appearance";
+import { pluginIframeDocument, type PluginDescriptor } from "../ui/src/plugin-host";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -32,6 +33,39 @@ Object.defineProperties(globalThis, {
 
 dom.window.HTMLElement.prototype.scrollIntoView = () => {};
 dom.window.alert = () => {};
+
+test("a bundled CommonJS Obsidian plugin receives the inherited app bootstrap", () => {
+  const descriptor: PluginDescriptor = {
+    id: "compat-smoke",
+    name: "Compatibility smoke test",
+    version: "1.0.0",
+    description: "",
+    permissions: ["vault.read", "editor.read"],
+    api_version: 1,
+    min_app_version: null,
+    compatibility: "obsidian",
+    source: `
+      const { Plugin } = require("obsidian");
+      module.exports = class extends Plugin {
+        onload() {
+          window.compatResult = {
+            paths: this.app.vault.getMarkdownFiles().map(file => file.path),
+            active: this.app.workspace.getActiveFile().path,
+            cache: this.app.metadataCache.getFileCache({ path: "People/Ada.md" }).properties,
+            link: this.app.fileManager.generateMarkdownLink({ path: "People/Ada.md" }, "Daily.md", "#Work", "Ada"),
+          };
+        }
+      };
+    `,
+  };
+  const document = pluginIframeDocument(descriptor);
+  assert.match(document, /window\.require = \(name\)/);
+  assert.match(document, /if \(name === "obsidian"\) return obsidian/);
+  assert.match(document, /const app = window\.app = Object\.freeze/);
+  assert.match(document, /generateMarkdownLink/);
+  assert.match(document, /window\.__startObsidianPlugin\(\)/);
+  assert.match(document, /module\.exports = class extends Plugin/);
+});
 
 test("appearance fonts are sanitized and applied independently", () => {
   const fonts = normalizeAppearanceFonts({

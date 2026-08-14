@@ -1,17 +1,15 @@
 import type { AppCommand } from "./command-bar";
 import type { FileEntry } from "./types";
+import {
+  ObsidianApp,
+  permissionForAppMethod,
+  type AppHostServices,
+  type AppPermission,
+} from "./app-api";
 
 export const PLUGIN_API_VERSION = 1;
 
-export type PluginPermission =
-  | "vault.read"
-  | "vault.write"
-  | "index.query"
-  | "editor.read"
-  | "editor.write"
-  | "workspace.commands"
-  | "workspace.views"
-  | "shell.execute";
+export type PluginPermission = AppPermission;
 
 export type PluginDescriptor = {
   id: string;
@@ -22,6 +20,8 @@ export type PluginDescriptor = {
   api_version: number;
   min_app_version: string | null;
   source: string;
+  compatibility?: "nephrite" | "obsidian";
+  style?: string | null;
 };
 
 export type PluginStatus = PluginDescriptor & {
@@ -30,16 +30,9 @@ export type PluginStatus = PluginDescriptor & {
   error: string | null;
 };
 
-export type PluginHostServices = {
+export type PluginHostServices = AppHostServices & {
   listFiles: () => readonly FileEntry[];
-  readFile: (path: string) => Promise<string>;
-  writeFile: (path: string, content: string) => Promise<void>;
-  queryIndex: (sql: string) => Promise<unknown>;
-  editorState: () => { path: string | null; content: string; selection: string };
-  replaceSelection: (content: string) => void;
-  openPath: (path: string) => Promise<void>;
   showView: (title: string, result: PluginViewResult) => void;
-  executeShell: (command: string, args: string[]) => Promise<unknown>;
 };
 
 export type PluginViewResult = { type?: "text" | "markdown"; content?: string } | string | null;
@@ -48,21 +41,8 @@ type Contribution = { id: string; title: string; keywords: string; pluginId: str
 type RpcRequest = { nephritePlugin: true; pluginId: string; type: "request"; requestId: number; method: string; args: unknown[] };
 type PluginMessage = RpcRequest | { nephritePlugin: true; pluginId: string; type: "ready" | "error"; message?: string };
 
-const METHOD_PERMISSIONS: Record<string, PluginPermission> = {
-  "vault.list": "vault.read",
-  "vault.read": "vault.read",
-  "vault.write": "vault.write",
-  "index.query": "index.query",
-  "editor.getState": "editor.read",
-  "editor.replaceSelection": "editor.write",
-  "workspace.open": "vault.read",
-  "workspace.registerCommand": "workspace.commands",
-  "workspace.registerView": "workspace.views",
-  "shell.execute": "shell.execute",
-};
-
 export function permissionForPluginMethod(method: string): PluginPermission | null {
-  return METHOD_PERMISSIONS[method] ?? null;
+  return permissionForAppMethod(method);
 }
 
 export function validatePluginDescriptor(plugin: PluginDescriptor): string | null {
@@ -74,7 +54,7 @@ export function validatePluginDescriptor(plugin: PluginDescriptor): string | nul
   return null;
 }
 
-function iframeDocument(plugin: PluginDescriptor): string {
+export function pluginIframeDocument(plugin: PluginDescriptor): string {
   const bootstrap = `
 (() => {
   "use strict";
@@ -83,6 +63,16 @@ function iframeDocument(plugin: PluginDescriptor): string {
   const views = new Map();
   const loadHandlers = [];
   const unloadHandlers = [];
+  let fileSnapshot = [];
+  let metadataSnapshot = new Map();
+  let resolvedLinksSnapshot = Object.create(null);
+  let activeFileSnapshot = null;
+  const eventHandlers = new Map();
+  const eventApi = Object.freeze({
+    on: (name, callback) => { const handlers = eventHandlers.get(name) || new Set(); handlers.add(callback); eventHandlers.set(name, handlers); return { name, callback }; },
+    offref: (reference) => eventHandlers.get(reference?.name)?.delete(reference?.callback),
+    trigger: (name, ...args) => { for (const callback of eventHandlers.get(name) || []) try { callback(...args); } catch (error) { console.error(error); } },
+  });
   let sequence = 0;
   const pending = new Map();
   const send = (method, args) => new Promise((resolve, reject) => {
@@ -100,16 +90,195 @@ function iframeDocument(plugin: PluginDescriptor): string {
     views.set(id, onOpen);
     return send("workspace.registerView", [id, name || title || id]);
   };
-  window.nephrite = Object.freeze({
+  const nephrite = Object.freeze({
     apiVersion: ${PLUGIN_API_VERSION},
     onLoad: (callback) => loadHandlers.push(callback),
     onUnload: (callback) => unloadHandlers.push(callback),
-    vault: Object.freeze({ list: () => send("vault.list", []), read: (path) => send("vault.read", [path]), write: (path, content) => send("vault.write", [path, content]) }),
+    vault: Object.freeze({
+      configDir: ".obsidian",
+      list: () => send("vault.list", []),
+      read: (path) => send("vault.read", [path]),
+      write: (path, content) => send("vault.write", [path, content]),
+      create: (path, content = "") => send("vault.create", [path, content]),
+      rename: (from, to) => send("vault.rename", [from, to]),
+      delete: (path) => send("vault.delete", [path]),
+    }),
     index: Object.freeze({ query: (sql) => send("index.query", [sql]) }),
     editor: Object.freeze({ getState: () => send("editor.getState", []), replaceSelection: (content) => send("editor.replaceSelection", [content]) }),
-    workspace: Object.freeze({ open: (path) => send("workspace.open", [path]), registerCommand, registerView }),
+    workspace: Object.freeze({
+      open: (path) => send("workspace.open", [path]),
+      getActiveFile: () => send("workspace.getActiveFile", []),
+      executeCommand: (id) => send("workspace.executeCommand", [id]),
+      registerCommand,
+      registerView,
+    }),
     shell: Object.freeze({ execute: (command, args = []) => send("shell.execute", [command, args]) }),
   });
+  window.nephrite = nephrite;
+  const pathOf = (file) => typeof file === "object" && file ? file.path : file;
+  const app = window.app = Object.freeze({
+    vault: Object.freeze({
+      configDir: ".obsidian",
+      getName: () => "Nephrite vault",
+      getMarkdownFiles: () => fileSnapshot.filter((file) => file.file_kind === "markdown" || /\\.md$/i.test(file.path)),
+      getFiles: () => fileSnapshot.slice(),
+      getAbstractFileByPath: (path) => fileSnapshot.find((file) => file.path === path) || null,
+      read: (file) => nephrite.vault.read(pathOf(file)),
+      cachedRead: (file) => nephrite.vault.read(pathOf(file)),
+      modify: (file, content) => nephrite.vault.write(pathOf(file), content),
+      create: nephrite.vault.create,
+      delete: (file) => nephrite.vault.delete(pathOf(file)),
+      rename: (file, to) => nephrite.vault.rename(pathOf(file), to),
+      on: eventApi.on,
+      offref: eventApi.offref,
+      adapter: Object.freeze({
+        read: nephrite.vault.read,
+        write: nephrite.vault.write,
+        exists: (path) => fileSnapshot.some((file) => file.path === path),
+        list: (folder) => ({
+          files: fileSnapshot.filter((file) => file.path.startsWith(String(folder).replace(/\\/$/, "") + "/")).map((file) => file.path),
+          folders: [],
+        }),
+      }),
+    }),
+    metadataCache: Object.freeze({
+      getFileCache: (file) => metadataSnapshot.get(pathOf(file)) || null,
+      getFirstLinkpathDest: (link, sourcePath) => {
+        const clean = String(link).split(/[|#^]/)[0].replace(/\\.md$/i, "").toLowerCase();
+        const sourceFolder = String(sourcePath || "").replace(/\\/[^/]*$/, "");
+        return fileSnapshot.find((file) => file.path.replace(/\\.md$/i, "").toLowerCase() === clean)
+          || fileSnapshot.find((file) => file.path.replace(/\\.md$/i, "").toLowerCase() === (sourceFolder ? sourceFolder + "/" + clean : clean))
+          || fileSnapshot.find((file) => file.path.replace(/^.*\\//, "").replace(/\\.md$/i, "").toLowerCase() === clean.replace(/^.*\\//, ""))
+          || null;
+      },
+      get resolvedLinks() { return resolvedLinksSnapshot; },
+      fileToLinktext: (file) => String(pathOf(file)).replace(/\.md$/i, ""),
+      on: eventApi.on,
+      offref: eventApi.offref,
+    }),
+    workspace: Object.freeze({
+      openLinkText: (link, sourcePath) => send("metadata.resolveLink", [link, sourcePath]).then((file) => file && nephrite.workspace.open(file.path)),
+      getActiveFile: () => activeFileSnapshot,
+      getLeaf: () => Object.freeze({ openFile: (file) => nephrite.workspace.open(pathOf(file)) }),
+      getLeavesOfType: () => [],
+      getActiveViewOfType: () => null,
+      onLayoutReady: (callback) => queueMicrotask(callback),
+      on: eventApi.on,
+      offref: eventApi.offref,
+    }),
+    fileManager: Object.freeze({
+      renameFile: (file, to) => nephrite.vault.rename(pathOf(file), to),
+      generateMarkdownLink: (file, _sourcePath, subpath = "", alias = "") => {
+        const target = String(pathOf(file)).replace(/\.md$/i, "") + String(subpath || "");
+        return "[[" + target + (alias ? "|" + alias : "") + "]]";
+      },
+    }),
+    commands: Object.freeze({ executeCommandById: nephrite.workspace.executeCommand }),
+    plugins: Object.freeze({
+      getPlugin: (id) => send("plugins.get", [id]),
+      getPlugins: () => send("plugins.get", []),
+    }),
+  });
+  const disposers = [];
+  class Component {
+    register(callback) { if (typeof callback === "function") disposers.push(callback); return callback; }
+    registerEvent(reference) { this.register(() => eventApi.offref(reference)); return reference; }
+    registerDomEvent(target, type, callback, options) {
+      target?.addEventListener?.(type, callback, options);
+      return this.register(() => target?.removeEventListener?.(type, callback, options));
+    }
+    registerInterval(id) { return this.register(() => clearInterval(id)); }
+    unload() { while (disposers.length) try { disposers.pop()?.(); } catch {} }
+  }
+  class TAbstractFile { constructor(path = "") { this.path = path; this.name = path.split("/").pop() || path; } }
+  class TFile extends TAbstractFile {
+    constructor(path = "") { super(path); this.extension = this.name.includes(".") ? this.name.split(".").pop() : ""; this.basename = this.extension ? this.name.slice(0, -(this.extension.length + 1)) : this.name; }
+  }
+  class TFolder extends TAbstractFile { constructor(path = "") { super(path); this.children = []; } }
+  class Notice { constructor(message) { console.info("[Obsidian Notice]", message); this.message = String(message); } hide() {} }
+  class Modal extends Component { constructor(app) { super(); this.app = app; this.contentEl = document.createElement("div"); } open() { this.onOpen?.(); } close() { this.onClose?.(); this.unload(); } }
+  class ItemView extends Component { constructor(leaf) { super(); this.leaf = leaf; this.containerEl = document.createElement("div"); this.contentEl = this.containerEl; } }
+  class MarkdownRenderChild extends Component { constructor(containerEl) { super(); this.containerEl = containerEl; } }
+  class MenuItem {
+    setTitle(value) { this.title = value; return this; }
+    setIcon(value) { this.icon = value; return this; }
+    setChecked(value) { this.checked = !!value; return this; }
+    setDisabled(value) { this.disabled = !!value; return this; }
+    onClick(callback) { this.callback = callback; return this; }
+  }
+  class Menu {
+    constructor() { this.items = []; }
+    addItem(callback) { const item = new MenuItem(); callback(item); this.items.push(item); return this; }
+    addSeparator() { return this; }
+    showAtMouseEvent() { return this; }
+    showAtPosition() { return this; }
+    hide() {}
+  }
+  class PluginSettingTab { constructor(app, plugin) { this.app = app; this.plugin = plugin; this.containerEl = document.createElement("div"); } display() {} hide() {} }
+  class Setting {
+    constructor(container) { this.settingEl = document.createElement("div"); container?.append?.(this.settingEl); }
+    setName(value) { this.name = value; return this; }
+    setDesc(value) { this.desc = value; return this; }
+    addText(callback) { const inputEl = document.createElement("input"); const control = { inputEl, setValue: (v) => (inputEl.value = v, control), setPlaceholder: (v) => (inputEl.placeholder = v, control), onChange: (fn) => (inputEl.addEventListener("input", () => fn(inputEl.value)), control) }; callback(control); return this; }
+    addToggle(callback) { const toggleEl = document.createElement("input"); toggleEl.type = "checkbox"; const control = { toggleEl, setValue: (v) => (toggleEl.checked = !!v, control), onChange: (fn) => (toggleEl.addEventListener("change", () => fn(toggleEl.checked)), control) }; callback(control); return this; }
+    addButton(callback) { const buttonEl = document.createElement("button"); const control = { buttonEl, setButtonText: (v) => (buttonEl.textContent = v, control), setCta: () => control, onClick: (fn) => (buttonEl.addEventListener("click", fn), control) }; callback(control); return this; }
+  }
+  class Plugin extends Component {
+    constructor(app, manifest) { super(); this.app = app; this.manifest = manifest; this._data = {}; }
+    addCommand(command) {
+      const callback = async () => {
+        const state = await nephrite.editor.getState().catch(() => ({ path: null, content: "", selection: "" }));
+        const editor = {
+          getValue: () => state.content,
+          getSelection: () => state.selection,
+          replaceSelection: (value) => nephrite.editor.replaceSelection(value),
+          getCursor: () => ({ line: 0, ch: 0 }),
+          setCursor: () => {},
+        };
+        if (typeof command.editorCallback === "function") return command.editorCallback(editor, null);
+        if (typeof command.checkCallback === "function") return command.checkCallback(false);
+        return command.callback?.();
+      };
+      return registerCommand({ ...command, name: command.name || command.id, callback });
+    }
+    registerView(type, creator) { return registerView({ id: type, name: type, onOpen: () => creator({ type, openFile: (file) => app.workspace.getLeaf().openFile(file) }) }); }
+    addRibbonIcon(_icon, _title, callback) { const el = document.createElement("button"); el.addEventListener("click", callback); return el; }
+    addStatusBarItem() { return document.createElement("span"); }
+    addSettingTab(tab) { return tab; }
+    registerMarkdownPostProcessor(processor) { this._postProcessor = processor; return processor; }
+    registerMarkdownCodeBlockProcessor(language, processor) { this._codeProcessors ||= new Map(); this._codeProcessors.set(language, processor); return processor; }
+    async loadData() { return (await send("plugins.loadData", [])) ?? {}; }
+    async saveData(value) { return send("plugins.saveData", [value ?? {}]); }
+  }
+  const obsidian = Object.freeze({
+    Plugin, Component, TAbstractFile, TFile, TFolder, Notice, Modal, ItemView,
+    MarkdownView: ItemView, MarkdownRenderChild, Menu, MenuItem, PluginSettingTab, Setting,
+    Platform: Object.freeze({ isDesktop: true, isDesktopApp: true, isMobile: false, isMobileApp: false }),
+    normalizePath: (path) => String(path).replace(/\\\\/g, "/").replace(/^\\.\\//, ""),
+    debounce: (callback, wait = 0) => { let timer; return (...args) => { clearTimeout(timer); timer = setTimeout(() => callback(...args), wait); }; },
+    MarkdownRenderer: Object.freeze({ render: async (_app, markdown, element) => { element.textContent = String(markdown); } }),
+    requestUrl: async () => { throw new Error("Network access is not granted by the app host"); },
+  });
+  const commonModule = { exports: {} };
+  window.module = commonModule;
+  window.exports = commonModule.exports;
+  window.require = (name) => {
+    if (name === "obsidian") return obsidian;
+    throw new Error("Unsupported external module: " + name);
+  };
+  window.__startObsidianPlugin = () => {
+    const exported = commonModule.exports?.default || commonModule.exports;
+    if (typeof exported !== "function") return;
+    const instance = new exported(window.app, ${JSON.stringify({
+      id: plugin.id,
+      name: plugin.name,
+      version: plugin.version,
+      minAppVersion: plugin.min_app_version,
+    })});
+    window.__obsidianPluginInstance = instance;
+    if (typeof instance.onload === "function") loadHandlers.push(() => instance.onload());
+    unloadHandlers.push(async () => { if (typeof instance.onunload === "function") await instance.onunload(); instance.unload?.(); });
+  };
   addEventListener("message", async (event) => {
     const message = event.data;
     if (!message || message.nephriteHost !== true || message.pluginId !== pluginId) return;
@@ -122,7 +291,22 @@ function iframeDocument(plugin: PluginDescriptor): string {
     }
     try {
       let result;
-      if (message.type === "load") for (const handler of loadHandlers) result = await handler();
+      if (message.type === "load") {
+        fileSnapshot = Array.isArray(message.files) ? message.files : [];
+        metadataSnapshot = new Map((Array.isArray(message.metadata) ? message.metadata : []).map((entry) => [entry.path, entry]));
+        resolvedLinksSnapshot = Object.create(null);
+        for (const entry of metadataSnapshot.values()) {
+          const counts = resolvedLinksSnapshot[entry.path] = Object.create(null);
+          for (const link of Array.isArray(entry.links) ? entry.links : []) {
+            const target = typeof link === "string" ? link : link?.path || link?.target || link?.link;
+            if (target) counts[target] = (counts[target] || 0) + 1;
+          }
+        }
+        activeFileSnapshot = message.activeFile || null;
+        for (const handler of loadHandlers) result = await handler();
+        eventApi.trigger("layout-ready");
+        eventApi.trigger("active-leaf-change", activeFileSnapshot);
+      }
       else if (message.type === "unload") for (const handler of unloadHandlers) result = await handler();
       else if (message.type === "command") result = await callbacks.get(message.id)?.();
       else if (message.type === "view") result = await views.get(message.id)?.();
@@ -133,8 +317,10 @@ function iframeDocument(plugin: PluginDescriptor): string {
   });
 })();`;
   const source = plugin.source.replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
-  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'">
-<script>${bootstrap}\ntry {\n${source}\nparent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"ready"},"*");\n} catch(error) { parent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"error",message:String(error)},"*"); }<\/script>`;
+  const style = (plugin.style ?? "").replace(/<\/style/gi, "<\\/style");
+  const startCompatibility = plugin.compatibility === "obsidian" ? "window.__startObsidianPlugin();" : "";
+  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"><style>${style}</style>
+<script>${bootstrap}\ntry {\n${source}\n${startCompatibility}\nparent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"ready"},"*");\n} catch(error) { parent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"error",message:String(error)},"*"); }<\/script>`;
 }
 
 class IsolatedPlugin {
@@ -144,13 +330,19 @@ class IsolatedPlugin {
   ready = false;
   private callbackSequence = 0;
   private callbacks = new Map<number, { resolve: (value: unknown) => void; reject: (reason: unknown) => void }>();
+  private app: ObsidianApp;
 
   constructor(readonly descriptor: PluginDescriptor, private services: PluginHostServices, private changed: () => void) {
+    this.app = new ObsidianApp({
+      ...services,
+      registerCommand: (id, title, keywords) => this.register(id, title, keywords, "command"),
+      registerView: (id, title) => this.register(id, title, "", "view"),
+    }, descriptor.permissions);
     this.iframe = document.createElement("iframe");
     this.iframe.hidden = true;
     this.iframe.sandbox.add("allow-scripts");
     this.iframe.title = `Nephrite plugin: ${descriptor.name}`;
-    this.iframe.srcdoc = iframeDocument(descriptor);
+    this.iframe.srcdoc = pluginIframeDocument(descriptor);
     document.body.appendChild(this.iframe);
   }
 
@@ -163,23 +355,7 @@ class IsolatedPlugin {
       nephriteHost: true, pluginId: this.descriptor.id, type: "response", requestId: message.requestId, result, error,
     }, "*");
     try {
-      const permission = permissionForPluginMethod(message.method);
-      if (!permission) throw new Error(`Unknown plugin API method: ${message.method}`);
-      if (!this.descriptor.permissions.includes(permission)) throw new Error(`Permission denied: ${permission}`);
-      const [first, second] = message.args;
-      let result: unknown;
-      switch (message.method) {
-        case "vault.list": result = this.services.listFiles(); break;
-        case "vault.read": result = await this.services.readFile(String(first)); break;
-        case "vault.write": result = await this.services.writeFile(String(first), String(second)); break;
-        case "index.query": result = await this.services.queryIndex(String(first)); break;
-        case "editor.getState": result = this.services.editorState(); break;
-        case "editor.replaceSelection": result = this.services.replaceSelection(String(first)); break;
-        case "workspace.open": result = await this.services.openPath(String(first)); break;
-        case "workspace.registerCommand": this.register(String(first), String(second), String(message.args[2] ?? ""), "command"); break;
-        case "workspace.registerView": this.register(String(first), String(second), "", "view"); break;
-        case "shell.execute": result = await this.services.executeShell(String(first), Array.isArray(second) ? second.map(String) : []); break;
-      }
+      const result = await this.app.call(message.method, ...message.args);
       reply(result);
     } catch (error) {
       reply(undefined, String(error));
@@ -196,7 +372,32 @@ class IsolatedPlugin {
     const requestId = ++this.callbackSequence;
     return new Promise((resolve, reject) => {
       this.callbacks.set(requestId, { resolve, reject });
-      this.iframe.contentWindow?.postMessage({ nephriteHost: true, pluginId: this.descriptor.id, type, id, requestId }, "*");
+      const dispatch = async () => {
+        const canRead = this.descriptor.permissions.includes("vault.read");
+        const canReadEditor = this.descriptor.permissions.includes("editor.read");
+        const [files, metadata] = type === "load" && canRead
+          ? await Promise.all([
+              this.services.listFiles(),
+              this.services.metadataSnapshot?.() ?? [],
+            ])
+          : [[], []];
+        this.iframe.contentWindow?.postMessage({
+          nephriteHost: true,
+          pluginId: this.descriptor.id,
+          type,
+          id,
+          requestId,
+          files,
+          metadata,
+          activeFile: type === "load" && canReadEditor
+            ? fileFromEditorState(this.services.editorState().path)
+            : null,
+        }, "*");
+      };
+      void dispatch().catch((error) => {
+        this.callbacks.delete(requestId);
+        reject(error);
+      });
     });
   }
 
@@ -215,11 +416,16 @@ class IsolatedPlugin {
   }
 }
 
+function fileFromEditorState(path: string | null) {
+  return path ? { path, name: path.replace(/^.*\//, "") } : null;
+}
+
 export class PluginManager {
   private plugins = new Map<string, IsolatedPlugin>();
   private descriptors: PluginDescriptor[] = [];
   private vaultKey = "";
   private listener = (event: MessageEvent) => this.onMessage(event);
+  private metadataSnapshot: readonly unknown[] | Promise<readonly unknown[]> | null = null;
 
   constructor(private services: PluginHostServices, private changed: () => void = () => {}) {
     window.addEventListener("message", this.listener);
@@ -229,12 +435,13 @@ export class PluginManager {
     await this.unload();
     this.descriptors = descriptors;
     this.vaultKey = vaultKey;
+    this.metadataSnapshot = this.services.metadataSnapshot?.() ?? [];
     for (const descriptor of descriptors) {
       const validation = validatePluginDescriptor(descriptor);
       if (validation) continue;
       if (localStorage.getItem(this.enabledKey(descriptor.id)) === "0") continue;
       if (!this.permissionsGranted(descriptor)) continue;
-      this.plugins.set(descriptor.id, new IsolatedPlugin(descriptor, this.services, this.changed));
+      this.plugins.set(descriptor.id, new IsolatedPlugin(descriptor, this.pluginServices(descriptor), this.changed));
     }
     this.changed();
   }
@@ -258,7 +465,7 @@ export class PluginManager {
     } else {
       const descriptor = this.descriptors.find((item) => item.id === id);
       if (descriptor && this.permissionsGranted(descriptor)) {
-        this.plugins.set(id, new IsolatedPlugin(descriptor, this.services, this.changed));
+        this.plugins.set(id, new IsolatedPlugin(descriptor, this.pluginServices(descriptor), this.changed));
       }
     }
     this.changed();
@@ -323,6 +530,19 @@ export class PluginManager {
   destroy() {
     void this.unload();
     window.removeEventListener("message", this.listener);
+  }
+
+  private pluginServices(descriptor: PluginDescriptor): PluginHostServices {
+    const dataKey = `nephrite.plugin.data:${this.vaultKey}:${descriptor.id}`;
+    return {
+      ...this.services,
+      metadataSnapshot: () => this.metadataSnapshot ?? [],
+      loadPluginData: () => {
+        try { return JSON.parse(localStorage.getItem(dataKey) ?? "null"); }
+        catch { return null; }
+      },
+      savePluginData: (value) => localStorage.setItem(dataKey, JSON.stringify(value ?? null)),
+    };
   }
 
   private enabledKey(id: string) { return `nephrite.plugin.enabled:${this.vaultKey}:${id}`; }

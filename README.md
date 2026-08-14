@@ -41,6 +41,8 @@ License: [AGPL-3.0](LICENSE)
   fields are preserved while nodes and edges remain indexed and searchable.
 - **Dataview** SQL-ish query language
 - **SQL** Actual SQL language largely based on PostgreSQL syntax.
+- **Plugins:** native permissioned plugins plus an Obsidian compatibility host
+  for enabled bundled plugins already installed in `.obsidian/plugins/`.
 
 ## Core features
 

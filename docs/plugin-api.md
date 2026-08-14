@@ -1,8 +1,9 @@
 # Nephrite plugin API v1
 
-Plugins live inside the vault at `.nephrite/plugins/<plugin-id>/`. Nephrite loads
-only folders containing a valid `manifest.json` and asks the user to approve the
-declared permissions before running the plugin.
+Native plugins live inside the vault at `.nephrite/plugins/<plugin-id>/`.
+Nephrite also discovers enabled packages already installed under
+`.obsidian/plugins/<plugin-id>/`. Both forms run in the same isolated host and
+require explicit permission approval.
 
 ```json
 {
@@ -20,7 +21,9 @@ Plugin JavaScript runs in a sandboxed iframe with no same-origin access, network
 access, filesystem access, or direct access to Nephrite's DOM. All host access
 goes through the frozen `nephrite` object and is checked against the manifest.
 The v1 loader accepts one self-contained classic JavaScript file; module imports
-and package dependencies are not yet supported.
+and package dependencies are not yet supported for native packages. Bundled
+Obsidian packages may use `require("obsidian")`; other external/Node modules are
+rejected by the compatibility loader.
 
 ```js
 nephrite.onLoad(async () => {
@@ -53,6 +56,11 @@ nephrite.onUnload(() => {
 | `workspace.commands` | `workspace.registerCommand(...)` |
 | `workspace.views` | `workspace.registerView(...)` |
 | `shell.execute` | `shell.execute(executable, args)` |
+
+The same host is also exposed through an Obsidian-shaped `app` facade. For
+example, `app.vault.read(file)` delegates to `nephrite.vault.read(file.path)`,
+and both calls pass through the identical `vault.read` permission and
+vault-relative path checks. See [`obsidian-plugin-compatibility.md`](obsidian-plugin-compatibility.md).
 
 A registered view supplies an async `onOpen` callback. It may return a string,
 or `{ type: "text" | "markdown", content: "..." }`. Markdown is rendered after

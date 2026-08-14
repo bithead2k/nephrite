@@ -64,6 +64,7 @@ import {
   validatePluginDescriptor,
   type PluginDescriptor,
 } from "../ui/src/plugin-host";
+import { NephriteApp, ObsidianApp, normalizeAppVaultPath } from "../ui/src/app-api";
 import { findInKanbanLane, kanbanCardSearchText } from "../ui/src/kanban-find";
 import {
   bindScrollSync,
@@ -996,6 +997,46 @@ test("plugin descriptors require a compatible API and methods map to explicit pe
     validatePluginDescriptor({ ...plugin, permissions: ["vault.read", "vault.read"] }) || "",
     /Duplicate/,
   );
+});
+
+test("Obsidian app aliases inherit Nephrite capability and path security", async () => {
+  const writes: unknown[][] = [];
+  const app = new ObsidianApp({
+    listFiles: () => [
+      { path: "People/Ada.md", name: "Ada.md", file_kind: "markdown" },
+      { path: "assets/photo.png", name: "photo.png", file_kind: "attachment" },
+    ],
+    readFile: async (path) => `read:${path}`,
+    writeFile: async (...args) => { writes.push(args); },
+    queryIndex: async () => ({ rows: [] }),
+    pageMetadata: async (path) => ({ path, frontmatter: { role: "engineer" } }),
+    resolveLink: async () => ({ path: "People/Ada.md", name: "Ada.md" }),
+    editorState: () => ({ path: "People/Ada.md", content: "", selection: "" }),
+    openPath: async () => {},
+  }, ["vault.read", "vault.write", "editor.read"]);
+  assert.ok(app instanceof NephriteApp);
+  const markdown = await app.vault.getMarkdownFiles() as Array<{ path: string }>;
+  assert.deepEqual(markdown.map((file) => file.path), ["People/Ada.md"]);
+  assert.equal(await app.vault.cachedRead({ path: "People/Ada.md" }), "read:People/Ada.md");
+  await app.vault.modify({ path: "People/Ada.md" }, "updated");
+  assert.deepEqual(writes, [["People/Ada.md", "updated"]]);
+  assert.deepEqual(await app.metadataCache.getFileCache({ path: "People/Ada.md" }), {
+    path: "People/Ada.md", frontmatter: { role: "engineer" },
+  });
+  assert.equal(app.metadataCache.fileToLinktext({ path: "People/Ada.md" }), "People/Ada");
+  assert.equal(
+    app.fileManager.generateMarkdownLink({ path: "People/Ada.md" }, "Daily.md", "#Work", "Ada"),
+    "[[People/Ada#Work|Ada]]",
+  );
+  assert.throws(() => app.vault.read("../outside.md"), /cannot escape/);
+  assert.throws(() => app.vault.read(".nephrite/index.db"), /not plugin data/);
+  assert.throws(() => normalizeAppVaultPath("/etc/passwd"), /vault-relative/);
+
+  const readOnly = new ObsidianApp({
+    listFiles: () => [], readFile: async () => "", queryIndex: async () => null,
+    editorState: () => ({ path: null, content: "", selection: "" }), openPath: async () => {},
+  }, ["vault.read"]);
+  assert.throws(() => readOnly.vault.modify("Note.md", "bad"), /Permission denied: vault.write/);
 });
 
 test("YAML and query results share field-aware URI and MIME detection", () => {

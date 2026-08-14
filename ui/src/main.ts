@@ -865,7 +865,36 @@ async function renderShell() {
       if (path === currentPath) await openNote(path, { skipDirtyPrompt: true });
       await refreshTree();
     },
+    createFile: async (path, content) => {
+      await invoke("create_file", { path, content });
+      await refreshTree();
+    },
+    renamePath: async (from, to) => {
+      if (from === currentPath && dirty) throw new Error("Save or discard current edits before a plugin renames this file");
+      await invoke("rename_path", { from, to });
+      if (from === currentPath) await openNote(to, { skipDirtyPrompt: true });
+      await refreshTree();
+    },
+    deletePath: async (path) => {
+      if (path === currentPath && dirty) throw new Error("Save or discard current edits before a plugin deletes this file");
+      await invoke("delete_path", { path });
+      await refreshTree();
+    },
     queryIndex: (sql) => invoke("query_vault_sql", { sql }),
+    pageMetadata: async (path) => {
+      const rows = await invoke<Array<Record<string, unknown>>>("list_pages", { source: null });
+      return rows.find((row) => row.path === path || row.path === `${path}.md`) ?? null;
+    },
+    metadataSnapshot: () => invoke<Array<Record<string, unknown>>>("list_pages", { source: null }),
+    resolveLink: async (link, sourcePath) => {
+      const path = await invoke<string | null>("resolve_wikilink", { target: link, fromPath: sourcePath });
+      return path ? mdFilesAll.find((file) => file.path === path) ?? {
+        path,
+        name: path.replace(/^.*\//, ""),
+        parent_path: path.includes("/") ? path.replace(/\/[^/]+$/, "") : "",
+        file_kind: "markdown",
+      } : null;
+    },
     editorState: () => ({
       path: currentPath,
       content: currentFileKind === "markdown" ? editor?.getDoc() ?? "" : "",
@@ -876,6 +905,15 @@ async function renderShell() {
       editor.replaceSelection(content);
     },
     openPath: (path) => openNote(path),
+    executeCommand: async (id) => {
+      const command = commandCatalog(false).find((candidate) => candidate.id === id);
+      if (!command) throw new Error(`Unknown command: ${id}`);
+      await command.run();
+    },
+    pluginInfo: (id) => {
+      const statuses = pluginManager?.statuses() ?? [];
+      return id == null ? statuses : statuses.find((plugin) => plugin.id === id) ?? null;
+    },
     showView: showPluginView,
     executeShell: (command, args) => invoke("shell_command", {
       command: [command, ...args].map(shellArgument).join(" "), cwd: null, timeoutMs: 60_000,
@@ -3471,7 +3509,7 @@ function renderPreferencesPlugins() {
     toggle.type = "checkbox";
     toggle.checked = plugin.enabled;
     const name = document.createElement("span");
-    name.textContent = `${plugin.name} ${plugin.version}`;
+    name.textContent = `${plugin.name} ${plugin.version}${plugin.compatibility === "obsidian" ? " · Obsidian" : ""}`;
     const state = document.createElement("small");
     state.textContent = plugin.error || (plugin.loaded ? "Loaded" : plugin.enabled ? "Starting" : "Disabled");
     toggle.addEventListener("change", () => void pluginManager?.setEnabled(plugin.id, toggle.checked).then(renderPreferencesPlugins));

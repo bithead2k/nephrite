@@ -147,6 +147,9 @@ dv.paragraph(csv.name.join(", "));
 const result = await dv.tryQuery("LIST file.name\\nFROM #interviewer");
 dv.paragraph(result.values.join(", "));
 await dv.view("views/person", { name: "Naruto" });
+dv.paragraph((await app.vault.getMarkdownFiles()).length);
+dv.paragraph(app.workspace.getActiveFile().path);
+dv.paragraph((await app.metadataCache.getFileCache({ path: "people/Josh Flanders.md" })).company);
 `, mount, context());
   assert.match(mount.textContent ?? "", /Brady Gunter, Josh Flanders/);
   assert.match(mount.textContent ?? "", /2/);
@@ -154,6 +157,8 @@ await dv.view("views/person", { name: "Naruto" });
   assert.match(mount.textContent ?? "", /Ada, Grace/);
   assert.match(mount.textContent ?? "", /Josh Flanders/);
   assert.match(mount.textContent ?? "", /Naruto/);
+  assert.match(mount.textContent ?? "", /people\/Brady Gunter\.md/);
+  assert.match(mount.textContent ?? "", /Acme/);
   assert.equal(mount.querySelector(".dv-error"), null);
 });
 
