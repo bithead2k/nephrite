@@ -12,6 +12,7 @@ pub struct MarkdownFacts {
     pub links: Vec<LinkFact>,
     pub tags: Vec<TagFact>,
     pub tasks: Vec<TaskFact>,
+    pub inline_fields: Vec<InlineFieldFact>,
     pub body_for_fts: String,
     pub heading_texts_for_fts: String,
 }
@@ -81,6 +82,17 @@ pub struct TaskFact {
     pub priority: Option<String>,
     pub recurrence: Option<String>,
     pub tags_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineFieldFact {
+    pub field_id: i64,
+    pub key: String,
+    pub value_text: Option<String>,
+    pub value_type: String,
+    pub value_json: String,
+    pub line: i64,
+    pub start_offset: i64,
 }
 
 pub fn parse_markdown(content: &str) -> MarkdownFacts {
@@ -163,6 +175,8 @@ fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
     let mut heading_id = 0i64;
     let mut link_id = 0i64;
     let mut task_id = 0i64;
+    let mut field_id = 0i64;
+    let mut inline_field_fence: Option<char> = None;
     let mut line_no = 0i64;
     let mut fts_body = String::new();
     let mut fts_headings = String::new();
@@ -173,6 +187,29 @@ fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
         let abs = (body_start + rel_off) as i64;
         let line = line_with_nl.trim_end_matches(['\r', '\n']);
         let line_end = abs + line_with_nl.len() as i64;
+        let trimmed = line.trim_start();
+        let fence = if trimmed.starts_with("```") {
+            Some('`')
+        } else if trimmed.starts_with("~~~") {
+            Some('~')
+        } else {
+            None
+        };
+        if let Some(marker) = fence {
+            inline_field_fence = if inline_field_fence == Some(marker) {
+                None
+            } else if inline_field_fence.is_none() {
+                Some(marker)
+            } else {
+                inline_field_fence
+            };
+        } else if inline_field_fence.is_none() {
+            for mut field in parse_inline_fields(line, abs, line_no) {
+                field_id += 1;
+                field.field_id = field_id;
+                facts.inline_fields.push(field);
+            }
+        }
 
         // Headings
         if let Some((level, text)) = parse_heading(line) {
@@ -234,6 +271,81 @@ fn parse_body(body: &str, body_start: usize, facts: &mut MarkdownFacts) {
 
     facts.body_for_fts = fts_body;
     facts.heading_texts_for_fts = fts_headings;
+}
+
+fn parse_inline_fields(line: &str, line_offset: i64, line_no: i64) -> Vec<InlineFieldFact> {
+    let mut fields = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = line[cursor..].find("::") {
+        let marker = cursor + relative;
+        let prefix = &line[..marker];
+        let (key_start, closing) = match (prefix.rfind('['), prefix.rfind('(')) {
+            (Some(square), Some(round)) if square > round => (square + 1, Some(']')),
+            (Some(_), Some(round)) => (round + 1, Some(')')),
+            (Some(square), None) => (square + 1, Some(']')),
+            (None, Some(round)) => (round + 1, Some(')')),
+            _ => (0, None),
+        };
+        let key = prefix[key_start..]
+            .trim()
+            .trim_start_matches(['-', '*', '+'])
+            .trim();
+        if key.is_empty() || key.contains("::") {
+            cursor = marker + 2;
+            continue;
+        }
+        let value_start = marker + 2;
+        let value_end = closing
+            .and_then(|delimiter| {
+                find_inline_close(&line[value_start..], delimiter).map(|index| value_start + index)
+            })
+            .unwrap_or(line.len());
+        let raw_value = line[value_start..value_end].trim();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(raw_value)
+            .unwrap_or_else(|_| serde_yaml::Value::String(raw_value.to_string()));
+        let json = serde_json::to_value(&yaml).unwrap_or(serde_json::Value::Null);
+        let value_type = match json {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+            serde_json::Value::String(ref value) if value.starts_with("[[") => "link",
+            serde_json::Value::String(_) => "string",
+        };
+        fields.push(InlineFieldFact {
+            field_id: 0,
+            key: key.to_string(),
+            value_text: match &json {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(value) => Some(value.clone()),
+                value => Some(value.to_string()),
+            },
+            value_type: value_type.to_string(),
+            value_json: json.to_string(),
+            line: line_no,
+            start_offset: line_offset + key_start as i64,
+        });
+        cursor = if closing.is_some() {
+            value_end.saturating_add(1).min(line.len())
+        } else {
+            line.len()
+        };
+    }
+    fields
+}
+
+fn find_inline_close(value: &str, delimiter: char) -> Option<usize> {
+    for (index, character) in value.char_indices() {
+        if character != delimiter {
+            continue;
+        }
+        let next = value[index + character.len_utf8()..].chars().next();
+        if next != Some(delimiter) {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn parse_heading(line: &str) -> Option<(i64, String)> {
@@ -1083,5 +1195,18 @@ See ![[Other#Section]] and [[Note|alias]].
         assert_eq!(task.scheduled.as_deref(), Some("2026-08-10"));
         assert_eq!(task.due.as_deref(), Some("2026-08-12"));
         assert_eq!(task.tags_json.as_deref(), Some("[\"admin\"]"));
+    }
+
+    #[test]
+    fn extracts_typed_dataview_inline_fields() {
+        let facts = parse_markdown(
+            "Rating:: 5\nPublished:: true\nSkills:: [sql, rust]\nText [Contact:: [[Ada Lovelace]]] and (Mood:: happy)\n```text\nIgnored:: yes\n```\n",
+        );
+        assert_eq!(facts.inline_fields.len(), 5);
+        assert_eq!(facts.inline_fields[0].value_type, "number");
+        assert_eq!(facts.inline_fields[1].value_type, "boolean");
+        assert_eq!(facts.inline_fields[2].value_json, "[\"sql\",\"rust\"]");
+        assert_eq!(facts.inline_fields[3].key, "Contact");
+        assert_eq!(facts.inline_fields[4].value_text.as_deref(), Some("happy"));
     }
 }

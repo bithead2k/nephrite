@@ -192,7 +192,7 @@ Read-only PostgreSQL-compatible SQL over the vault index (`docs/decisions.md`). 
 
 ### Dataview compatibility
 
-Translate common Dataview DQL into the internal query IR later—not as the internal architecture.
+Dataview DQL and DataviewJS compatibility are implemented over the shared disposable index, not as the internal architecture. The supported query types, clauses, source selectors, page fields, and scripting API are documented in [`dataview.md`](dataview.md).
 
 ### DataviewJS-class power without insane blocks
 
@@ -202,7 +202,7 @@ Users want **programmatic views** (what DataviewJS provides) without:
 - copy-pasted query soup,
 - or a second half-documented runtime bolted on sideways.
 
-**Direction:** support something with the **power of DataviewJS directly in the engine**—a deliberate, documented scripting surface (sandboxed) that can read the index, produce views, and run from clear entry points—not “parse random JS out of Markdown with folklore.”
+**Direction:** retain the compatible fenced and inline entry points while moving long-lived automation toward a deliberate, permissioned scripting surface. DataviewJS reads the shared index and vault API rather than maintaining a second private cache.
 
 Details (language host, sandbox, how scripts are stored in the vault) are implementation design; the compatibility commitment is: **engine-native scripting, not insane block parsing as the primary API.**
 
@@ -296,7 +296,7 @@ Legend: **P** = Preserve, **R** = Render, **E** = Execute / full product. Priori
 | Canvas | ✓ | → | → | Equivalent implementation goal |
 | Kanban | | | ✓ | **Out of the box** |
 | SQL queries | | ✓ | ✓ | SELECT-only |
-| Dataview DQL compat | | ✓ | later | Frontend to same IR |
+| Dataview DQL compat | | ✓ | implemented | Frontend over the shared index |
 | Engine scripting (DVJS-class) | | ✓ | ✓ | No insane primary block parser |
 | Templates / automation | | | ✓ | Native runtime |
 | Excalidraw | ✓ | ✓ | ✓ | Upstream engine |

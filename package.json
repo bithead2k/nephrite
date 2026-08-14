@@ -1,7 +1,7 @@
 {
   "name": "nephrite",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "engines": {
     "node": ">=20.19.0"
@@ -13,8 +13,9 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "test": "npm run test:performance && npm run test:ui",
-    "test:ui": "node --import tsx --test tests/ui-interactions.test.ts",
+    "test": "npm run test:performance && npm run test:ui && npm run test:dataview",
+    "test:ui": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/ui-interactions.test.ts",
+    "test:dataview": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/dataview.test.ts",
     "test:performance": "esbuild tests/editor-performance.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/nephrite-editor-performance.test.cjs && node --test /tmp/nephrite-editor-performance.test.cjs"
   },
   "dependencies": {

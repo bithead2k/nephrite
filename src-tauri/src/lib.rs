@@ -1182,6 +1182,11 @@ pub struct PageRow {
     pub size_bytes: i64,
     /// JSON object of frontmatter / properties when available
     pub properties: serde_json::Value,
+    pub tags: serde_json::Value,
+    pub aliases: serde_json::Value,
+    pub links: serde_json::Value,
+    pub tasks: serde_json::Value,
+    pub inline_fields: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -1654,16 +1659,28 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
     let src = src.trim().trim_matches('"').trim_matches('\'').trim();
 
     let mut sql = String::from(
-        "SELECT f.path, f.name, f.parent_path, f.mtime_ms, f.size_bytes, fm.json
-         FROM files f
-         LEFT JOIN file_frontmatter fm ON fm.path = f.path
-         WHERE f.file_kind = 'markdown'",
+        "SELECT p.path, p.name, p.folder, p.mtime_ms, f.size_bytes,
+                p.properties, p.tags, p.aliases, p.links, p.todos,
+                COALESCE((
+                    SELECT json_group_array(json_object(
+                        'key', inline.key,
+                        'value', json(COALESCE(inline.value_json, 'null')),
+                        'type', inline.value_type,
+                        'line', inline.line
+                    ))
+                    FROM inline_fields inline
+                    WHERE inline.path = p.path
+                    ORDER BY inline.field_id
+                ), '[]')
+         FROM pages p
+         JOIN files f ON f.path = p.path
+         WHERE 1 = 1",
     );
     let mut rows_out = Vec::new();
 
     if !src.is_empty() {
         // folder path prefix (Dataview FROM "people")
-        sql.push_str(" AND (f.parent_path = ?1 OR f.parent_path LIKE ?2 OR f.path LIKE ?3)");
+        sql.push_str(" AND (p.folder = ?1 OR p.folder LIKE ?2 OR p.path LIKE ?3)");
         let like_folder = format!("{src}/%");
         let like_path = format!("{src}/%");
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -1674,21 +1691,53 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
                 let folder: String = r.get(2)?;
                 let mtime_ms: i64 = r.get(3)?;
                 let size_bytes: i64 = r.get(4)?;
-                let json: Option<String> = r.get(5)?;
-                Ok((path, name, folder, mtime_ms, size_bytes, json))
+                let properties: String = r.get(5)?;
+                let tags: String = r.get(6)?;
+                let aliases: String = r.get(7)?;
+                let links: String = r.get(8)?;
+                let tasks: String = r.get(9)?;
+                let inline_fields: String = r.get(10)?;
+                Ok((
+                    path,
+                    name,
+                    folder,
+                    mtime_ms,
+                    size_bytes,
+                    properties,
+                    tags,
+                    aliases,
+                    links,
+                    tasks,
+                    inline_fields,
+                ))
             })
             .map_err(|e| e.to_string())?;
         for row in mapped {
-            let (path, name, folder, mtime_ms, size_bytes, json) =
-                row.map_err(|e| e.to_string())?;
-            let properties = page_properties(json.as_deref());
-            rows_out.push(PageRow {
+            let (
                 path,
                 name,
                 folder,
                 mtime_ms,
                 size_bytes,
                 properties,
+                tags,
+                aliases,
+                links,
+                tasks,
+                inline_fields,
+            ) = row.map_err(|e| e.to_string())?;
+            rows_out.push(PageRow {
+                path,
+                name,
+                folder,
+                mtime_ms,
+                size_bytes,
+                properties: page_properties(Some(&properties)),
+                tags: page_json_array(&tags),
+                aliases: page_json_array(&aliases),
+                links: page_json_array(&links),
+                tasks: page_json_array(&tasks),
+                inline_fields: page_json_array(&inline_fields),
             });
         }
     } else {
@@ -1700,26 +1749,65 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
                 let folder: String = r.get(2)?;
                 let mtime_ms: i64 = r.get(3)?;
                 let size_bytes: i64 = r.get(4)?;
-                let json: Option<String> = r.get(5)?;
-                Ok((path, name, folder, mtime_ms, size_bytes, json))
+                let properties: String = r.get(5)?;
+                let tags: String = r.get(6)?;
+                let aliases: String = r.get(7)?;
+                let links: String = r.get(8)?;
+                let tasks: String = r.get(9)?;
+                let inline_fields: String = r.get(10)?;
+                Ok((
+                    path,
+                    name,
+                    folder,
+                    mtime_ms,
+                    size_bytes,
+                    properties,
+                    tags,
+                    aliases,
+                    links,
+                    tasks,
+                    inline_fields,
+                ))
             })
             .map_err(|e| e.to_string())?;
         for row in mapped {
-            let (path, name, folder, mtime_ms, size_bytes, json) =
-                row.map_err(|e| e.to_string())?;
-            let properties = page_properties(json.as_deref());
-            rows_out.push(PageRow {
+            let (
                 path,
                 name,
                 folder,
                 mtime_ms,
                 size_bytes,
                 properties,
+                tags,
+                aliases,
+                links,
+                tasks,
+                inline_fields,
+            ) = row.map_err(|e| e.to_string())?;
+            rows_out.push(PageRow {
+                path,
+                name,
+                folder,
+                mtime_ms,
+                size_bytes,
+                properties: page_properties(Some(&properties)),
+                tags: page_json_array(&tags),
+                aliases: page_json_array(&aliases),
+                links: page_json_array(&links),
+                tasks: page_json_array(&tasks),
+                inline_fields: page_json_array(&inline_fields),
             });
         }
     }
 
     Ok(rows_out)
+}
+
+fn page_json_array(json: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .filter(serde_json::Value::is_array)
+        .unwrap_or_else(|| serde_json::json!([]))
 }
 
 /// Decode frontmatter without asking SQLite's JSON functions to process every
@@ -1787,6 +1875,147 @@ fn context_json_value(
     })
 }
 
+fn metadata_case_fold(value: &str) -> String {
+    value.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn page_property_value<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    requested: &str,
+) -> Result<Option<&'a serde_json::Value>, String> {
+    if let Some(value) = object.get(requested) {
+        return Ok(Some(value));
+    }
+    let folded = metadata_case_fold(requested);
+    let mut matches = object
+        .iter()
+        .filter(|(key, _)| metadata_case_fold(key) == folded)
+        .map(|(_, value)| value);
+    let first = matches.next();
+    if first.is_some() && matches.next().is_some() {
+        return Err(format!(
+            "Ambiguous frontmatter property {requested:?}: multiple keys differ only by case"
+        ));
+    }
+    Ok(first)
+}
+
+fn strict_page_cast(
+    value: rusqlite::types::ValueRef<'_>,
+    target: &str,
+) -> rusqlite::Result<rusqlite::types::Value> {
+    use rusqlite::types::{Value, ValueRef};
+    if matches!(value, ValueRef::Null) {
+        return Ok(Value::Null);
+    }
+    let source_text = || -> rusqlite::Result<String> {
+        Ok(match value {
+            ValueRef::Null => return Ok(String::new()),
+            ValueRef::Integer(value) => value.to_string(),
+            ValueRef::Real(value) => value.to_string(),
+            ValueRef::Text(value) => {
+                String::from_utf8(value.to_vec()).map_err(user_function_error)?
+            }
+            ValueRef::Blob(value) => BASE64.encode(value),
+        })
+    };
+    let invalid = |message: String| {
+        user_function_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message,
+        ))
+    };
+    let scalar_target = target.strip_suffix("[]").unwrap_or(target);
+    if target.ends_with("[]") {
+        let text = source_text()?;
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|_| invalid(format!("Cannot cast value to {target}: expected an array")))?;
+        if !parsed.is_array() {
+            return Err(invalid(format!(
+                "Cannot cast value to {target}: expected an array"
+            )));
+        }
+        return Ok(Value::Text(parsed.to_string()));
+    }
+    match scalar_target {
+        "text" | "tag" | "alias" | "link" | "header" | "todo" => Ok(Value::Text(source_text()?)),
+        "smallint" | "integer" | "bigint" => {
+            let integer = match value {
+                ValueRef::Integer(value) => value,
+                ValueRef::Real(value) if value.fract() == 0.0 => value as i64,
+                _ => source_text()?
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| invalid(format!("Cannot cast value to {scalar_target}")))?,
+            };
+            if scalar_target == "smallint" && !(-32_768..=32_767).contains(&integer) {
+                return Err(invalid("smallint out of range".into()));
+            }
+            if scalar_target == "integer" && !(i32::MIN as i64..=i32::MAX as i64).contains(&integer)
+            {
+                return Err(invalid("integer out of range".into()));
+            }
+            Ok(Value::Integer(integer))
+        }
+        "numeric" | "real" | "double precision" => {
+            let number = match value {
+                ValueRef::Integer(value) => value as f64,
+                ValueRef::Real(value) => value,
+                _ => source_text()?
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| invalid(format!("Cannot cast value to {scalar_target}")))?,
+            };
+            if !number.is_finite() {
+                return Err(invalid(format!("Cannot cast non-finite {scalar_target}")));
+            }
+            Ok(Value::Real(number))
+        }
+        "boolean" => {
+            let folded = metadata_case_fold(source_text()?.trim());
+            match folded.as_str() {
+                "true" | "t" | "yes" | "y" | "on" | "1" => Ok(Value::Integer(1)),
+                "false" | "f" | "no" | "n" | "off" | "0" => Ok(Value::Integer(0)),
+                _ => Err(invalid("Cannot cast value to boolean".into())),
+            }
+        }
+        "json" | "jsonb" => {
+            let parsed: serde_json::Value = serde_json::from_str(&source_text()?)
+                .map_err(|_| invalid(format!("Cannot cast value to {scalar_target}")))?;
+            Ok(Value::Text(parsed.to_string()))
+        }
+        "date" => {
+            let text = source_text()?;
+            chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d")
+                .map_err(|_| invalid("Cannot cast value to date (expected YYYY-MM-DD)".into()))?;
+            Ok(Value::Text(text.trim().to_string()))
+        }
+        "timestamp" | "timestamp with time zone" | "time" | "time with time zone" => {
+            let text = source_text()?;
+            let trimmed = text.trim();
+            let valid =
+                if scalar_target.starts_with("time") && !scalar_target.starts_with("timestamp") {
+                    chrono::NaiveTime::parse_from_str(trimmed, "%H:%M:%S%.f").is_ok()
+                        || chrono::DateTime::parse_from_rfc3339(&format!("1970-01-01T{trimmed}"))
+                            .is_ok()
+                } else {
+                    chrono::DateTime::parse_from_rfc3339(trimmed).is_ok()
+                        || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f")
+                            .is_ok()
+                        || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+                            .is_ok()
+                };
+            if !valid {
+                return Err(invalid(format!("Cannot cast value to {scalar_target}")));
+            }
+            Ok(Value::Text(trimmed.to_string()))
+        }
+        _ => Err(invalid(format!(
+            "Unsupported PostgreSQL cast target: {target}"
+        ))),
+    }
+}
+
 fn json_compare(left: &serde_json::Value, right: &serde_json::Value) -> std::cmp::Ordering {
     use serde_json::Value;
     let rank = |value: &Value| match value {
@@ -1841,6 +2070,12 @@ fn register_page_array_functions(connection: &rusqlite::Connection) -> Result<()
             })
         })
         .map_err(|error| format!("register page_bool: {error}"))?;
+    connection
+        .create_scalar_function("page_cast", 2, SAFE, |context| {
+            let target = context.get::<String>(1)?;
+            strict_page_cast(context.get_raw(0), &target)
+        })
+        .map_err(|error| format!("register page_cast: {error}"))?;
     connection
         .create_scalar_function("page_array", -1, SAFE, |context| {
             let values = (0..context.len())
@@ -2194,6 +2429,17 @@ fn run_readonly_sql(
     register_page_array_functions(connection)?;
     postgres_compat::register(connection)?;
     connection
+        .pragma_update(None, "case_sensitive_like", true)
+        .map_err(|error| format!("enable PostgreSQL LIKE case semantics: {error}"))?;
+    connection
+        .create_scalar_function(
+            "unicode_lower",
+            1,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| Ok(metadata_case_fold(&context.get::<String>(0)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    connection
         .create_scalar_function(
             "page_has_tag",
             2,
@@ -2203,9 +2449,10 @@ fn run_readonly_sql(
                 let wanted = context.get::<String>(1)?;
                 let wanted = wanted.trim_start_matches('#');
                 let tags = serde_json::from_str::<Vec<String>>(&json).unwrap_or_default();
+                let wanted = metadata_case_fold(wanted);
                 Ok(tags
                     .iter()
-                    .any(|tag| tag.trim_start_matches('#').eq_ignore_ascii_case(wanted)))
+                    .any(|tag| metadata_case_fold(tag.trim_start_matches('#')) == wanted))
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2218,7 +2465,19 @@ fn run_readonly_sql(
                 let source = context.get::<String>(0)?;
                 let key = context.get::<String>(1)?;
                 let object = serde_json::from_str::<serde_json::Value>(&source).unwrap_or_default();
-                Ok(match object.get(&key).unwrap_or(&serde_json::Value::Null) {
+                let value = object
+                    .as_object()
+                    .map(|object| page_property_value(object, &key))
+                    .transpose()
+                    .map_err(|message| {
+                        user_function_error(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            message,
+                        ))
+                    })?
+                    .flatten()
+                    .unwrap_or(&serde_json::Value::Null);
+                Ok(match value {
                     serde_json::Value::Null => Value::Null,
                     serde_json::Value::Bool(value) => Value::Integer(i64::from(*value)),
                     serde_json::Value::Number(value) => value
@@ -2241,10 +2500,17 @@ fn run_readonly_sql(
                 let source = context.get::<String>(0)?;
                 let key = context.get::<String>(1)?;
                 let object = serde_json::from_str::<serde_json::Value>(&source).unwrap_or_default();
-                Ok(object
+                object
                     .as_object()
-                    .map(|m| m.contains_key(&key))
-                    .unwrap_or(false))
+                    .map(|object| page_property_value(object, &key).map(|value| value.is_some()))
+                    .transpose()
+                    .map(|value| value.unwrap_or(false))
+                    .map_err(|message| {
+                        user_function_error(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            message,
+                        ))
+                    })
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2592,25 +2858,22 @@ fn translate_page_sql_forms(sql: &str) -> Result<String, String> {
 
 /// Residual lowering after AST page rewrites (or as the tail of full textual).
 fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
-    // PostgreSQL `::type` casts → strip (SQLite is dynamically typed)
-    // Handles: 'Moe'::text, 1::int, col::varchar(10), expr::float8
-    let typecast = regex::Regex::new(r"::\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?")
-        .map_err(|error| error.to_string())?;
-    let mut translated = typecast.replace_all(sql, "").into_owned();
+    // Fill page forms whose sibling source spans were not selected by the AST
+    // rewrite. This transformation is idempotent.
+    let mut translated = translate_page_sql_forms(sql)?;
+    translated = lower_textual_casts(&translated)?;
+    // Casts must be handled by the PostgreSQL AST path and perform a real
+    // conversion. Never erase a cast: that silently changes query semantics.
+    let unresolved_cast =
+        regex::Regex::new(r"(?i)::\s*[a-z_]|\bCAST\s*\(").map_err(|error| error.to_string())?;
+    if unresolved_cast.is_match(&translated) {
+        return Err(format!(
+            "A PostgreSQL cast could not be lowered safely: {translated}"
+        ));
+    }
     // Syntax residual only (operators, SQL-standard forms). Function names
     // stay intact for postgres_compat UDFs.
     translated = page_sql::lower_pg_syntax(&translated);
-
-    // CAST(expr AS type) → (expr)  (SQLite ignores declared types)
-    let cast_fn = regex::Regex::new(
-        r"(?i)\bCAST\s*\((.+?)\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\([^)]*\))?\s*\)",
-    )
-    .map_err(|error| error.to_string())?;
-    translated = cast_fn
-        .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            format!("({})", captures[1].trim())
-        })
-        .into_owned();
 
     // ARRAY constructor (not already consumed by page tag forms)
     let array_constructor =
@@ -2620,8 +2883,8 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
             format!("page_array({})", &captures[1])
         })
         .into_owned();
-    translated = page_sql::lower_array_operators(&translated);
     translated = page_sql::lower_json_operators(&translated);
+    translated = page_sql::lower_array_operators(&translated);
 
     let extract = regex::Regex::new(r"(?i)\bEXTRACT\s*\(\s*([a-z_]+)\s+FROM\s+([^()]+?)\s*\)")
         .map_err(|error| error.to_string())?;
@@ -2638,7 +2901,10 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     translated = ilike
         .replace_all(&translated, |captures: &regex::Captures<'_>| {
-            format!("lower({}) LIKE lower({})", &captures[1], &captures[2])
+            format!(
+                "unicode_lower({}) LIKE unicode_lower({})",
+                &captures[1], &captures[2]
+            )
         })
         .into_owned();
 
@@ -2752,6 +3018,89 @@ fn translate_page_sql_residual(sql: &str) -> Result<String, String> {
     translated = lower_values_table_alias(&translated);
 
     Ok(translated)
+}
+
+fn textual_cast_name(raw: &str) -> Result<String, String> {
+    let compact = raw
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let array = compact.ends_with("[]");
+    let scalar = compact
+        .trim_end_matches("[]")
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let canonical = match scalar {
+        "text" | "varchar" | "character varying" | "char" | "character" | "name" => "text",
+        "int2" | "smallint" => "smallint",
+        "int" | "int4" | "integer" => "integer",
+        "int8" | "bigint" => "bigint",
+        "numeric" | "decimal" => "numeric",
+        "float4" | "real" => "real",
+        "float8" | "double precision" => "double precision",
+        "bool" | "boolean" => "boolean",
+        "json" => "json",
+        "jsonb" => "jsonb",
+        "date" => "date",
+        "timestamp" | "timestamp without time zone" => "timestamp",
+        "timestamptz" | "timestamp with time zone" => "timestamp with time zone",
+        "time" | "time without time zone" => "time",
+        "timetz" | "time with time zone" => "time with time zone",
+        "tag" | "alias" | "link" | "header" | "todo" => scalar,
+        _ => return Err(format!("Unsupported PostgreSQL cast target: {raw}")),
+    };
+    Ok(if array {
+        format!("{canonical}[]")
+    } else {
+        canonical.into()
+    })
+}
+
+fn lower_textual_casts(sql: &str) -> Result<String, String> {
+    let atom = r"(?:'(?:''|[^'])*'|-?[0-9]+(?:\.[0-9]+)?|[A-Za-z_][A-Za-z0-9_$.]*|page_property\([^()]*\)|page_array\([^()]*\))";
+    let type_name = r"[A-Za-z_][A-Za-z0-9_]*(?:\s+(?:precision|varying|with\s+time\s+zone|without\s+time\s+zone))?(?:\s*\([^)]*\))?(?:\[\])?";
+    let postfix = regex::Regex::new(&format!(r"(?i)({atom})\s*::\s*({type_name})"))
+        .map_err(|error| error.to_string())?;
+    let mut failure = None;
+    let mut lowered = postfix
+        .replace_all(
+            sql,
+            |captures: &regex::Captures<'_>| match textual_cast_name(&captures[2]) {
+                Ok(target) => format!("page_cast({}, '{target}')", &captures[1]),
+                Err(error) => {
+                    failure = Some(error);
+                    captures[0].to_string()
+                }
+            },
+        )
+        .into_owned();
+    if let Some(error) = failure.take() {
+        return Err(error);
+    }
+    let cast = regex::Regex::new(&format!(
+        r"(?i)\bCAST\s*\(\s*({atom})\s+AS\s+({type_name})\s*\)"
+    ))
+    .map_err(|error| error.to_string())?;
+    lowered = cast
+        .replace_all(
+            &lowered,
+            |captures: &regex::Captures<'_>| match textual_cast_name(&captures[2]) {
+                Ok(target) => format!("page_cast({}, '{target}')", &captures[1]),
+                Err(error) => {
+                    failure = Some(error);
+                    captures[0].to_string()
+                }
+            },
+        )
+        .into_owned();
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(lowered)
 }
 
 /// Rewrite `(VALUES ...) AS alias(c1, c2, ...)` for SQLite.
@@ -4047,7 +4396,8 @@ pub fn run() {
 mod sql_query_tests {
     use super::{
         fts_query, is_conflict_status, next_recurrence_date, page_properties, recurring_task_lines,
-        run_readonly_sql, search_yaml_properties, translate_page_sql, vault_search_terms,
+        run_readonly_sql, search_yaml_properties, translate_page_sql, translate_page_sql_residual,
+        vault_search_terms,
     };
     use chrono::NaiveDate;
 
@@ -4332,17 +4682,20 @@ mod sql_query_tests {
     }
 
     #[test]
-    fn strips_postgres_type_casts() {
+    fn lowers_postgres_type_casts_to_real_conversions() {
+        let lower = |sql: &str| {
+            super::page_sql::lower_page_sql(sql, translate_page_sql, translate_page_sql_residual)
+                .unwrap()
+        };
         assert_eq!(
-            translate_page_sql(
+            lower(
                 "SELECT a.name FROM (VALUES ('Moe'::text), ('Larry'), ('Curly')) AS a(name)"
-            )
-            .unwrap(),
-            "SELECT a.name FROM (SELECT column1 AS name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS _nephrite_values) AS a"
+            ),
+            "SELECT a.name FROM (SELECT column1 AS name FROM (VALUES (page_cast('Moe', 'text')), ('Larry'), ('Curly')) AS _nephrite_values) AS a"
         );
         assert_eq!(
-            translate_page_sql("SELECT 1::int AS n").unwrap(),
-            "SELECT 1 AS n"
+            lower("SELECT 1::int AS n"),
+            "SELECT page_cast(1, 'integer') AS n"
         );
     }
 
@@ -4401,22 +4754,41 @@ mod sql_query_tests {
     }
 
     #[test]
-    fn strips_postgres_type_casts_and_values_aliases() {
+    fn executes_strict_postgres_casts_and_values_aliases() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
         assert_eq!(
-            translate_page_sql("SELECT 1::int AS n").unwrap(),
-            "SELECT 1 AS n"
+            run_readonly_sql(&connection, "SELECT '12'::int AS n")
+                .unwrap()
+                .rows,
+            [[serde_json::json!(12)]]
         );
         assert_eq!(
-            translate_page_sql("SELECT CAST('x' AS text) AS t").unwrap(),
-            "SELECT ('x') AS t"
+            run_readonly_sql(&connection, "SELECT CAST(12 AS text) AS t")
+                .unwrap()
+                .rows,
+            [[serde_json::json!("12")]]
         );
         assert_eq!(
-            translate_page_sql(
+            run_readonly_sql(&connection, "SELECT '1.5'::double precision AS n")
+                .unwrap()
+                .rows,
+            [[serde_json::json!(1.5)]]
+        );
+        assert_eq!(
+            run_readonly_sql(
+                &connection,
                 "SELECT a.name FROM (VALUES ('Moe'::text), ('Larry'), ('Curly')) AS a(name)"
             )
-            .unwrap(),
-            "SELECT a.name FROM (SELECT column1 AS name FROM (VALUES ('Moe'), ('Larry'), ('Curly')) AS _nephrite_values) AS a"
+            .unwrap()
+            .rows,
+            [
+                [serde_json::json!("Moe")],
+                [serde_json::json!("Larry")],
+                [serde_json::json!("Curly")],
+            ]
         );
+        assert!(run_readonly_sql(&connection, "SELECT 'not a number'::integer").is_err());
+        assert!(run_readonly_sql(&connection, "SELECT 'x'::regclass").is_err());
     }
 
     #[test]
@@ -4584,7 +4956,9 @@ mod sql_query_tests {
             translate_page_sql("SELECT path FROM pages WHERE properties->>'name' ILIKE '%roy%'")
                 .unwrap();
         assert!(
-            ilike_out.contains("lower(page_property(properties, 'name')) LIKE lower('%roy%')"),
+            ilike_out.contains(
+                "unicode_lower(page_property(properties, 'name')) LIKE unicode_lower('%roy%')"
+            ),
             "ILIKE not lowered: {ilike_out}"
         );
         assert_eq!(
@@ -4665,5 +5039,58 @@ mod sql_query_tests {
         )
         .unwrap();
         assert_eq!(alias_hit.rows, [[serde_json::json!("CDW")]]);
+    }
+
+    #[test]
+    fn preserves_metadata_case_with_unique_folded_lookup_and_postgres_like() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE pages(properties TEXT, tags TEXT, aliases TEXT); INSERT INTO pages VALUES ('{\"Company\":\"München\"}', '[\"RéCruiter\"]', '[\"Résumé\"]');")
+            .unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            "SELECT properties['Company'] AS exact, properties['company'] AS folded, 'récruiter' = ANY(tags) AS tag_match, 'résumé' = ANY(aliases) AS alias_match, properties['Company'] LIKE 'm%' AS sensitive, properties['Company'] ILIKE 'm%' AS insensitive FROM pages",
+        )
+        .unwrap();
+        assert_eq!(
+            result.rows,
+            [[
+                serde_json::json!("München"),
+                serde_json::json!("München"),
+                serde_json::json!(1),
+                serde_json::json!(1),
+                serde_json::json!(0),
+                serde_json::json!(1),
+            ]]
+        );
+
+        connection
+            .execute(
+                "UPDATE pages SET properties = '{\"Company\":1,\"company\":2}'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            run_readonly_sql(&connection, "SELECT properties['COMPANY'] FROM pages")
+                .unwrap_err()
+                .contains("Ambiguous frontmatter property")
+        );
+    }
+
+    #[test]
+    fn lowers_nested_page_expressions_recursively() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE pages(properties TEXT, tags TEXT); INSERT INTO pages VALUES ('{\"Company\":\"  Acme  \",\"Rate\":\"12\"}', '[]');")
+            .unwrap();
+        let result = run_readonly_sql(
+            &connection,
+            "SELECT lower(trim(properties['company'])) AS company, coalesce(properties['missing'], properties['rate']::integer + 1) AS rate FROM pages",
+        )
+        .unwrap();
+        assert_eq!(
+            result.rows,
+            [[serde_json::json!("acme"), serde_json::json!(13)]]
+        );
     }
 }

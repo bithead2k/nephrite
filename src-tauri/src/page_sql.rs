@@ -254,21 +254,21 @@ struct AstRewrite {
 /// treated as comment starters (PG identifiers rarely embed those).
 pub fn strip_sql_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
+    let mut out = Vec::with_capacity(sql.len());
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
         // Single-quoted string
         if c == b'\'' {
-            out.push('\'');
+            out.push(b'\'');
             i += 1;
             while i < bytes.len() {
                 let ch = bytes[i];
-                out.push(ch as char);
+                out.push(ch);
                 i += 1;
                 if ch == b'\'' {
                     if i < bytes.len() && bytes[i] == b'\'' {
-                        out.push('\'');
+                        out.push(b'\'');
                         i += 1; // escaped ''
                         continue;
                     }
@@ -297,13 +297,13 @@ pub fn strip_sql_comments(sql: &str) -> String {
             } else {
                 i = bytes.len();
             }
-            out.push(' '); // keep token separation
+            out.push(b' '); // keep token separation
             continue;
         }
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("SQL input started as valid UTF-8")
 }
 
 pub fn lower_page_sql(
@@ -577,7 +577,7 @@ fn lower_like_ilike(
     }
 
     let replacement = if case_insensitive {
-        format!("lower({left_sql}) LIKE lower('{pat}')")
+        format!("unicode_lower({left_sql}) LIKE unicode_lower('{pat}')")
     } else {
         format!("{left_sql} LIKE '{pat}'")
     };
@@ -1055,24 +1055,6 @@ fn lower_aindirection(
 // Span recovery helpers (token scan + location hints)
 // ---------------------------------------------------------------------------
 
-/// From a column location through the matching closing `]` after `array_hint`.
-fn peel_typecast(node: &protobuf::Node) -> &protobuf::Node {
-    let mut cur = node;
-    for _ in 0..8 {
-        match &cur.node {
-            Some(NodeEnum::TypeCast(tc)) => {
-                if let Some(ref arg) = tc.arg {
-                    cur = arg.as_ref();
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-    cur
-}
-
 fn lower_booleantest(
     sql: &str,
     bt: &protobuf::BooleanTest,
@@ -1144,43 +1126,46 @@ fn lower_typecast(
     tc: &protobuf::TypeCast,
     tokens: &[protobuf::ScanToken],
 ) -> Result<Option<AstRewrite>, String> {
-    let Some(ref arg) = tc.arg else {
+    if tc.arg.is_none() {
         return Ok(None);
-    };
-    let inner = peel_typecast(arg);
-    let inner_rw = match &inner.node {
-        Some(NodeEnum::AArrayExpr(arr)) => lower_aarrayexpr(sql, arr, tokens)?,
-        Some(NodeEnum::AExpr(expr)) => lower_aexpr(sql, expr, tokens)?,
-        Some(NodeEnum::SubscriptingRef(sub)) => lower_subscript(sql, sub, tokens)?,
-        Some(NodeEnum::NullTest(nt)) => lower_nulltest(sql, nt, tokens)?,
-        Some(NodeEnum::FuncCall(func)) => lower_funccall(sql, func, tokens)?,
-        _ => None,
-    };
-
-    // Locate `::` after the arg and strip the cast for SQLite.
-    let start_hint = if tc.location >= 0 {
-        tc.location as usize
-    } else if let Some(c) = const_location(arg) {
-        c as usize
-    } else if let Some(rw) = &inner_rw {
-        rw.start
+    }
+    let cast_type = canonical_cast_type(tc)?;
+    let start_hint = tc.location.max(0) as usize;
+    let (start, end, argument) = if sql[start_hint..]
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cast"))
+    {
+        let end = find_closing_paren_end(sql, start_hint)
+            .ok_or_else(|| "Could not recover CAST(...) source span".to_string())?;
+        let open = sql[start_hint..end]
+            .find('(')
+            .map(|offset| start_hint + offset)
+            .ok_or_else(|| "Malformed CAST expression".to_string())?;
+        let as_position = find_top_level_as(sql, open + 1, end - 1)
+            .ok_or_else(|| "CAST expression is missing AS".to_string())?;
+        (
+            start_hint,
+            end,
+            sql[open + 1..as_position].trim().to_string(),
+        )
     } else {
-        return Ok(inner_rw);
+        let type_location = tc
+            .type_name
+            .as_ref()
+            .map(|name| name.location)
+            .filter(|location| *location >= 0)
+            .map(|location| location as usize)
+            .unwrap_or(start_hint);
+        let (start, separator, end) = find_postfix_cast_span(sql, type_location)
+            .ok_or_else(|| "Could not recover PostgreSQL ::type source span".to_string())?;
+        (start, end, sql[start..separator].trim().to_string())
     };
-
-    let Some((start, end)) = find_typecast_span(sql, start_hint) else {
-        return Ok(inner_rw);
-    };
-    let replacement = if let Some(rw) = inner_rw {
-        rw.replacement
-    } else {
-        // Drop `::typename`; keep the argument text.
-        let slice = &sql[start..end];
-        match slice.find("::") {
-            Some(i) => slice[..i].trim_end().to_string(),
-            None => slice.to_string(),
-        }
-    };
+    let lowered_argument = lower_expression_fragment(&argument)?;
+    let replacement = format!(
+        "page_cast({}, '{}')",
+        lowered_argument,
+        escape_sql_string(&cast_type)
+    );
     let _ = tokens;
     Ok(Some(AstRewrite {
         start,
@@ -1189,87 +1174,179 @@ fn lower_typecast(
     }))
 }
 
-/// Span covering `expr::typename` starting at a location inside/at the expr.
-fn find_typecast_span(sql: &str, from: usize) -> Option<(usize, usize)> {
-    let bytes = sql.as_bytes();
-    if from >= bytes.len() {
-        return None;
-    }
-    // Walk left to start of string literal or identifier
-    let mut start = from;
-    if bytes[start] == b'\'' || (start > 0 && bytes[start - 1] == b'\'') {
-        // find opening quote
-        let mut i = start;
-        if bytes[i] != b'\'' {
-            i = start;
+fn canonical_cast_type(tc: &protobuf::TypeCast) -> Result<String, String> {
+    let type_name = tc
+        .type_name
+        .as_ref()
+        .ok_or_else(|| "PostgreSQL cast has no target type".to_string())?;
+    let names = type_name
+        .names
+        .iter()
+        .filter_map(|node| match &node.node {
+            Some(NodeEnum::String(value)) => Some(value.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let leaf = names.last().copied().unwrap_or("").to_ascii_lowercase();
+    let array = !type_name.array_bounds.is_empty() || leaf.starts_with('_');
+    let scalar = leaf.trim_start_matches('_');
+    let canonical = match scalar {
+        "text" | "varchar" | "bpchar" | "char" | "name" => "text",
+        "int2" | "smallint" => "smallint",
+        "int4" | "int" | "integer" => "integer",
+        "int8" | "bigint" => "bigint",
+        "numeric" | "decimal" => "numeric",
+        "float4" | "real" => "real",
+        "float8" | "double" => "double precision",
+        "bool" | "boolean" => "boolean",
+        "json" => "json",
+        "jsonb" => "jsonb",
+        "date" => "date",
+        "timestamp" => "timestamp",
+        "timestamptz" => "timestamp with time zone",
+        "time" => "time",
+        "timetz" => "time with time zone",
+        // Semantic page scalar names are assertions over their Markdown-backed
+        // representation; arrays are still validated as JSON arrays below.
+        "tag" | "alias" | "link" | "header" | "todo" => scalar,
+        _ => {
+            return Err(format!(
+                "Unsupported PostgreSQL cast target: {}",
+                names.join(".")
+            ));
         }
-        while i > 0 {
-            if bytes[i] == b'\'' {
-                // check not doubled
-                if i > 0 && bytes[i - 1] == b'\'' {
-                    i -= 1;
-                    continue;
-                }
-                start = i;
+    };
+    Ok(if array {
+        format!("{canonical}[]")
+    } else {
+        canonical.to_string()
+    })
+}
+
+fn lower_expression_fragment(expression: &str) -> Result<String, String> {
+    let cast_depth = expression.matches("::").count()
+        + expression
+            .to_ascii_lowercase()
+            .match_indices("cast(")
+            .count();
+    if cast_depth > 32 {
+        return Err("PostgreSQL expression nesting exceeds Nephrite's limit of 32".into());
+    }
+    let wrapped = format!("SELECT {expression}");
+    Ok(match try_ast_lower(&wrapped)? {
+        Some(lowered) => lowered
+            .strip_prefix("SELECT ")
+            .or_else(|| lowered.strip_prefix("select "))
+            .unwrap_or(expression)
+            .to_string(),
+        None => expression.to_string(),
+    })
+}
+
+fn find_top_level_as(sql: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut index = start;
+    while index + 1 < end {
+        if bytes[index] == b'\'' {
+            if quoted && index + 1 < end && bytes[index + 1] == b'\'' {
+                index += 2;
+                continue;
+            }
+            quoted = !quoted;
+            index += 1;
+            continue;
+        }
+        if !quoted {
+            match bytes[index] {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0
+                && sql[index..end]
+                    .get(..2)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("as"))
+                && (index == start || bytes[index - 1].is_ascii_whitespace())
+                && (index + 2 == end || bytes[index + 2].is_ascii_whitespace())
+            {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_postfix_cast_span(sql: &str, type_location: usize) -> Option<(usize, usize, usize)> {
+    let bytes = sql.as_bytes();
+    let separator = sql[..type_location.min(sql.len())].rfind("::")?;
+    let mut start = separator;
+    while start > 0 && bytes[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    if start > 0 && matches!(bytes[start - 1], b')' | b']') {
+        let close = bytes[start - 1];
+        let open = if close == b')' { b'(' } else { b'[' };
+        let mut depth = 1i32;
+        start -= 1;
+        while start > 0 && depth > 0 {
+            start -= 1;
+            if bytes[start] == close {
+                depth += 1;
+            } else if bytes[start] == open {
+                depth -= 1;
+            }
+        }
+        while start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'_' | b'.'))
+        {
+            start -= 1;
+        }
+    } else if start > 0 && bytes[start - 1] == b'\'' {
+        start -= 1;
+        while start > 0 {
+            start -= 1;
+            if bytes[start] == b'\'' && (start == 0 || bytes[start - 1] != b'\'') {
                 break;
             }
-            i -= 1;
         }
     } else {
         while start > 0
             && (bytes[start - 1].is_ascii_alphanumeric()
-                || bytes[start - 1] == b'_'
-                || bytes[start - 1] == b'.')
+                || matches!(bytes[start - 1], b'_' | b'.' | b'+' | b'-'))
         {
             start -= 1;
         }
     }
-
-    let mut i = start;
-    // consume string or ident
-    if i < bytes.len() && bytes[i] == b'\'' {
-        i += 1;
-        while i < bytes.len() {
-            if bytes[i] == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                break;
-            }
-            i += 1;
-        }
-    } else {
-        while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
-        {
-            i += 1;
+    let mut end = type_location;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'.'))
+    {
+        end += 1;
+    }
+    if end < bytes.len() && bytes[end] == b'(' {
+        end = find_closing_paren_end(sql, end)?;
+    }
+    let remainder = sql[end..].to_ascii_lowercase();
+    for continuation in [
+        " precision",
+        " varying",
+        " with time zone",
+        " without time zone",
+    ] {
+        if remainder.starts_with(continuation) {
+            end += continuation.len();
+            break;
         }
     }
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
+    while end + 1 < bytes.len() && bytes[end] == b'[' && bytes[end + 1] == b']' {
+        end += 2;
     }
-    if i + 1 >= bytes.len() || bytes[i] != b':' || bytes[i + 1] != b':' {
-        return None;
-    }
-    i += 2;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() || !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-        return None;
-    }
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-    }
-    if i < bytes.len() && bytes[i] == b'(' {
-        if let Some(end) = find_closing_paren_end(sql, i) {
-            i = end;
-        }
-    }
-    Some((start, i))
+    Some((start, separator, end))
 }
+
 fn lower_nulltest(
     sql: &str,
     nt: &protobuf::NullTest,
@@ -2324,7 +2401,7 @@ pub fn lower_array_operators(sql: &str) -> String {
 /// property expressions. JSON remains serialized text inside SQLite.
 pub fn lower_json_operators(sql: &str) -> String {
     let source = r"(?:page_property\([^()]*\)|[A-Za-z_][A-Za-z0-9_$.]*)";
-    let json_literal = r"'(?:''|[^'])*'";
+    let json_literal = r"(?:'(?:''|[^'])*'|page_cast\('(?:''|[^'])*',\s*'jsonb?'\))";
     let mut out = sql.to_string();
     if let Ok(re) = regex::Regex::new(&format!(
         r"(?i)({source})\s*(#>>|#>)\s*page_array\(([^()]*)\)"
@@ -2513,11 +2590,11 @@ mod tests {
 
     #[test]
     fn strip_sql_comments_line_and_block() {
-        let sql = "SELECT 1 -- skip me\nFROM pages /* block */ WHERE path = 'a--b'";
+        let sql = "SELECT 'Résumé' -- skip me\nFROM pages /* block */ WHERE path = 'München--東京'";
         let out = strip_sql_comments(sql);
-        assert!(out.contains("SELECT 1"));
+        assert!(out.contains("SELECT 'Résumé'"));
         assert!(out.contains("FROM pages"));
-        assert!(out.contains("WHERE path = 'a--b'"));
+        assert!(out.contains("WHERE path = 'München--東京'"));
         assert!(!out.contains("skip me"));
         assert!(!out.contains("block"));
     }
@@ -2602,21 +2679,10 @@ mod tests {
     }
 
     #[test]
-    fn peel_typecast_unwraps_nested() {
-        // Smoke: TypeCast arm is wired; casted ARRAY should still attempt rewrite.
+    fn typecast_wraps_nested_expression_in_strict_conversion() {
         let sql = "SELECT ARRAY['a']::text[]";
-        match try_ast_lower(sql) {
-            Ok(Some(out)) => {
-                assert!(
-                    out.contains("page_array") || out.contains("ARRAY"),
-                    "unexpected: {out}"
-                );
-            }
-            Ok(None) => {
-                // Acceptable if parser shape differs; residual still covers ARRAY.
-            }
-            Err(e) => panic!("parse/lower error: {e}"),
-        }
+        let out = try_ast_lower(sql).unwrap().expect("cast should lower");
+        assert_eq!(out, "SELECT page_cast(page_array('a'), 'text[]')");
     }
 
     #[test]

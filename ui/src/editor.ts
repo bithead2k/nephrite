@@ -143,9 +143,10 @@ export class NephriteEditor {
     const configuredFont = config.fontFamily
       ? `"${config.fontFamily.replace(/"/g, "\\\"")}", `
       : "";
-    const editorFontStack =
+    const vimrcFontStack =
       `${configuredFont}ui-monospace, "Cascadia Code", "Hack", "DejaVu Sans Mono", ` +
       `"SF Mono", Menlo, Consolas, monospace`;
+    const editorFontStack = `var(--editor-font, ${vimrcFontStack})`;
     const gutters = config.lineNumbers
       ? lineNumbers({
           formatNumber: config.relativeLineNumbers

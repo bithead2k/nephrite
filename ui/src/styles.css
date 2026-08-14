@@ -375,6 +375,14 @@ button:disabled {
   color: var(--text);
   font: 0.72rem var(--mono);
 }
+.preferences-font-grid {
+  display: grid;
+  grid-template-columns: minmax(5rem, auto) minmax(0, 1fr);
+  gap: 0.35rem 0.55rem;
+  align-items: center;
+}
+.preferences-font-grid label { color: var(--muted); font-size: 0.7rem; }
+.preferences-font-actions { display: flex; gap: 0.4rem; }
 .preferences-plugins { display: grid; gap: 0.3rem; color: var(--muted); font-size: 0.72rem; }
 .preferences-plugin {
   display: grid;
@@ -1288,6 +1296,61 @@ body.resizing-panes .cm-editor {
   padding: 0.3rem 0.5rem;
 }
 
+.dv-task-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.dv-task-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  margin: 0.3rem 0;
+}
+
+.dv-task-list label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.45rem;
+}
+
+.dv-task-source {
+  color: var(--muted);
+  font-size: 0.86em;
+}
+
+.dv-calendar {
+  margin: 0.75rem 0 1.2rem;
+}
+
+.dv-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+}
+
+.dv-calendar-grid > * {
+  min-width: 0;
+  padding: 0.35rem;
+  background: var(--panel);
+}
+
+.dv-calendar-grid > b {
+  text-align: center;
+}
+
+.dv-calendar-day {
+  min-height: 4.5rem;
+}
+
+.dv-calendar-day > div {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .editor-host .cm-editor {
   font-size: calc(14.5px * var(--ui-zoom, 1));
 }
@@ -1330,6 +1393,7 @@ body.resizing-panes .cm-editor {
   max-width: 48rem;
   line-height: 1.6;
   font-size: 0.97rem;
+  font-family: var(--preview-font, var(--font));
 }
 
 /* Frontmatter properties — not Markdown */

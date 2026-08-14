@@ -23,6 +23,37 @@ The compatibility layer includes:
 - safe informational functions such as `version`, `pg_typeof`, and
   `pg_client_encoding`.
 
+### Dynamic values and casts
+
+Markdown has no declared database schema, but YAML values retain their scalar,
+array, and object types in the disposable index. PostgreSQL casts therefore
+mean an explicit runtime conversion, not a column declaration. Nephrite never
+silently erases `::type` or `CAST(value AS type)`.
+
+Supported scalar targets are text, integer families, numeric/real families,
+boolean, JSON/JSONB, date, time, and timestamp. One-dimensional arrays of
+supported scalar and `page.*` semantic element names are validated as arrays.
+Invalid values and unsupported target types are query errors.
+
+Nested page expressions are lowered inside functions, casts, arrays, and other
+ordinary SQLite-compatible expressions. Cast recursion is capped at 32 levels;
+the existing 128 KiB query limit and parser gate provide the broader resource
+bound.
+
+### Case behavior
+
+- Original property, tag, alias, path, and output spelling is retained.
+- Frontmatter property lookup tries an exact key first, then a unique
+  Unicode-lowercased match. Multiple case-only matches are an ambiguity error.
+- Tags and aliases compare case-insensitively while preserving stored spelling.
+- Ordinary values remain case-sensitive under `=` and PostgreSQL `LIKE`.
+  `ILIKE` performs Unicode-aware lowercasing before matching.
+- Paths follow the host filesystem. Nephrite does not invent case-insensitive
+  Linux paths or case-sensitive Windows paths.
+
+This is deliberately case-retentive rather than case-destructive: query
+convenience must not rewrite or merge Markdown metadata.
+
 `concat_ws(separator, ...)` is the PostgreSQL spelling. Nephrite also provides
 `ws_concat(separator, ...)` as an alias. Both ignore NULL value arguments.
 `coalesce(...)` and text concatenation with `||` use the native SQLite
@@ -105,7 +136,8 @@ helpers.
 
 Pipeline:
 
-1. **AST rewrite** of recognized page forms, FuncCalls, arrays, null tests, casts.
+1. **AST rewrite** of recognized page forms, FuncCalls, arrays, null tests, and
+   strict runtime casts, including nested cast operands.
 2. **EXTRACT keyword** scan for raw `EXTRACT(field FROM expr)` not already covered.
 3. **Residual syntax lowering** for grammar SQLite cannot parse directly.
 4. **Compatibility fallback** only when AST span recovery produces no rewrite.

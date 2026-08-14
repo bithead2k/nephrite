@@ -111,6 +111,14 @@ import {
   type AutomationConfig,
 } from "./automation";
 import { findInKanbanLane, normalizePageFindQuery } from "./kanban-find";
+import {
+  APPEARANCE_FONTS_KEY,
+  DEFAULT_APPEARANCE_FONTS,
+  applyAppearanceFonts,
+  loadAppearanceFonts,
+  normalizeAppearanceFonts,
+  type AppearanceFonts,
+} from "./appearance";
 import type {
   FileEntry,
   GitCommit,
@@ -186,6 +194,7 @@ let sidebarCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
 let showDotfiles = localStorage.getItem(DOTFILES_KEY) === "1";
 let vimOn = localStorage.getItem(VIM_KEY) === "1";
 let externalLinksInBrowser = localStorage.getItem(EXTERNAL_BROWSER_KEY) === "1";
+let appearanceFonts = loadAppearanceFonts();
 let viewMode: ViewMode = normalizeMode(localStorage.getItem(VIEW_KEY));
 const previewWork = new DeferredDocumentWork(PREVIEW_DELAY_MS);
 const previewRenderer = new PreviewWorkerClient();
@@ -551,6 +560,20 @@ async function renderShell() {
               <span>Open external links in browser</span>
             </label>
             <section class="preferences-section">
+              <strong>Appearance fonts</strong>
+              <small>Enter a CSS font-family or fallback stack. Empty fields use Nephrite defaults; the editor then falls back to <code>guifont</code> from your Vim configuration.</small>
+              <div class="preferences-font-grid">
+                <label for="appearance-font-ui">Interface</label><input type="text" id="appearance-font-ui" placeholder='"Segoe UI", system-ui' />
+                <label for="appearance-font-editor">Editor/code</label><input type="text" id="appearance-font-editor" placeholder='"DejaVu Sans Mono", monospace' />
+                <label for="appearance-font-preview">Preview</label><input type="text" id="appearance-font-preview" placeholder='system-ui, sans-serif' />
+                <label for="appearance-font-powerline">Powerline</label><input type="text" id="appearance-font-powerline" placeholder='"DejaVu Sans Mono", "PowerlineSymbols"' />
+              </div>
+              <div class="preferences-font-actions">
+                <button type="button" id="appearance-font-save">Save fonts</button>
+                <button type="button" id="appearance-font-reset">Reset</button>
+              </div>
+            </section>
+            <section class="preferences-section">
               <strong>Task scope</strong>
               <small>Only checkboxes matching at least one configured rule appear in Tasks. Leave all fields empty to include every checkbox.</small>
               <input type="text" id="task-scope-folders" placeholder="Folders: Projects, Work" />
@@ -673,6 +696,7 @@ async function renderShell() {
         sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"></iframe>
     </div>
   `;
+  applyAppearanceFonts(appearanceFonts);
 
   $("btn-open").addEventListener("click", () => {
     closePreferences();
@@ -743,6 +767,8 @@ async function renderShell() {
   ($("task-scope-tags") as HTMLInputElement).value = taskScope.tags.join(", ");
   ($("task-scope-property") as HTMLInputElement).value = taskScope.property;
   $("task-scope-save").addEventListener("click", saveTaskScopePreferences);
+  $("appearance-font-save").addEventListener("click", saveAppearanceFontPreferences);
+  $("appearance-font-reset").addEventListener("click", resetAppearanceFontPreferences);
   $("preferences-plugin-reload").addEventListener("click", () => void reloadPlugins().then(renderPreferencesPlugins));
   $("preferences-automation-reload").addEventListener("click", () => void reloadAutomations(true));
   $("preferences-automation-create").addEventListener("click", () => void createExampleAutomationConfig());
@@ -993,11 +1019,51 @@ function resetPreviewCss() {
   setTransientStatus("Page CSS reset to default", "#5ecf9a");
 }
 
+const appearanceFontInputs: Record<keyof AppearanceFonts, string> = {
+  ui: "appearance-font-ui",
+  editor: "appearance-font-editor",
+  preview: "appearance-font-preview",
+  powerline: "appearance-font-powerline",
+};
+
+function loadAppearanceFontInputs() {
+  for (const [key, id] of Object.entries(appearanceFontInputs) as Array<[keyof AppearanceFonts, string]>) {
+    const input = document.getElementById(id) as HTMLInputElement | null;
+    if (input) input.value = appearanceFonts[key];
+  }
+}
+
+function saveAppearanceFontPreferences() {
+  const candidate = Object.fromEntries(
+    (Object.entries(appearanceFontInputs) as Array<[keyof AppearanceFonts, string]>).map(
+      ([key, id]) => [key, (document.getElementById(id) as HTMLInputElement).value],
+    ),
+  );
+  appearanceFonts = normalizeAppearanceFonts(candidate);
+  localStorage.setItem(APPEARANCE_FONTS_KEY, JSON.stringify(appearanceFonts));
+  applyAppearanceFonts(appearanceFonts);
+  loadAppearanceFontInputs();
+  updateVimPowerline();
+  setTransientStatus("Appearance fonts saved", "#5ecf9a");
+}
+
+function resetAppearanceFontPreferences() {
+  appearanceFonts = { ...DEFAULT_APPEARANCE_FONTS };
+  localStorage.removeItem(APPEARANCE_FONTS_KEY);
+  applyAppearanceFonts(appearanceFonts);
+  loadAppearanceFontInputs();
+  updateVimPowerline();
+  setTransientStatus("Appearance fonts reset", "#5ecf9a");
+}
+
 function togglePreferences() {
   const popover = $("preferences-popover");
   const opening = popover.classList.contains("hidden");
   popover.classList.toggle("hidden", !opening);
-  if (opening) loadPreviewCssEditor();
+  if (opening) {
+    loadPreviewCssEditor();
+    loadAppearanceFontInputs();
+  }
   $("btn-preferences").setAttribute("aria-expanded", opening ? "true" : "false");
   $("btn-preferences").classList.toggle("active", opening);
   if (opening) {

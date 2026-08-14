@@ -35,6 +35,7 @@ use pathutil::{
 };
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
+const DATAVIEW_INLINE_FIELDS_VERSION: &str = "1";
 
 pub struct VaultIndex {
     vault_root: PathBuf,
@@ -204,6 +205,8 @@ impl VaultIndex {
         let legacy_02_renumbering = stored_version
             .map(|stored| PROJECT_VERSION.is_legacy_02_renumbering(stored))
             .unwrap_or(false);
+        let dataview_inline_backfill = self.get_meta("dataview_inline_fields_version")?.as_deref()
+            != Some(DATAVIEW_INLINE_FIELDS_VERSION);
         let needs_rebuild = match stored_version {
             None => true, // empty or brand-new db content
             Some(stored) => PROJECT_VERSION.requires_rebuild(stored),
@@ -261,8 +264,18 @@ impl VaultIndex {
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("canvas"));
+            let inline_field_backfill = dataview_inline_backfill
+                && Path::new(rel)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
             match index_meta.get(rel) {
-                Some((im, is)) if *im == *mtime_ms && *is == *size_bytes && !canvas_backfill => {
+                Some((im, is))
+                    if *im == *mtime_ms
+                        && *is == *size_bytes
+                        && !canvas_backfill
+                        && !inline_field_backfill =>
+                {
                     stats.unchanged += 1;
                 }
                 _ => {
@@ -296,6 +309,10 @@ impl VaultIndex {
         let now = now_ms();
         self.set_meta("last_open_reconcile_ms", &now.to_string())?;
         self.write_project_version_meta()?;
+        self.set_meta(
+            "dataview_inline_fields_version",
+            DATAVIEW_INLINE_FIELDS_VERSION,
+        )?;
         Ok(stats)
     }
 
@@ -354,6 +371,10 @@ impl VaultIndex {
         self.resolve_all_links()?;
         progress(ProgressPhase::Resolve, 1, 1, None);
         self.write_project_version_meta()?;
+        self.set_meta(
+            "dataview_inline_fields_version",
+            DATAVIEW_INLINE_FIELDS_VERSION,
+        )?;
         self.set_meta("last_open_reconcile_ms", &now_ms().to_string())?;
         Ok(stats)
     }
@@ -570,6 +591,23 @@ impl VaultIndex {
                         t.priority,
                         t.recurrence,
                         t.tags_json,
+                    ],
+                )?;
+            }
+            for field in &facts.inline_fields {
+                tx.execute(
+                    "INSERT INTO inline_fields(
+                        path, field_id, key, value_text, value_type, value_json, line, start_offset
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        rel,
+                        field.field_id,
+                        field.key,
+                        field.value_text,
+                        field.value_type,
+                        field.value_json,
+                        field.line,
+                        field.start_offset,
                     ],
                 )?;
             }
@@ -1068,6 +1106,8 @@ title: YAML Title
 
 Link to [[Other]]
 
+Rating:: 5
+
 - [ ] Task one #tag
 "#,
         )
@@ -1080,6 +1120,23 @@ Link to [[Other]]
         assert!(idx.count("tasks").unwrap() >= 1);
         assert!(idx.count("links").unwrap() >= 1);
         assert!(idx.count("headings").unwrap() >= 1);
+        assert_eq!(idx.count("inline_fields").unwrap(), 1);
+        let (inline_key, inline_type, inline_json): (String, String, String) = idx
+            .connection()
+            .query_row(
+                "SELECT key, value_type, value_json FROM inline_fields WHERE path = 'Note.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                inline_key.as_str(),
+                inline_type.as_str(),
+                inline_json.as_str()
+            ),
+            ("Rating", "number", "5")
+        );
 
         let (title, properties, tags, links): (String, String, String, String) = idx
             .connection()

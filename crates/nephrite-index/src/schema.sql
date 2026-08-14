@@ -304,7 +304,11 @@ SELECT
             'done', todo.done_date,
             'created', todo.created_date,
             'priority', todo.priority,
-            'recurrence', todo.recurrence
+            'recurrence', todo.recurrence,
+            'tags', CASE
+                WHEN json_valid(todo.tags_json) THEN json(todo.tags_json)
+                ELSE json('[]')
+            END
         ))
         FROM tasks todo
         WHERE todo.path = f.path

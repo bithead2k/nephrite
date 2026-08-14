@@ -9,6 +9,7 @@ import {
 } from "../ui/src/context-menu";
 import { hydrateNoteEmbeds } from "../ui/src/note-embed";
 import { renderPreview } from "../ui/src/preview";
+import { applyAppearanceFonts, normalizeAppearanceFonts } from "../ui/src/appearance";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -31,6 +32,23 @@ Object.defineProperties(globalThis, {
 
 dom.window.HTMLElement.prototype.scrollIntoView = () => {};
 dom.window.alert = () => {};
+
+test("appearance fonts are sanitized and applied independently", () => {
+  const fonts = normalizeAppearanceFonts({
+    ui: '"Inter", sans-serif',
+    editor: '"DejaVu Sans Mono", monospace',
+    preview: "serif",
+    powerline: "bad; color: red",
+  });
+  applyAppearanceFonts(fonts, document.documentElement);
+  assert.equal(document.documentElement.style.getPropertyValue("--font"), '"Inter", sans-serif');
+  assert.equal(
+    document.documentElement.style.getPropertyValue("--editor-font"),
+    '"DejaVu Sans Mono", monospace',
+  );
+  assert.equal(document.documentElement.style.getPropertyValue("--preview-font"), "serif");
+  assert.equal(document.documentElement.style.getPropertyValue("--powerline-font"), "");
+});
 
 test("a mounted file-tab menu exposes file actions without redundant open actions", () => {
   const selected: Array<{ action: CtxAction; target: CtxTarget }> = [];

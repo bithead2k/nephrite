@@ -27,6 +27,13 @@ export type DvPage = {
     size?: number | null;
     user?: string | null;
     group?: string | null;
+    tags?: string[];
+    etags?: string[];
+    aliases?: string[];
+    tasks?: DvTask[];
+    frontmatter?: Record<string, unknown>;
+    outlinks?: string[];
+    inlinks?: string[];
   };
   [key: string]: unknown;
 };
@@ -35,22 +42,59 @@ export type DvApi = {
   current: () => DvPage;
   pages: (source?: string) => DvPageList;
   page: (path: string) => DvPage | null;
+  pagePaths: (source?: string) => DvDataArray<string>;
+  array: <T>(value: T | Iterable<T> | null | undefined) => DvDataArray<T>;
+  compare: (left: unknown, right: unknown) => number;
+  equal: (left: unknown, right: unknown) => boolean;
+  clone: <T>(value: T) => T;
+  fileLink: (path: string, embed?: boolean, display?: string) => string;
+  sectionLink: (path: string, section: string, embed?: boolean, display?: string) => string;
+  blockLink: (path: string, block: string, embed?: boolean, display?: string) => string;
   date: (input?: unknown) => Date | null;
   duration?: (s: string) => unknown;
   paragraph: (html: unknown) => void;
   list: (items: unknown) => void;
   table: (headers: string[], rows: unknown[][]) => void;
+  taskList: (tasks: Iterable<DvTask>, groupByFile?: boolean) => void;
+  markdownTable: (headers: string[], rows: unknown[][]) => string;
+  markdownList: (items: Iterable<unknown>) => string;
+  markdownTaskList: (tasks: Iterable<DvTask>) => string;
+  query: (source: string) => Promise<{ successful: boolean; value?: unknown; error?: string }>;
+  tryQuery: (source: string) => Promise<unknown>;
+  execute: (source: string) => Promise<void>;
+  executeJs: (source: string) => Promise<void>;
+  evaluate: (expression: string, context?: Record<string, unknown>) => { successful: boolean; value?: unknown; error?: string };
+  tryEvaluate: (expression: string, context?: Record<string, unknown>) => unknown;
+  io: {
+    load: (path: string) => Promise<string>;
+    csv: (path: string) => Promise<DvDataArray<Record<string, string>>>;
+    normalize: (path: string, origin?: string) => string;
+  };
   el: (tag: string, text?: string) => HTMLElement;
   span: (text: string) => HTMLElement;
   header: (level: number, text: string) => void;
-  view?: unknown;
+  view: (path: string, input?: unknown) => Promise<void>;
 };
 
-export type DvPageList = Array<DvPage> & {
-  file: { link: string[] };
-  where: (predicate: (page: DvPage, index: number) => unknown) => DvPageList;
-  limit: (n: number) => DvPageList;
+export type DvTask = Record<string, unknown> & {
+  path: string;
+  task_id: number;
+  text?: string;
+  completed?: boolean;
 };
+
+export type DvDataArray<T> = Array<T> & {
+  where: (predicate: (value: T, index: number) => unknown) => DvDataArray<T>;
+  limit: (n: number) => DvDataArray<T>;
+  distinct: (key?: (value: T) => unknown) => DvDataArray<T>;
+  groupBy: (key: (value: T) => unknown) => DvDataArray<{ key: unknown; rows: DvDataArray<T> }>;
+  first: () => T | undefined;
+  last: () => T | undefined;
+  values: T[];
+  array: () => T[];
+};
+
+export type DvPageList = DvDataArray<DvPage> & { file: Record<string, DvDataArray<unknown>> };
 
 export type EngineContext = {
   currentPath: string;
@@ -58,6 +102,8 @@ export type EngineContext = {
   loadPages: (source?: string) => Promise<DvPage[]>;
   loadPage: (path: string) => Promise<DvPage | null>;
   runSql: (sql: string) => Promise<SqlQueryResult>;
+  readFile?: (path: string) => Promise<string>;
+  setTaskCompleted?: (path: string, taskId: number, completed: boolean) => Promise<unknown>;
   resolveLink: (target: string) => void;
 };
 
@@ -128,42 +174,57 @@ function extractInlineScriptFlags(markdown: string): boolean[] {
   return flags;
 }
 
-function wrapList(pages: DvPage[]): DvPageList {
-  const arr = pages.slice() as DvPageList;
-  Object.defineProperty(arr, "file", {
-    get() {
-      return { link: arr.map((p) => p.file.link) };
+export function wrapDataArray<T>(values: Iterable<T>): DvDataArray<T> {
+  const target = Array.from(values) as DvDataArray<T>;
+  const wrap = (items: Iterable<T>) => wrapDataArray(items);
+  Object.defineProperties(target, {
+    where: { value: (predicate: (value: T, index: number) => unknown) => wrap(target.filter(predicate)), enumerable: false },
+    limit: { value: (n: number) => wrap(target.slice(0, Math.max(0, n))), enumerable: false },
+    distinct: { value: (key: (value: T) => unknown = (value) => value) => {
+      const seen = new Set<unknown>();
+      return wrap(target.filter((value) => { const identity = key(value); if (seen.has(identity)) return false; seen.add(identity); return true; }));
+    }, enumerable: false },
+    groupBy: { value: (key: (value: T) => unknown) => {
+      const groups = new Map<unknown, T[]>();
+      for (const value of target) { const identity = key(value); groups.set(identity, [...(groups.get(identity) ?? []), value]); }
+      return wrapDataArray([...groups].map(([identity, rows]) => ({ key: identity, rows: wrap(rows) })));
+    }, enumerable: false },
+    first: { value: () => target[0], enumerable: false },
+    last: { value: () => target.at(-1), enumerable: false },
+    values: { get: () => target.slice(), enumerable: false },
+    array: { value: () => target.slice(), enumerable: false },
+  });
+  return new Proxy(target, {
+    get(array, property, receiver) {
+      if (property === "then") return undefined;
+      if (property === "filter") return (predicate: (value: T, index: number) => unknown) => wrap(array.filter(predicate));
+      if (property === "map") return <U>(mapper: (value: T, index: number) => U) => wrapDataArray(array.map(mapper));
+      if (property === "flatMap") return <U>(mapper: (value: T, index: number) => U | U[]) => wrapDataArray(array.flatMap(mapper));
+      if (property === "concat") return (...items: (T | ConcatArray<T>)[]) => wrap(array.concat(...items));
+      if (property === "slice") return (start?: number, end?: number) => wrap(array.slice(start, end));
+      if (property === "sort") return (keyOrComparator?: ((value: T, other?: T) => unknown), direction?: string) => {
+        const copy = array.slice();
+        if (keyOrComparator && direction) {
+          const sign = direction.toLowerCase() === "desc" ? -1 : 1;
+          copy.sort((left, right) => compareValues(keyOrComparator(left), keyOrComparator(right)) * sign);
+        } else if (keyOrComparator) copy.sort(keyOrComparator as (left: T, right: T) => number);
+        else copy.sort();
+        return wrap(copy);
+      };
+      if (typeof property === "string" && !(property in array)) {
+        const swizzled = array.flatMap((value) => {
+          const child = value == null ? null : (value as Record<string, unknown>)[property];
+          return Array.isArray(child) ? child : [child];
+        });
+        return wrapDataArray(swizzled);
+      }
+      return Reflect.get(array, property, receiver);
     },
   });
-  // Patch filter/sort to keep .file / .limit helpers
-  const nativeFilter = Array.prototype.filter;
-  const nativeSort = Array.prototype.sort;
-  arr.filter = function (this: DvPage[], predicate: (value: DvPage, index: number, array: DvPage[]) => unknown) {
-    return wrapList(nativeFilter.call(this, predicate) as DvPage[]);
-  } as typeof arr.filter;
-  arr.where = (predicate) => wrapList(nativeFilter.call(arr, predicate) as DvPage[]);
-  arr.sort = function (
-    this: DvPage[],
-    compareOrKey?: ((a: DvPage, b?: DvPage) => unknown),
-    direction?: string,
-  ) {
-    if (compareOrKey && direction) {
-      const sign = direction.toLowerCase() === "desc" ? -1 : 1;
-      nativeSort.call(this, (a: DvPage, b: DvPage) => {
-        const av = compareOrKey(a);
-        const bv = compareOrKey(b);
-        return compareValues(av, bv) * sign;
-      });
-    } else {
-      nativeSort.call(
-        this,
-        compareOrKey as ((a: DvPage, b: DvPage) => number) | undefined,
-      );
-    }
-    return this as DvPageList;
-  } as typeof arr.sort;
-  arr.limit = (n) => wrapList(arr.slice(0, n));
-  return arr;
+}
+
+function wrapList(pages: DvPage[]): DvPageList {
+  return wrapDataArray(pages) as DvPageList;
 }
 
 class DvDate extends Date {
@@ -350,6 +411,7 @@ export async function runScriptBlock(
   container: HTMLElement,
   ctx: EngineContext,
   inline = false,
+  scriptInput?: unknown,
 ): Promise<void> {
   queryDiagnostic("dataviewjs.invoke", { path: ctx.currentPath, inline });
   const outputs: HTMLElement[] = [];
@@ -377,16 +439,43 @@ export async function runScriptBlock(
   }
   const thisNote = makeThisNote(current, ctx, fileMeta);
 
+  if (inline && /^\s*=/.test(code)) {
+    try {
+      pushHtml(stringifyInline(evaluateDql(code.replace(/^\s*=\s*/, ""), thisNote, thisNote)));
+    } catch (error) {
+      const failure = document.createElement("span");
+      failure.className = "dv-error";
+      failure.textContent = `Inline query error: ${error instanceof Error ? error.message : String(error)}`;
+      container.appendChild(failure);
+    }
+    bindPreviewLinks(container, ctx);
+    return;
+  }
+
   const dv: DvApi = {
     current: () => thisNote,
-    pages: (_source?: string) => {
-      // sync facade — populated before AsyncFunction runs via preloaded
-      return wrapList((dv as unknown as { _pages: DvPage[] })._pages || []);
+    pages: (source?: string) => {
+      const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
+      return wrapList(filterPagesBySource(pages, source, ctx.currentPath));
     },
     page: (path: string) => {
       const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
       return pages.find((p) => p.path === path || p.path === path + ".md") ?? null;
     },
+    pagePaths: (source?: string) => wrapDataArray(dv.pages(source).map((page) => page.path)),
+    array: <T>(value: T | Iterable<T> | null | undefined) => {
+      if (value == null) return wrapDataArray<T>([]);
+      if (typeof value !== "string" && Symbol.iterator in Object(value)) return wrapDataArray(value as Iterable<T>);
+      return wrapDataArray([value as T]);
+    },
+    compare: compareValues,
+    equal: (left, right) => compareValues(left, right) === 0,
+    clone: <T>(value: T): T => typeof structuredClone === "function"
+      ? structuredClone(value)
+      : JSON.parse(JSON.stringify(value)) as T,
+    fileLink: (path, embed = false, display) => makeWikilink(path, embed, display),
+    sectionLink: (path, section, embed = false, display) => makeWikilink(`${path}#${section}`, embed, display),
+    blockLink: (path, block, embed = false, display) => makeWikilink(`${path}^${block}`, embed, display),
     date: (input?: unknown) => {
       if (input == null || input === "") return new DvDate();
       if (input instanceof Date || typeof input === "string" || typeof input === "number") {
@@ -433,6 +522,59 @@ export async function runScriptBlock(
         .join("");
       pushHtml(`<table class="dv-table"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`);
     },
+    taskList: (tasks, _groupByFile = false) => {
+      const mount = document.createElement("div");
+      outputs.push(mount);
+      container.appendChild(mount);
+      renderTaskQuery(mount, [...tasks].map((task) => ({ ...task, task })), ctx);
+    },
+    markdownTable: (headers, rows) => markdownTable(headers, rows),
+    markdownList: (items) => [...items].map((item) => `- ${plainString(item)}`).join("\n"),
+    markdownTaskList: (tasks) => [...tasks].map((task) => `- [${task.completed ? "x" : " "}] ${task.text ?? ""}`).join("\n"),
+    query: async (source) => queryDqlForApi(source, ctx),
+    tryQuery: async (source) => {
+      const result = await queryDqlForApi(source, ctx);
+      if (!result.successful) throw new Error(result.error);
+      return result.value;
+    },
+    execute: async (source) => {
+      const mount = document.createElement("div");
+      outputs.push(mount);
+      container.appendChild(mount);
+      await runDqlBlock(source, mount, ctx);
+    },
+    executeJs: async (source) => {
+      const mount = document.createElement("div");
+      outputs.push(mount);
+      container.appendChild(mount);
+      await runScriptBlock(source, mount, ctx);
+    },
+    evaluate: (expression, context = {}) => {
+      try { return { successful: true, value: evaluateDql(expression, { ...thisNote, ...context }, thisNote) }; }
+      catch (error) { return { successful: false, error: error instanceof Error ? error.message : String(error) }; }
+    },
+    tryEvaluate: (expression, context = {}) => evaluateDql(expression, { ...thisNote, ...context }, thisNote),
+    io: {
+      load: async (path) => {
+        if (!ctx.readFile) throw new Error("Vault file access is unavailable in this view");
+        return ctx.readFile(normalizeIoPath(path, ctx.currentPath));
+      },
+      csv: async (path) => {
+        if (!ctx.readFile) throw new Error("Vault file access is unavailable in this view");
+        return wrapDataArray(parseCsv(await ctx.readFile(normalizeIoPath(path, ctx.currentPath))));
+      },
+      normalize: (path, origin = ctx.currentPath) => normalizeIoPath(path, origin),
+    },
+    view: async (path, input) => {
+      if (!ctx.readFile) throw new Error("Vault file access is unavailable in this view");
+      const normalized = normalizeIoPath(path.endsWith(".js") ? path : `${path}.js`, ctx.currentPath);
+      const source = await ctx.readFile(normalized);
+      const mount = document.createElement("div");
+      mount.className = "dv-custom-view";
+      outputs.push(mount);
+      container.appendChild(mount);
+      await runScriptBlock(source, mount, ctx, false, input);
+    },
     el: (tag: string, text?: string) => {
       const el = document.createElement(tag);
       if (text) el.textContent = text;
@@ -453,22 +595,9 @@ export async function runScriptBlock(
     },
   };
 
-  // Preload pages for source used in code — heuristic: parse dv.pages("...")
-  const sources = [...code.matchAll(/dv\.pages\s*\(\s*(['"`])(.*?)\1\s*\)/g)].map(
-    (m) => m[2],
-  );
-  if (sources.length === 0) sources.push("");
-  const all: DvPage[] = [];
-  const seen = new Set<string>();
-  for (const s of sources) {
-    const batch = await ctx.loadPages(s || undefined);
-    for (const p of batch) {
-      if (!seen.has(p.path)) {
-        seen.add(p.path);
-        all.push(normalizePage(p));
-      }
-    }
-  }
+  // Dataview's JavaScript API is synchronous. Preload the disposable page index
+  // once, then evaluate every source expression against that immutable snapshot.
+  const all = (await ctx.loadPages()).map(normalizePage);
   (dv as unknown as { _pages: DvPage[] })._pages = all;
 
   // Global helpers seen in vaults
@@ -549,6 +678,7 @@ export async function runScriptBlock(
           "choice",
           "luxonish",
           "note",
+          "input",
           `"use strict";\nreturn (${expression});`,
         );
       } catch {
@@ -561,6 +691,7 @@ export async function runScriptBlock(
           "choice",
           "luxonish",
           "note",
+          "input",
           `"use strict";\n${expression}`,
         );
       }
@@ -573,6 +704,7 @@ export async function runScriptBlock(
         "choice",
         "luxonish",
         "note",
+        "input",
         `"use strict";\n${code}`,
       );
     }
@@ -585,6 +717,7 @@ export async function runScriptBlock(
       choice,
       luxonish,
       thisNote,
+      scriptInput,
     );
     if (inline && outputs.length === 0 && result !== undefined) {
       pushHtml(stringifyInline(result));
@@ -614,6 +747,25 @@ export async function runScriptBlock(
 }
 
 type DqlColumn = { expression: string; label: string };
+export type DqlQuery = {
+  kind: "TABLE" | "LIST" | "TASK" | "CALENDAR";
+  withoutId: boolean;
+  columns: DqlColumn[];
+  expression: string | null;
+  source: string | null;
+  where: string[];
+  flatten: { expression: string; alias: string }[];
+  group: { expression: string; alias: string } | null;
+  operations: (
+    | { kind: "where"; expression: string }
+    | { kind: "flatten"; expression: string; alias: string }
+    | { kind: "group"; expression: string; alias: string }
+  )[];
+  sort: { expression: string; descending: boolean }[];
+  limit: number | null;
+};
+
+type DqlRow = Record<string, unknown> & { file?: DvPage["file"]; path?: string };
 
 /** Execute the common Dataview DQL surface without treating DQL as JavaScript. */
 export async function runDqlBlock(
@@ -627,30 +779,61 @@ export async function runDqlBlock(
       (await ctx.loadPage(ctx.currentPath)) ?? stubPage(ctx.currentPath),
     );
     const query = parseDql(code);
-    let pages = (await ctx.loadPages(query.source || undefined)).map(normalizePage);
-    if (query.where) {
-      pages = pages.filter((page) => Boolean(evaluateDql(query.where!, page, current)));
+    const loaded = (await ctx.loadPages()).map(normalizePage);
+    let rows: DqlRow[] = filterPagesBySource(loaded, query.source, ctx.currentPath);
+    if (query.kind === "TASK") {
+      rows = rows.flatMap((page) => (page.file?.tasks ?? []).map((task) => ({
+        ...page,
+        ...task,
+        task,
+        file: page.file,
+        path: page.path,
+      })));
     }
-    if (query.sort.length > 0) {
-      pages.sort((left, right) => {
-        for (const sort of query.sort) {
-          const comparison = compareValues(
-            evaluateDql(sort.expression, left, current),
-            evaluateDql(sort.expression, right, current),
-          );
-          if (comparison !== 0) return sort.descending ? -comparison : comparison;
+    for (const operation of query.operations) {
+      if (operation.kind === "where") {
+        rows = rows.filter((row) => Boolean(evaluateDql(operation.expression, row, current)));
+      } else if (operation.kind === "flatten") {
+        rows = rows.flatMap((row) => {
+          const value = evaluateDql(operation.expression, row, current);
+          const values = Array.isArray(value) ? value : [value];
+          return values.map((item) => ({ ...row, [operation.alias]: item }));
+        });
+      } else {
+        const groups = new Map<unknown, DqlRow[]>();
+        for (const row of rows) {
+          const key = evaluateDql(operation.expression, row, current);
+          groups.set(key, [...(groups.get(key) ?? []), row]);
         }
-        return 0;
-      });
+        rows = [...groups].map(([key, members]) => ({
+          key,
+          [operation.alias]: key,
+          rows: wrapDataArray(members),
+        }));
+      }
     }
-    if (query.limit != null) pages = pages.slice(0, query.limit);
+    if (query.sort.length > 0) rows.sort((left, right) => {
+      for (const sort of query.sort) {
+        const comparison = compareValues(
+          evaluateDql(sort.expression, left, current),
+          evaluateDql(sort.expression, right, current),
+        );
+        if (comparison !== 0) return sort.descending ? -comparison : comparison;
+      }
+      return 0;
+    });
+    if (query.limit != null) rows = rows.slice(0, query.limit);
 
     if (query.kind === "LIST") {
-      const items = pages.map((page) => query.listExpression
-        ? evaluateDql(query.listExpression, page, current)
-        : page);
+      const items = rows.map((row) => query.expression
+        ? evaluateDql(query.expression, row, current)
+        : row);
       container.innerHTML = `<ul class="dv-list">${items.map((item) =>
         `<li>${stringify(item)}</li>`).join("")}</ul>`;
+    } else if (query.kind === "TASK") {
+      renderTaskQuery(container, rows, ctx);
+    } else if (query.kind === "CALENDAR") {
+      renderCalendarQuery(container, rows, query.expression, current);
     } else {
       const columns = query.columns;
       const includeId = !query.withoutId;
@@ -658,16 +841,16 @@ export async function runDqlBlock(
         ...(includeId ? ["File"] : []),
         ...columns.map((column) => column.label),
       ];
-      const rows = pages.map((page) => [
-        ...(includeId ? [page] : []),
-        ...columns.map((column) => evaluateDql(column.expression, page, current)),
+      const cells = rows.map((row) => [
+        ...(includeId ? [row] : []),
+        ...columns.map((column) => evaluateDql(column.expression, row, current)),
       ]);
       const hints = [
         ...(includeId ? ["file"] : []),
         ...columns.map((column) => `${column.expression} ${column.label}`),
       ];
       container.innerHTML = `<table class="dv-table"><thead><tr>${headers.map((header) =>
-        `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) =>
+        `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${cells.map((row) =>
         `<tr>${row.map((value, index) => `<td>${stringify(value, hints[index])}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
     }
     queryDiagnostic("dataview.result", {
@@ -694,6 +877,50 @@ export async function runDqlBlock(
     });
   });
   bindQueryUriLinks(container);
+}
+
+function renderTaskQuery(container: HTMLElement, rows: DqlRow[], ctx: EngineContext): void {
+  container.innerHTML = `<ul class="dv-task-list">${rows.map((row) => {
+    const task = (row.task ?? row) as DvTask;
+    return `<li><label><input type="checkbox" data-task-path="${esc(String(task.path ?? row.path ?? ""))}" data-task-id="${Number(task.task_id ?? task.id ?? 0)}" ${task.completed ? "checked" : ""}><span>${stringify(task.text ?? "")}</span></label> <span class="dv-task-source">${stringify(row as unknown)}</span></li>`;
+  }).join("")}</ul>`;
+  container.querySelectorAll<HTMLInputElement>("input[data-task-id]").forEach((checkbox) => {
+    checkbox.addEventListener("change", async () => {
+      const path = checkbox.dataset.taskPath ?? "";
+      const taskId = Number(checkbox.dataset.taskId);
+      if (!ctx.setTaskCompleted || !path || !Number.isFinite(taskId)) return;
+      checkbox.disabled = true;
+      try { await ctx.setTaskCompleted(path, taskId, checkbox.checked); }
+      catch { checkbox.checked = !checkbox.checked; }
+      finally { checkbox.disabled = false; }
+    });
+  });
+}
+
+function renderCalendarQuery(
+  container: HTMLElement,
+  rows: DqlRow[],
+  expression: string | null,
+  current: DvPage,
+): void {
+  const dated = rows.map((row) => ({ row, date: toDvDate(evaluateDql(expression || "file.day", row, current)) }))
+    .filter((entry): entry is { row: DqlRow; date: DvDate } => entry.date != null);
+  const months = new Map<string, typeof dated>();
+  for (const entry of dated) {
+    const key = `${entry.date.year}-${String(entry.date.month).padStart(2, "0")}`;
+    months.set(key, [...(months.get(key) ?? []), entry]);
+  }
+  container.innerHTML = [...months].sort(([left], [right]) => left.localeCompare(right)).map(([key, entries]) => {
+    const [year, month] = key.split("-").map(Number);
+    const first = new Date(year, month - 1, 1).getDay();
+    const days = new Date(year, month, 0).getDate();
+    const cells = Array.from({ length: first }, () => "<div class=\"dv-calendar-empty\"></div>");
+    for (let day = 1; day <= days; day++) {
+      const matches = entries.filter((entry) => entry.date.day === day);
+      cells.push(`<div class="dv-calendar-day"><strong>${day}</strong>${matches.map((entry) => `<div>${stringify(entry.row)}</div>`).join("")}</div>`);
+    }
+    return `<section class="dv-calendar"><h3>${new Date(year, month - 1).toLocaleDateString(undefined, { month: "long", year: "numeric" })}</h3><div class="dv-calendar-grid">${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => `<b>${day}</b>`).join("")}${cells.join("")}</div></section>`;
+  }).join("") || "<div class=\"dv-empty\">No dated pages.</div>";
 }
 
 /** Execute native read-only vault SQL and render it like every other query table. */
@@ -764,55 +991,68 @@ export async function runSqlBlock(
   }
 }
 
-function parseDql(code: string): {
-  kind: "TABLE" | "LIST";
-  withoutId: boolean;
-  columns: DqlColumn[];
-  listExpression: string | null;
-  source: string | null;
-  where: string | null;
-  sort: { expression: string; descending: boolean }[];
-  limit: number | null;
-} {
+export function parseDql(code: string): DqlQuery {
   const lines = code.replace(/\r/g, "").split("\n");
-  const clauses = new Map<string, string>();
+  const clauses: { marker: string; value: string }[] = [];
   let active = "";
   for (const original of lines) {
     const line = original.trim();
     if (!line || line.startsWith("//")) continue;
-    const marker = line.match(/^(TABLE|LIST|FROM|WHERE|SORT|LIMIT)\b(.*)$/i);
+    const marker = line.match(/^(TABLE|LIST|TASK|CALENDAR|FROM|WHERE|FLATTEN|GROUP\s+BY|SORT|LIMIT)\b(.*)$/i);
     if (marker) {
-      active = marker[1].toUpperCase();
-      clauses.set(active, marker[2].trim());
+      active = marker[1].toUpperCase().replace(/\s+/g, " ");
+      clauses.push({ marker: active, value: marker[2].trim() });
     } else if (active) {
-      clauses.set(active, `${clauses.get(active) || ""} ${line}`.trim());
+      clauses[clauses.length - 1].value = `${clauses.at(-1)?.value ?? ""} ${line}`.trim();
     }
   }
-  const table = clauses.get("TABLE");
-  const list = clauses.get("LIST");
-  if (table == null && list == null) throw new Error("Expected TABLE or LIST");
-  let tableText = table ?? "";
-  const withoutId = /^WITHOUT\s+ID\b/i.test(tableText);
-  tableText = tableText.replace(/^WITHOUT\s+ID\b/i, "").trim();
-  const columns = tableText ? splitDqlList(tableText).map(parseDqlColumn) : [];
-  const sourceMatch = clauses.get("FROM")?.match(/^["']([^"']+)["']/);
-  const sort = clauses.has("SORT")
-    ? splitDqlList(clauses.get("SORT")!).map((part) => {
+  const header = clauses.find((clause) => ["TABLE", "LIST", "TASK", "CALENDAR"].includes(clause.marker));
+  if (!header) throw new Error("Expected TABLE, LIST, TASK, or CALENDAR");
+  let headerText = header.value;
+  const withoutId = /^WITHOUT\s+ID\b/i.test(headerText);
+  headerText = headerText.replace(/^WITHOUT\s+ID\b/i, "").trim();
+  const columns = header.marker === "TABLE" && headerText
+    ? splitDqlList(headerText).map(parseDqlColumn)
+    : [];
+  const sorts = clauses.filter((clause) => clause.marker === "SORT");
+  const sort = sorts.flatMap((clause) =>
+    splitDqlList(clause.value).map((part) => {
         const match = part.trim().match(/^(.*?)(?:\s+(ASC|DESC))?$/i)!;
         return { expression: match[1].trim(), descending: match[2]?.toUpperCase() === "DESC" };
-      })
-    : [];
-  const parsedLimit = Number.parseInt(clauses.get("LIMIT") || "", 10);
+      }),
+  );
+  const limitText = clauses.find((clause) => clause.marker === "LIMIT")?.value ?? "";
+  const parsedLimit = Number.parseInt(limitText, 10);
+  const expression = header.marker === "LIST" || header.marker === "CALENDAR"
+    ? headerText || null
+    : null;
+  const operationClauses = clauses.filter((clause) => ["WHERE", "FLATTEN", "GROUP BY"].includes(clause.marker));
   return {
-    kind: table != null ? "TABLE" : "LIST",
+    kind: header.marker as DqlQuery["kind"],
     withoutId,
     columns,
-    listExpression: list?.trim() || null,
-    source: sourceMatch?.[1] ?? null,
-    where: clauses.get("WHERE") || null,
+    expression,
+    source: clauses.find((clause) => clause.marker === "FROM")?.value || null,
+    where: clauses.filter((clause) => clause.marker === "WHERE").map((clause) => clause.value),
+    flatten: clauses.filter((clause) => clause.marker === "FLATTEN").map((clause) => parseDqlBinding(clause.value)),
+    group: clauses.find((clause) => clause.marker === "GROUP BY")
+      ? parseDqlBinding(clauses.find((clause) => clause.marker === "GROUP BY")!.value)
+      : null,
+    operations: operationClauses.map((clause) => {
+      if (clause.marker === "WHERE") return { kind: "where" as const, expression: clause.value };
+      const binding = parseDqlBinding(clause.value);
+      return { kind: clause.marker === "FLATTEN" ? "flatten" as const : "group" as const, ...binding };
+    }),
     sort,
     limit: Number.isFinite(parsedLimit) ? Math.max(0, parsedLimit) : null,
   };
+}
+
+function parseDqlBinding(value: string): { expression: string; alias: string } {
+  const match = value.match(/^(.*?)\s+AS\s+(?:"([^"]+)"|'([^']+)'|([\w-]+))$/i);
+  const expression = (match?.[1] ?? value).trim();
+  const alias = (match?.[2] ?? match?.[3] ?? match?.[4] ?? expression.split(".").at(-1) ?? "value").trim();
+  return { expression, alias };
 }
 
 function parseDqlColumn(part: string): DqlColumn {
@@ -881,9 +1121,95 @@ export function lowerDqlFunctionAliases(expression: string): string {
   return output;
 }
 
+/** Apply Dataview's page-source selectors to an already-loaded page collection. */
+export function filterPagesBySource(
+  pages: DvPage[],
+  source?: string | null,
+  currentPath = "",
+): DvPage[] {
+  const text = source?.trim();
+  if (!text) return pages.slice();
+  return pages.filter((page) => matchesSource(page, text, pages, currentPath));
+}
+
+function matchesSource(page: DvPage, raw: string, pages: DvPage[], currentPath: string): boolean {
+  let source = stripOuterParens(raw.trim());
+  const or = splitSourceOperator(source, "OR");
+  if (or.length > 1) return or.some((part) => matchesSource(page, part, pages, currentPath));
+  const and = splitSourceOperator(source, "AND");
+  if (and.length > 1) return and.every((part) => matchesSource(page, part, pages, currentPath));
+  if (/^(?:NOT\s+|-)/i.test(source)) {
+    source = source.replace(/^(?:NOT\s+|-)/i, "");
+    return !matchesSource(page, source, pages, currentPath);
+  }
+  const quoted = source.match(/^["'](.*)["']$/);
+  if (quoted) {
+    const folder = quoted[1].replace(/^\/+|\/+$/g, "").toLocaleLowerCase();
+    return page.file.folder.toLocaleLowerCase() === folder || page.path.toLocaleLowerCase().startsWith(`${folder}/`);
+  }
+  if (source.startsWith("#")) {
+    const tag = source.toLocaleLowerCase();
+    return (page.file.tags ?? []).some((candidate) => candidate.toLocaleLowerCase() === tag || candidate.toLocaleLowerCase().startsWith(`${tag}/`));
+  }
+  const outgoing = source.match(/^outgoing\s*\(\s*\[\[([^\]]+)\]\]\s*\)$/i);
+  if (outgoing) {
+    const owner = findPage(pages, outgoing[1] === "this.file" ? currentPath : outgoing[1]);
+    return Boolean(owner?.file.outlinks?.some((target) => linksEqual(target, page.path)));
+  }
+  const link = source.match(/^\[\[([^\]]+)\]\]$/);
+  if (link) return (page.file.outlinks ?? []).some((target) => linksEqual(target, link[1]));
+  return true;
+}
+
+function stripOuterParens(value: string): string {
+  if (!value.startsWith("(") || !value.endsWith(")")) return value;
+  let depth = 0;
+  for (let index = 0; index < value.length; index++) {
+    if (value[index] === "(") depth++;
+    if (value[index] === ")") depth--;
+    if (depth === 0 && index < value.length - 1) return value;
+  }
+  return stripOuterParens(value.slice(1, -1).trim());
+}
+
+function splitSourceOperator(value: string, operator: "AND" | "OR"): string[] {
+  const output: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let quote = "";
+  const pattern = new RegExp(`\\s+${operator}\\s+`, "iy");
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (quote) { if (char === quote && value[index - 1] !== "\\") quote = ""; continue; }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === "(") depth++;
+    else if (char === ")") depth--;
+    else if (depth === 0) {
+      pattern.lastIndex = index;
+      const match = pattern.exec(value);
+      if (match) { output.push(value.slice(start, index).trim()); start = pattern.lastIndex; index = pattern.lastIndex - 1; }
+    }
+  }
+  output.push(value.slice(start).trim());
+  return output;
+}
+
+function linksEqual(left: string, right: string): boolean {
+  const clean = (value: string) => value.split(/[|#^]/)[0].replace(/\.md$/i, "").replace(/\\/g, "/").toLocaleLowerCase();
+  const a = clean(left); const b = clean(right);
+  return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+}
+
+function findPage(pages: DvPage[], path: string): DvPage | undefined {
+  return pages.find((page) => linksEqual(page.path, path));
+}
+
 /** Evaluate one DQL expression after lowering compatibility aliases to the IR vocabulary. */
-export function evaluateDql(expression: string, row: DvPage, current: DvPage): unknown {
+export function evaluateDql(expression: string, row: DqlRow, current: DvPage): unknown {
   const javascript = lowerDqlFunctionAliases(expression)
+    .replace(/\bdate\(\s*(today|now)\s*\)/gi, 'date("$1")')
+    .replace(/\bdate\(\s*(\d{4}-\d{2}-\d{2}(?:T[^)\s]+)?)\s*\)/gi, 'date("$1")')
+    .replace(/\bdur\(\s*(-?\d+(?:\.\d+)?)\s+(years?|months?|weeks?|days?|hours?|minutes?|seconds?)\s*\)/gi, 'dur("$1 $2")')
     .replace(/\bthis\./gi, "current.")
     .replace(/\bAND\b/gi, "&&")
     .replace(/\bOR\b/gi, "||")
@@ -894,13 +1220,61 @@ export function evaluateDql(expression: string, row: DvPage, current: DvPage): u
     contains: (haystack: unknown, needle: unknown) => Array.isArray(haystack)
       ? haystack.includes(needle)
       : String(haystack ?? "").includes(String(needle ?? "")),
+    icontains: (haystack: unknown, needle: unknown) => String(haystack ?? "").toLocaleLowerCase().includes(String(needle ?? "").toLocaleLowerCase()),
+    econtains: (haystack: unknown, needle: unknown) => Array.isArray(haystack) ? haystack.includes(needle) : String(haystack ?? "") === String(needle ?? ""),
+    containsword: (haystack: unknown, needle: unknown) => new RegExp(`(?:^|\\W)${escapeRegex(String(needle ?? ""))}(?:$|\\W)`, "iu").test(String(haystack ?? "")),
+    startswith: (value: unknown, prefix: unknown) => String(value ?? "").startsWith(String(prefix ?? "")),
+    endswith: (value: unknown, suffix: unknown) => String(value ?? "").endsWith(String(suffix ?? "")),
     string: (value: unknown) => String(value ?? ""),
-    length: (value: unknown) => value == null ? 0 : String(value).length,
+    number: (value: unknown) => Number(value),
+    length: (value: unknown) => value == null ? 0 : Array.isArray(value) || typeof value === "string" ? value.length : typeof value === "object" ? Object.keys(value).length : String(value).length,
     choice: (condition: unknown, yes: unknown, no: unknown) => condition ? yes : no,
     coalesce: (...values: unknown[]) => values.find((value) => value != null),
     regexmatch: (pattern: string, value: unknown) => new RegExp(pattern).test(String(value ?? "")),
+    regextest: (pattern: string, value: unknown) => new RegExp(pattern).test(String(value ?? "")),
+    regexreplace: (value: unknown, pattern: string, replacement: string) => String(value ?? "").replace(new RegExp(pattern, "g"), replacement),
+    replace: (value: unknown, pattern: unknown, replacement: unknown) => String(value ?? "").split(String(pattern ?? "")).join(String(replacement ?? "")),
+    lower: (value: unknown) => String(value ?? "").toLocaleLowerCase(),
+    upper: (value: unknown) => String(value ?? "").toLocaleUpperCase(),
+    split: (value: unknown, separator: unknown) => String(value ?? "").split(String(separator ?? "")),
+    substring: (value: unknown, start: number, end?: number) => String(value ?? "").slice(start, end),
+    truncate: (value: unknown, length: number, suffix = "…") => {
+      const text = String(value ?? ""); return text.length <= length ? text : text.slice(0, Math.max(0, length - suffix.length)) + suffix;
+    },
+    padleft: (value: unknown, length: number, fill = " ") => String(value ?? "").padStart(length, fill),
+    padright: (value: unknown, length: number, fill = " ") => String(value ?? "").padEnd(length, fill),
+    typeof: (value: unknown) => dqlTypeof(value),
     list: (...values: unknown[]) => values,
     join: (values: unknown[], separator = ", ") => values.filter((value) => value != null).join(separator),
+    sum: (values: unknown[]) => values.reduce<number>((total, value) => total + Number(value ?? 0), 0),
+    min: (values: unknown[]) => values.reduce((best, value) => compareValues(value, best) < 0 ? value : best, values[0]),
+    max: (values: unknown[]) => values.reduce((best, value) => compareValues(value, best) > 0 ? value : best, values[0]),
+    average: (values: unknown[]) => values.length ? values.reduce<number>((total, value) => total + Number(value ?? 0), 0) / values.length : null,
+    product: (values: unknown[]) => values.reduce<number>((total, value) => total * Number(value ?? 1), 1),
+    round: Math.round,
+    floor: Math.floor,
+    ceil: Math.ceil,
+    trunc: Math.trunc,
+    any: (values: unknown[], predicate?: (value: unknown) => unknown) => predicate ? values.some((value) => Boolean(predicate(value))) : values.some(Boolean),
+    all: (values: unknown[], predicate?: (value: unknown) => unknown) => predicate ? values.every((value) => Boolean(predicate(value))) : values.every(Boolean),
+    none: (values: unknown[]) => !values.some(Boolean),
+    filter: (values: unknown[], predicate: (value: unknown) => unknown) => values.filter((value) => Boolean(predicate(value))),
+    map: (values: unknown[], mapper: (value: unknown) => unknown) => values.map(mapper),
+    reduce: (values: unknown[], reducer: (total: unknown, value: unknown) => unknown, initial?: unknown) => initial === undefined ? values.reduce(reducer) : values.reduce(reducer, initial),
+    flat: (values: unknown[], depth = 1) => values.flat(depth),
+    slice: (values: unknown[], start?: number, end?: number) => values.slice(start, end),
+    nonnull: (values: unknown[]) => values.filter((value) => value != null),
+    firstvalue: (values: unknown[]) => values.find((value) => value != null),
+    unique: (values: unknown[]) => [...new Set(values)],
+    distinct: (values: unknown[]) => [...new Set(values)],
+    reverse: (values: unknown[]) => values.slice().reverse(),
+    sort: (values: unknown[]) => values.slice().sort(compareValues),
+    date: (value?: unknown) => value == null || value === "today" ? toDvDate(new Date()) : value === "now" ? new DvDate() : toDvDate(value),
+    dur: parseDuration,
+    dateformat: formatDvDate,
+    object: (...pairs: unknown[]) => Object.fromEntries(pairs.filter(Array.isArray).map((pair) => [String(pair[0]), pair[1]])),
+    extract: (value: unknown, ...keys: string[]) => Object.fromEntries(keys.map((key) => [key, value && typeof value === "object" ? (value as Record<string, unknown>)[key] : null])),
+    meta: (value: unknown) => linkMetadata(value),
     link: (value: unknown, label?: unknown) => {
       const target = typeof value === "object" && value && "path" in value
         ? String((value as { path: unknown }).path)
@@ -912,8 +1286,45 @@ export function evaluateDql(expression: string, row: DvPage, current: DvPage): u
     "row",
     "helpers",
     `with (helpers) { with (row) { return (${javascript}); } }`,
-  ) as (row: DvPage, helpers: Record<string, unknown>) => unknown;
+  ) as (row: DqlRow, helpers: Record<string, unknown>) => unknown;
   return evaluator(row, helpers);
+}
+
+function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function dqlTypeof(value: unknown): string {
+  if (value == null) return "null";
+  if (value instanceof Date) return "date";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+function parseDuration(value: unknown): DvDuration {
+  const match = String(value ?? "").trim().match(/^(-?\d+(?:\.\d+)?)\s*(years?|months?|weeks?|days?|hours?|minutes?|seconds?)$/i);
+  if (!match) return new DvDuration(0);
+  const amount = Number(match[1]); const unit = match[2].toLocaleLowerCase();
+  const seconds = unit.startsWith("year") ? amount * 31_556_952 : unit.startsWith("month") ? amount * 2_629_746 : unit.startsWith("week") ? amount * 604_800 : unit.startsWith("day") ? amount * 86_400 : unit.startsWith("hour") ? amount * 3_600 : unit.startsWith("minute") ? amount * 60 : amount;
+  return new DvDuration(seconds * 1000);
+}
+function formatDvDate(value: unknown, format = "yyyy-MM-dd"): string {
+  const date = toDvDate(value); if (!date) return "";
+  const names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  return format.replace(/yyyy/g, String(date.year)).replace(/MMMM/g, names[date.month - 1]).replace(/MM/g, String(date.month).padStart(2, "0")).replace(/dd/g, String(date.day).padStart(2, "0"));
+}
+function linkMetadata(value: unknown): Record<string, unknown> {
+  const raw = typeof value === "object" && value && "path" in value
+    ? String((value as { path: unknown }).path)
+    : String(value ?? "");
+  const embed = raw.startsWith("![[");
+  const inner = raw.replace(/^!?\[\[|\]\]$/g, "");
+  const [target, display] = inner.split("|");
+  const [pathAndSubpath, blockId] = target.split("^");
+  const [path, subpath] = pathAndSubpath.split("#");
+  return {
+    path,
+    display: display ?? null,
+    embed,
+    subpath: subpath ?? null,
+    type: blockId ? "block" : subpath ? "header" : "file",
+  };
 }
 
 function stubPage(path: string): DvPage {
@@ -943,6 +1354,70 @@ function normalizeItems(items: unknown): unknown[] {
     }
   }
   return [items];
+}
+
+async function queryDqlForApi(
+  source: string,
+  ctx: EngineContext,
+): Promise<{ successful: boolean; value?: unknown; error?: string }> {
+  const mount = document.createElement("div");
+  await runDqlBlock(source, mount, ctx);
+  const error = mount.querySelector(".dv-error")?.textContent;
+  if (error) return { successful: false, error };
+  const table = mount.querySelector("table");
+  if (table) {
+    return {
+      successful: true,
+      value: {
+        type: "table",
+        headers: [...table.querySelectorAll("thead th")].map((cell) => cell.textContent ?? ""),
+        values: [...table.querySelectorAll("tbody tr")].map((row) =>
+          [...row.querySelectorAll("td")].map((cell) => cell.textContent ?? "")),
+      },
+    };
+  }
+  return {
+    successful: true,
+    value: {
+      type: mount.querySelector(".dv-task-list") ? "task" : mount.querySelector(".dv-calendar") ? "calendar" : "list",
+      values: [...mount.querySelectorAll("li, .dv-calendar-day > div")].map((item) => item.textContent ?? ""),
+    },
+  };
+}
+
+function normalizeIoPath(path: string, origin: string): string {
+  const clean = path.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!path.startsWith("./") && !path.startsWith("../")) return clean.replace(/^\//, "");
+  const parts = `${origin.replace(/\/[^/]*$/, "")}/${clean}`.split("/");
+  const normalized: string[] = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") normalized.pop();
+    else normalized.push(part);
+  }
+  return normalized.join("/");
+}
+
+function parseCsv(source: string): Record<string, string>[] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let index = 0; index <= source.length; index++) {
+    const char = source[index] ?? "\n";
+    if (quoted) {
+      if (char === '"' && source[index + 1] === '"') { cell += '"'; index++; }
+      else if (char === '"') quoted = false;
+      else cell += char;
+    } else if (char === '"') quoted = true;
+    else if (char === ",") { row.push(cell); cell = ""; }
+    else if (char === "\n") { row.push(cell.replace(/\r$/, "")); rows.push(row); row = []; cell = ""; }
+    else cell += char;
+  }
+  const headers = rows.shift() ?? [];
+  return rows.filter((values) => values.some(Boolean)).map((values) =>
+    Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ""])),
+  );
 }
 
 function stringify(v: unknown, fieldHint?: string): string {
@@ -976,6 +1451,41 @@ function stringifyInline(v: unknown): string {
   return v.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target, alias) =>
     `<a href="#" class="preview-wikilink" data-wikilink="${esc(String(target).trim())}">${esc(String(alias || target).trim())}</a>`,
   );
+}
+
+function makeWikilink(path: string, embed = false, display?: string): string {
+  return `${embed ? "!" : ""}[[${path}${display == null ? "" : `|${display}`}]]`;
+}
+
+function plainString(value: unknown): string {
+  if (value == null) return "";
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (Array.isArray(value)) return value.map(plainString).join(", ");
+  if (typeof value === "object" && "file" in value) return (value as DvPage).file.link;
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function markdownTable(headers: string[], rows: unknown[][]): string {
+  const clean = (value: unknown) => plainString(value).replace(/\|/g, "\\|").replace(/\n/g, " ");
+  return [
+    `| ${headers.map(clean).join(" | ")} |`,
+    `| ${headers.map(() => "---").join(" | ")} |`,
+    ...rows.map((row) => `| ${row.map(clean).join(" | ")} |`),
+  ].join("\n");
+}
+
+function bindPreviewLinks(container: HTMLElement, ctx: EngineContext): void {
+  container.querySelectorAll<HTMLAnchorElement>("a[data-wikilink]").forEach((link) => {
+    if (link.dataset.openLinkBound) return;
+    link.dataset.openLinkBound = "1";
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      const target = link.dataset.wikilink;
+      if (target) ctx.resolveLink(target);
+    });
+  });
+  bindQueryUriLinks(container);
 }
 
 function esc(s: string): string {

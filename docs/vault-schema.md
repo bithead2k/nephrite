@@ -103,7 +103,7 @@ Map every Nephrite product surface (from `docs/compatibility.md`) to index requi
 | Tasks UI + Ctrl-Enter | `tasks` | Toggle → file write → reindex file |
 | SQL query blocks | SQL views over all tables | Read-only |
 | Engine scripting (DVJS-class) | Same as SQL + row APIs | Prefer read; writes via vault API only |
-| Dataview DQL (later) | Same IR | — |
+| Dataview DQL | Shared indexed page model and compatibility evaluator | Implemented frontend |
 | Kanban | `kanban_*` or tasks/notes + board files | Board edit → vault file |
 | Canvas | `canvas_nodes`, `canvas_edges` | Canvas edit → `.canvas` file |
 | Excalidraw | `files` type + `links` extracted from drawing | Drawing save → file |

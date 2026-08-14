@@ -668,8 +668,8 @@ This section records the current implementation state and recent design decision
 * Markdown remains authoritative. Preview/index transformations must never rewrite source unless the user edits it.
 * Vault opening displays action text and progress while checking or rebuilding the index.
 * The project is AGPL-3.0-only.
-* `PROJECT_VERSION` is currently `0.3`; Cargo and npm package versions are `0.3.0`.
-* Version 0.3 is a minor upgrade from 0.2 and does not force an index rebuild.
+* `PROJECT_VERSION` is currently `0.4`; Cargo and npm package versions are `0.4.0`.
+* Version 0.4 is a minor upgrade from 0.3 and does not force a full index rebuild. It performs a one-time Markdown backfill for typed Dataview inline fields.
 * Version 0.2 rebuilds indexes from the earlier internal 2.0 development version because the stored major differs.
 
 ### Editor and Vim Integration
@@ -728,8 +728,11 @@ Media resolution added a native `read_media_file` command. Native command change
 
 * `dataview`, `dataviewjs`, `js`, `javascript`, `nephrite`, and `nephritejs` fences are dynamically executed where supported.
 * Single-backtick inline commands are supported; longer backtick spans remain literal.
-* Common Dataview DQL constructs (`TABLE`, `LIST`, `FROM`, `WHERE`, `SORT`, and limits) have a compatibility implementation.
-* DataviewJS exposes page collections with array-compatible `.where()`/`.limit()` behavior and current-page context.
+* Dataview DQL supports `TABLE`, `LIST`, `TASK`, and `CALENDAR`; folder/tag/link sources; ordered `WHERE`, `FLATTEN`, and `GROUP BY`; multi-sort; and limits.
+* Typed Dataview inline fields (`key:: value`, `[key:: value]`, and `(key:: value)`) populate the disposable index and page objects without changing Markdown.
+* DataviewJS exposes source-aware page snapshots, proxy-backed DataArrays/swizzling, render and Markdown helpers, query/evaluation helpers, vault IO/CSV, and custom views.
+* Live DQL task checkboxes use Nephrite's surgical source task edit. Calendar queries render native month grids.
+* Full compatibility details and deliberate Obsidian-internal exclusions are recorded in `docs/dataview.md`.
 * Null/empty query values render as empty text rather than `[object Object]`.
 * Query results detect URLs, email addresses, and telephone numbers. Field names such as `work_email`, `home_email`, `website`, `company_url`, `linkedin`, and `phone` guide detection.
 * URI results render as clickable anchors with an appropriate MIME `type` attribute.
@@ -800,7 +803,11 @@ p.tags && ARRAY['recruiter', 'interviewer']
 
 The normalized `properties`, `tags`, `aliases`, `links`, `headings`, and `tasks` tables remain disposable index internals/advanced escape hatches. Ordinary page queries should use `pages` and its page-owned values.
 
-Current implementation note: SQLite still serializes complex page values internally; that encoding is private. `libpg_query` validates PostgreSQL syntax. Page properties, array literals, property/array indirection, tag operators, JSON paths, null tests, casts, and supported function forms lower through AST/IR when source spans are recoverable. Successful AST lowering runs only the SQLite grammar residual; the full textual page translator remains a compatibility fallback. One-dimensional arrays support typed values, subscripts, slices, concatenation, containment, contained-by, overlap, lexicographic comparison, all scalar comparison operators through `ANY`/`ALL`, and PostgreSQL 18's sort/reverse/shuffle/sample functions. JSONB-compatible extraction, existence, containment, concatenation, deletion, and JSON/JSONB aggregates are available. `pg_catalog.pg_proc` and `pg_catalog.pg_operator` expose the supported safe surface, audited against PostgreSQL 18.4 on port 5438. JSONPath and set-returning record expansion remain deliberately unadvertised rather than approximated incorrectly.
+Current implementation note: SQLite still serializes complex page values internally; that encoding is private. `libpg_query` validates PostgreSQL syntax. Page properties, array literals, property/array indirection, tag operators, JSON paths, null tests, casts, and supported function forms lower through AST/IR when source spans are recoverable; an idempotent compatibility pass fills sibling spans the AST selector cannot safely combine. PostgreSQL casts now perform strict runtime conversion through `page_cast` or fail—`::type` and `CAST(... AS type)` are never erased. Nested page/function/cast expressions are supported, with cast recursion capped at 32. One-dimensional arrays support typed values, subscripts, slices, concatenation, containment, contained-by, overlap, lexicographic comparison, all scalar comparison operators through `ANY`/`ALL`, and PostgreSQL 18's sort/reverse/shuffle/sample functions. JSONB-compatible extraction, existence, containment, concatenation, deletion, and JSON/JSONB aggregates are available. `pg_catalog.pg_proc` and `pg_catalog.pg_operator` expose the supported safe surface, audited against PostgreSQL 18.4 on port 5438. JSONPath and set-returning record expansion remain deliberately unadvertised rather than approximated incorrectly.
+
+SQL metadata lookup is case-retentive. Frontmatter keys use exact-match-first and then a unique Unicode-lowercased fallback; case-only ambiguity is an error. Tags and aliases compare case-insensitively while retaining source spelling. Values remain case-sensitive for `=` and `LIKE`; `ILIKE` is case-insensitive. Paths continue to follow the host filesystem. SQL comment stripping preserves UTF-8 byte sequences verbatim.
+
+Appearance preferences now expose independent persisted font stacks for the interface, editor/code, preview, and Powerline status. An empty editor preference falls back to the user's Vim `guifont`; all empty fields use Nephrite's existing platform font stacks.
 
 ### YAML Index Typing
 
@@ -839,10 +846,10 @@ The live v2 backing index returns Josh Flanders alone. His missing `work_email` 
 
 The latest completed validation is:
 
-* 61/61 Nephrite Rust application tests passing;
+* 63/63 Nephrite Rust application tests passing;
 * 13/13 `nephrite-index` tests passing;
 * 50/50 TypeScript performance/rendering regression tests passing;
-* 4/4 UI integration tests passing;
+* 5/5 UI integration tests passing;
 * `cargo fmt --check` passing;
 * strict workspace Clippy passing with warnings denied;
 * `npm run build` passing;
@@ -867,7 +874,7 @@ Fundamental Requirements — Status vs Gaps
 1. Existing Obsidian vault compatibility (open as-is, no silent rewrite)StrongBlock-reference fidelity is “where practical”; some edge-case link/heading/alias resolution and hierarchical YAML write discipline still need hardening. The Git-diff acceptance test is the right bar and is largely held.
 2. Markdown is authoritative (disposable .nephrite/ index)DoneIndex rebuild on major version bump is implemented; residual risk is only in accidental non-minimal writes during property/task edits.
 3. Native vault metadata indexStrongRich schema already covers files, properties (hierarchical), headings, blocks, links, tags, tasks, aliases, attachments, canvas nodes/edges, kanban boards/columns/cards, inline fields, footnotes, and pages / backlinks views. Gap is mostly completeness of incremental reconcile under heavy concurrent external changes (Obsidian Sync / other editors).
-4. PostgreSQL SQL as the query languageStronglibpg_query gate + read-only enforcement + AST/IR page lowering + typed one-dimensional arrays + JSONB operators + catalog-visible safe functions/operators are implemented. SQLite-native joins, CTEs, aggregates, grouping, subqueries, CASE, and window functions remain available. This is a semantic read-only PostgreSQL compatibility layer, not a bundled PostgreSQL server; server administration, procedural languages, extensions, network/filesystem functions, ranges, multidimensional arrays, and mutation remain outside its boundary. Dataview compatibility remains separate and incomplete.
+4. PostgreSQL SQL as the query languageStronglibpg_query gate + read-only enforcement + AST/IR page lowering + typed one-dimensional arrays + JSONB operators + catalog-visible safe functions/operators are implemented. SQLite-native joins, CTEs, aggregates, grouping, subqueries, CASE, and window functions remain available. This is a semantic read-only PostgreSQL compatibility layer, not a bundled PostgreSQL server; server administration, procedural languages, extensions, network/filesystem functions, ranges, multidimensional arrays, and mutation remain outside its boundary. Dataview compatibility is a separate, complete practical frontend over the same index.
 5. Tasks as a core facilityUsable partialIndexing of status, due/scheduled/start/done/created, recurrence, priority, tags; surgical checkbox edits; task dashboard with scoping. Gaps: fuller interactive editing UX, complete Obsidian Tasks syntax variants, richer grouping/views (by project, recurrence series, etc.), and tighter source-location navigation.
 6. Native template & automation engineEarly / limitedDeclarative .nephrite/automations.json (create/append/prepend/move/apply-template/open + lifecycle hooks) + safe Templater subset (tp.file.*, dates, frontmatter, prompts, includes, cursor). Gaps: no sandboxed execution of <%* JavaScript %>  (preserved with warning); no full user-defined JS functions or rich runtime; QuickAdd-style capture is only partially covered by the declarative layer.
 7. Excalidraw integrationDoneUpstream engine, vault files, embeds, editing, autosave, fonts bundled. Minor fidelity gaps possible with exotic Obsidian Excalidraw plugin files.
@@ -880,7 +887,7 @@ Fundamental Requirements — Status vs Gaps
  - Phase 1 (Safe Vault Reader) — Largely complete (open, parse, index, search, basic editor/viewer, watcher).
  - Phase 2 (Vault Database) — Complete and quite rich (see schema.sql + docs/vault-schema.md).
  - Phase 3 (SQL) — Complete for the documented safe embedded boundary: parser/read-only gate, AST/IR page semantics, array/JSON operators, PostgreSQL compatibility functions/catalog, typed results, and dynamic rendering.
- - Phase 4 (Dataview Compatibility) — Partial. Common DQL works; DataviewJS has a usable but incomplete page/collection API. TASK/CALENDAR and deeper JS features remain.
+ - Phase 4 (Dataview Compatibility) — Complete practical package. DQL query types/clauses, typed inline fields, TASK/CALENDAR, source selectors, DataArrays, rendering, query/evaluation, IO/CSV, and custom-view APIs work. Obsidian application internals and unsafe external capabilities remain deliberately excluded.
  - Phase 5 (Tasks) — Functional dashboard + surgical edits; advanced views, recurrence editing, and full syntax parity still needed.
  - Phase 6 (Templates & Automation) — Declarative + limited Templater only. Full native automation runtime + sandboxed JS is the largest product gap relative to the original vision.
  - Phase 7 (Excalidraw) — Done.
@@ -892,7 +899,7 @@ Fundamental Requirements — Status vs Gaps
  - Kanban — Present with hooks, resize, find, etc., but the patch volume suggests it is not yet rock-solid.
  - Hierarchical YAML / properties — Indexing improved in 0.2; full query ergonomics and minimal write-back still have room.
  - Block links, section embeds, rename/update of links — “Where practical” language in the docs; not yet at full Obsidian fidelity.
- - DataviewJS / Templater JS — Intentionally limited for safety; the product vision wants sandboxed execution eventually.
+ - Templater JS — Intentionally limited for safety; the product vision wants sandboxed execution eventually. DataviewJS now has the full practical data/view API but still excludes Obsidian application internals.
  - Mobile — Explicit non-goal for initial release (architecture kept abstract).
  - Full Obsidian plugin API / Sync / proprietary formats — Correctly out of scope.
 
@@ -910,7 +917,7 @@ Use SQL, tasks dashboard, Excalidraw, Git history, graph, canvas, basic template
 
 What still falls short for “mature local-first knowledge system” users:
 
- - Heavy DataviewJS or complex Templater scripts
+ - DataviewJS scripts that depend on Obsidian application/plugin internals, or complex Templater scripts
  - Deep Tasks plugin workflows
  - Custom long-tail plugins that need richer host APIs
  - Very large vaults under continuous external mutation (reconcile robustness)
@@ -920,7 +927,6 @@ What still falls short for “mature local-first knowledge system” users:
 
  - Deepen the automation/Templater runtime (sandboxed JS + richer declarative actions).
  - Task views + full syntax fidelity.
- - Dataview DQL/JS completeness for the common power-user patterns.
  - Plugin API surface expansion once the core abstractions stop moving.
  - Continued preview/query/kanban hardening (the recent patch stream).
 
