@@ -72,7 +72,6 @@ import {
   CURSOR_SYNC_DELAY_MS,
   rebindScrollSync,
   setEditorDocumentEnd,
-  syncEditorCursorMovement,
   withoutScrollSync,
 } from "./scroll-sync";
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
@@ -105,6 +104,14 @@ import { resizedKanbanLaneWidth } from "./kanban-resize";
 import { canPersistSession } from "./session-guard";
 import { bindQueryUriLinks } from "./query-uri";
 import { vaultChangeTouchesFileTree } from "./vault-change";
+import {
+  DirtyReactor,
+  shouldCommitRightPane,
+  shouldKeepPreviewWork,
+  shouldRefreshPreviewFromOtherPages,
+  shouldRefreshVaultStats,
+  shouldReloadEditorFromVault,
+} from "./editor-lock";
 import { CanvasView, serializeCanvas } from "./canvas-view";
 import { renderGraph } from "./graph-view";
 import { renderLinkHealth } from "./link-health";
@@ -220,6 +227,29 @@ let drawingContent = "";
 let drawingDocument: ExcalidrawDocument | null = null;
 let canvasContent = "";
 let dirty = false;
+let pendingCursor: { line: number; col: number; totalLines: number } | null = null;
+let pendingFolds = false;
+const dirtyReactor = new DirtyReactor(() => {
+  const idle = dirtyReactor.consumeIdle(PREVIEW_DELAY_MS, AUTOSAVE_DELAY_MS);
+  if (idle.save) void saveFile(true);
+  if (idle.preview && editor && (viewMode === "split" || viewMode === "preview")) {
+    const revision = ++previewRevision;
+    void renderRightPane(editor.getDoc(), revision);
+  }
+  if (pendingCursor) {
+    const { line, col, totalLines } = pendingCursor;
+    pendingCursor = null;
+    statusLine = line;
+    statusColumn = col;
+    setEditorDocumentEnd(line === totalLines);
+    scheduleCursorChromeUpdate();
+  }
+  if (pendingFolds) {
+    pendingFolds = false;
+    rememberEditorFolds();
+  }
+});
+dirtyReactor.start();
 /** All markdown paths from the index (unfiltered). */
 let mdFilesAll: FileEntry[] = [];
 /** What the tree shows after dotfile + search filters. */
@@ -234,8 +264,10 @@ let appearanceFonts = loadAppearanceFonts();
 let viewMode: ViewMode = normalizeMode(localStorage.getItem(VIEW_KEY));
 const previewWork = new DeferredDocumentWork(PREVIEW_DELAY_MS);
 const previewRenderer = new PreviewWorkerClient();
+const rightPreviewRenderer = new PreviewWorkerClient();
 const vaultPreviewRefresh = new RefreshGate();
 let previewRevision = 0;
+let rightPaneRevision = 0;
 /** Last markdown body committed to the preview (for trivial block patches). */
 let lastPreviewBody: string | null = null;
 let lastPreviewPath: string | null = null;
@@ -411,6 +443,16 @@ function sessionStorageKey(vaultRoot: string): string {
   return `nephrite.session.v1:${vaultRoot}`;
 }
 
+function syncVisiblePaths() {
+  const paths = new Set<string>();
+  if (currentPath) paths.add(currentPath);
+  if (rightPath) paths.add(rightPath);
+  for (const path of openTabs) paths.add(path);
+  void invoke("set_visible_paths", { paths: [...paths] }).catch(() => {
+    /* vault not open yet */
+  });
+}
+
 function saveSession() {
   // The last-vault key exists before automatic startup indexing finishes.
   // Do not let the crash-safety timer overwrite a valid saved workspace with
@@ -510,6 +552,7 @@ async function restoreSession(vaultRoot: string) {
     }
   } finally {
     restoringSession = false;
+    syncVisiblePaths();
     saveSession();
   }
 }
@@ -904,9 +947,7 @@ async function renderShell() {
     if (detail?.uri) openExternalView(detail.uri);
   });
   $("right-close").addEventListener("click", () => {
-    rightPath = null;
-    updateRightPane();
-    saveSession();
+    closeRightPane();
   });
   installPaneSplitter();
   applyPaneSplit();
@@ -1085,28 +1126,20 @@ async function initEditor() {
     host,
     {
       onDirty: (d) => {
-        if (dirty === d) return;
         dirty = d;
-        updateChrome();
+        if (d) dirtyReactor.markDirty();
+        else dirtyReactor.clearDirty();
       },
       onSave: () => saveFile(false),
       onVimMessage: (message, isError) =>
         setTransientStatus(message, isError ? "#e9ad55" : "#5ecf9a"),
       onCursor: (line, col, totalLines) => {
-        const lineChanged = line !== statusLine;
-        statusLine = line;
-        statusColumn = col;
-        const atDocumentEnd = line === totalLines;
-        setEditorDocumentEnd(atDocumentEnd);
-        if (lineChanged && !atDocumentEnd) syncEditorCursorMovement();
-        scheduleCursorChromeUpdate();
+        pendingCursor = { line, col, totalLines };
       },
       onOpenWikilink: (target) => void openWikilink(target),
-      onDocChange: () => {
-        scheduleEditorPreview();
-        scheduleAutosave();
+      onFoldsChanged: () => {
+        pendingFolds = true;
       },
-      onFoldsChanged: () => rememberEditorFolds(),
       onSaveAttachments: async (files) => {
         if (!currentPath) return [];
         const { saveDroppedFiles } = await import("./attachments");
@@ -1252,11 +1285,10 @@ function setViewMode(mode: ViewMode) {
   }
   syncModeButtons();
   applyViewMode();
-  if ((mode === "split" || mode === "preview") && editor) {
+  if (shouldKeepPreviewWork(mode) && editor) {
     schedulePreview(editor.getDoc());
   } else {
-    previewRevision++;
-    previewWork.cancel();
+    cancelPreviewWork();
     clearScrollSync();
   }
   if (mode !== "preview") {
@@ -1375,11 +1407,17 @@ function scheduleEditorPreview() {
   schedulePreviewRead(() => editor?.getDoc() ?? "");
 }
 
-function schedulePreviewRead(read: () => string) {
-  const revision = ++previewRevision;
+function cancelPreviewWork(): void {
+  previewRevision++;
   previewWork.cancel();
   previewRenderer.cancel();
-  if (viewMode === "source" || viewMode === "live") return;
+}
+
+function schedulePreviewRead(read: () => string) {
+  previewWork.cancel();
+  previewRenderer.cancel();
+  const revision = ++previewRevision;
+  if (!shouldKeepPreviewWork(viewMode)) return;
   previewWork.schedule(read, (text) => {
     void renderRightPane(text, revision);
   });
@@ -1491,7 +1529,7 @@ async function renderRightPane(text: string, revision: number) {
         host.scrollTop = scrollTop;
         host.scrollLeft = scrollLeft;
       }
-      bindPreviewContent(previewEl, path);
+      bindPreviewContent(previewEl, path, revision);
       queryDiagnostic("preview.yaml-patch", { path, revision });
       requestAnimationFrame(() => setupScrollSync());
       return;
@@ -1543,7 +1581,7 @@ async function renderRightPane(text: string, revision: number) {
           roundTripMs: Number((performance.now() - requestedAt).toFixed(1)),
         });
         // Bind only; skip full dynamic re-run unless a dirty block has code fences.
-        bindPreviewContent(previewEl, path);
+        bindPreviewContent(previewEl, path, revision);
         // Scoped dynamics: only re-execute fences inside the replaced .md-block nodes.
         const dynCtx = makeEngineContext(path, text, (target) => void openWikilink(target));
         for (const index of plan.changed) {
@@ -1573,6 +1611,11 @@ async function renderRightPane(text: string, revision: number) {
     });
     return;
   }
+  if (!path || !isPreviewRevisionCurrent(path, revision)) {
+    queryDiagnostic("preview.worker.discard", { path, revision, previewRevision });
+    return;
+  }
+  await yieldToUi();
   if (!path || !isPreviewRevisionCurrent(path, revision)) {
     queryDiagnostic("preview.worker.discard", { path, revision, previewRevision });
     return;
@@ -1624,16 +1667,8 @@ async function renderRightPane(text: string, revision: number) {
       codeElements: previewEl.querySelectorAll("pre > code").length,
       current: isPreviewRevisionCurrent(path, revision),
     });
-    bindPreviewContent(previewEl, path);
-    void (async () => {
-      try {
-        await renderDynamicPreview(text, path, revision, previewEl);
-      } finally {
-        void hydrateNoteEmbeds(previewEl, path, {
-          openLink: (target) => void openWikilink(target),
-        }).catch((error) => console.warn("[note embed]", error));
-      }
-    })();
+    bindPreviewContent(previewEl, path, revision);
+    void renderDynamicPreview(text, path, revision, previewEl);
   } else {
     hydrateTableOfContents(previewEl);
   }
@@ -1713,7 +1748,16 @@ function bindExternalLinks(root: ParentNode) {
   });
 }
 
-function bindPreviewContent(root: HTMLElement, path: string) {
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+function bindPreviewContent(root: HTMLElement, path: string, revision?: number) {
+  const live = () =>
+    revision == null || isPreviewRevisionCurrent(path, revision);
+  if (!live()) return;
   bindPropertiesFoldState(root, path);
   bindQueryUriLinks(root);
   bindExternalLinks(root);
@@ -1811,7 +1855,9 @@ function bindPreviewContent(root: HTMLElement, path: string) {
     .catch((error) => console.warn("[excalidraw embed]", error));
   void hydrateNoteEmbeds(root, path, {
     openLink: (target) => void openWikilink(target),
+    shouldContinue: live,
   }).catch((error) => console.warn("[note embed]", error));
+  if (!live()) return;
   highlightPreviewCode(root);
   hydrateCsvFences(root);
   void hydrateMermaid(root).catch((error) => console.warn("[mermaid]", error));
@@ -1842,9 +1888,7 @@ async function renderDynamicPreview(
       body,
       target,
       ctx,
-      // The block elements belong to this preview revision. If a later edit
-      // replaces the preview DOM, these detached nodes can finish harmlessly.
-      () => true,
+      () => isPreviewRevisionCurrent(path, revision),
     );
   } catch (error) {
     queryDiagnostic("dynamic.error", {
@@ -1866,7 +1910,7 @@ async function renderDynamicPreview(
     resultBlocks: target.querySelectorAll(".dv-block").length,
     sourceBlocks: target.querySelectorAll("pre > code.language-pgsql, pre > code.language-dataview, pre > code.language-dataviewjs").length,
   });
-  bindPreviewContent(target, path);
+  bindPreviewContent(target, path, revision);
   requestAnimationFrame(() => setupScrollSync());
 }
 
@@ -2469,6 +2513,14 @@ async function runKanbanHookScript(
 function updateChrome() {
   const save = $("btn-save") as HTMLButtonElement;
   save.disabled = !currentPath || !dirty;
+  if (dirty) {
+    const tab = $("tab");
+    if (currentPath) {
+      tab.textContent = `${currentPath} •`;
+      $("status-path").textContent = currentPath;
+    }
+    return;
+  }
   const tab = $("tab");
   if (!currentPath) {
     tab.textContent = "Open a Markdown file";
@@ -2495,6 +2547,7 @@ function updateChrome() {
 }
 
 function updateVimPowerline() {
+  if (dirty) return;
   vimPowerline?.update({
     enabled: vimOn,
     path: currentPath,
@@ -2779,50 +2832,40 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
   }
   const changed = new Set(change.paths);
 
-  if (currentPath && changed.has(currentPath)) {
-    if (change.removed > 0 && !pathExistsInIndex(currentPath)) {
-      if (dirty) {
-        setTransientStatus(
-          `${currentPath} was deleted externally; the unsaved editor was left intact`,
-          "#e9ad55",
-        );
-      } else {
-        const removedPath = currentPath;
-        openTabs = openTabs.filter((path) => path !== removedPath);
-        pinnedTabs.delete(removedPath);
-        currentPath = null;
-        editor?.setDoc("");
-        renderTabBar();
-        updateChrome();
-        setTransientStatus(`${removedPath} was deleted externally`, "#e9ad55");
-      }
-    } else if (dirty) {
+  if (currentPath && changed.has(currentPath) && change.removed > 0 && !pathExistsInIndex(currentPath)) {
+    if (dirty) {
       setTransientStatus(
-        `${currentPath} changed externally; your unsaved editor was not overwritten`,
+        `${currentPath} was deleted externally; the unsaved editor was left intact`,
         "#e9ad55",
       );
-    } else if (currentFileKind === "markdown") {
-      const file = await invoke<OpenFile>("read_file", { path: currentPath });
-      // Nephrite's own save returns through the watcher too. Do not replace
-      // the complete CodeMirror document when the bytes are already current.
-      if (editor && file.content !== editor.getDoc()) editor.reloadDoc(file.content);
     } else {
-      await openNote(currentPath, { skipDirtyPrompt: true });
+      const removedPath = currentPath;
+      openTabs = openTabs.filter((path) => path !== removedPath);
+      pinnedTabs.delete(removedPath);
+      currentPath = null;
+      editor?.setDoc("");
+      renderTabBar();
+      updateChrome();
+      setTransientStatus(`${removedPath} was deleted externally`, "#e9ad55");
     }
-  } else if (currentPath && currentFileKind === "markdown" &&
-      (viewMode === "split" || viewMode === "preview")) {
-    // SQL and Dataview results may depend on any page in the vault.
-    // Do not invalidate a query already rendering. External scripts can update
-    // the vault continuously; cancelling on every watcher event can otherwise
-    // leave executable fences permanently unrendered. Coalesce those events
-    // into one follow-up render after the active pass completes.
+  } else if (shouldReloadEditorFromVault(currentPath, currentFileKind, dirty, changed)) {
+    const file = await invoke<OpenFile>("read_file", { path: currentPath! });
+    if (editor && file.content !== editor.getDoc()) editor.reloadDoc(file.content);
+  } else if (shouldRefreshPreviewFromOtherPages(currentPath, viewMode, changed)) {
     if (vaultPreviewRefresh.request()) scheduleEditorPreview();
   }
 
   if (rightPath && changed.has(rightPath)) await updateRightPane();
-  const info = await invoke<VaultInfo>("vault_stats");
-  $("index-stats").textContent =
-    `v${info.project_version} · ${info.file_count} files · ${info.task_count} tasks`;
+
+  if (shouldRefreshVaultStats(manual, change.updated, change.removed)) {
+    try {
+      const info = await invoke<VaultInfo>("vault_stats");
+      $("index-stats").textContent =
+        `v${info.project_version} · ${info.file_count} files · ${info.task_count} tasks`;
+    } catch {
+      /* stale stats are non-fatal */
+    }
+  }
 
   const total = change.updated + change.removed;
   if (manual) {
@@ -2831,7 +2874,7 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
         `Vault refreshed: ${change.updated} updated, ${change.removed} removed`,
       "#5ecf9a",
     );
-  } else {
+  } else if (total > 0) {
     setTransientStatus(
       `External changes indexed: ${change.updated} updated, ${change.removed} removed`,
       "#5ecf9a",
@@ -3066,6 +3109,7 @@ async function openNoteSerialized(
     openTabs.push(file.path);
   }
   closedTabs = closedTabs.filter((path) => path !== file.path);
+  syncVisiblePaths();
   if (currentFileKind === "excalidraw") {
     canvasContent = "";
     canvasView?.clear();
@@ -3679,7 +3723,10 @@ async function performSave(pending: PendingSave) {
       : kind === "canvas"
         ? canvasContent === content
         : editor?.getDocumentRevision() === documentRevision);
-  if (unchanged) dirty = false;
+  if (unchanged) {
+    dirty = false;
+    dirtyReactor.clearDirty();
+  }
   updateChrome();
   await runAutomationLifecycle("onNoteSave");
   if (!automatic) setTransientStatus(`Saved ${path}`, "#5ecf9a");
@@ -5782,10 +5829,11 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
         dirty = false;
       }
       openTabs = openTabs.filter((t) => t !== target.path);
-      if (rightPath === target.path) rightPath = null;
+      if (rightPath === target.path) closeRightPane();
+      syncVisiblePaths();
       await refreshTree();
       renderTabBar();
-      updateRightPane();
+      if (rightPath) void updateRightPane();
       updateChrome();
       saveSession();
       return;
@@ -5910,33 +5958,64 @@ function renderTabBar() {
   }
 }
 
+function hideRightPane(): void {
+  const ws = document.getElementById("workspace");
+  const body = document.getElementById("right-body");
+  const pathEl = document.getElementById("right-path");
+  ws?.classList.remove("with-right");
+  if (body) body.innerHTML = "";
+  if (pathEl) pathEl.textContent = "—";
+  applyPaneSplit();
+}
+
+function closeRightPane(): void {
+  rightPath = null;
+  rightPaneRevision++;
+  rightPreviewRenderer.cancel();
+  hideRightPane();
+  saveSession();
+}
+
 async function updateRightPane() {
   const ws = document.getElementById("workspace");
   const body = document.getElementById("right-body");
   const pathEl = document.getElementById("right-path");
   if (!ws || !body || !pathEl) return;
+  const revision = ++rightPaneRevision;
+  const live = () => shouldCommitRightPane(revision, rightPaneRevision, rightPath);
   if (!rightPath) {
-    ws.classList.remove("with-right");
-    body.innerHTML = "";
-    pathEl.textContent = "—";
-    applyPaneSplit();
+    rightPreviewRenderer.cancel();
+    hideRightPane();
     return;
   }
+  const path = rightPath;
   ws.classList.add("with-right");
   applyPaneSplit();
-  pathEl.textContent = rightPath;
+  pathEl.textContent = path;
   try {
-    const file = await invoke<OpenFile>("read_file", { path: rightPath });
-    // Read-only preview of the note (full content, frontmatter handled in render)
+    const file = await invoke<OpenFile>("read_file", { path });
+    if (!live()) return;
     rememberPropertiesFoldState(body);
-    body.innerHTML = renderPreview(file.content);
+    let markup;
+    try {
+      markup = await rightPreviewRenderer.render(file.content);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      throw error;
+    }
+    if (!live()) return;
+    await yieldToUi();
+    if (!live()) return;
+    body.innerHTML = markup.html;
     bindPropertiesFoldState(body, file.path);
     const { body: markdownBody } = splitFrontmatter(file.content);
     await executeBlocksInPreview(
       markdownBody,
       body,
       makeEngineContext(file.path, file.content, (target) => void openWikilink(target)),
+      live,
     );
+    if (!live()) return;
     bindQueryUriLinks(body);
     bindExternalLinks(body);
     body.querySelectorAll<HTMLAnchorElement>("a.preview-wikilink").forEach((a) => {
@@ -5953,12 +6032,17 @@ async function updateRightPane() {
     void hydrateMarkdownImages(body, file.path)
       .catch((error) => console.warn("[right pane markdown image]", error));
     void hydrateExcalidrawEmbeds(body, file.path, (drawingPath) => void openNote(drawingPath))
-      .then(() => hydrateNoteEmbeds(body, file.path, {
-        openLink: (target) => void openWikilink(target),
-      }))
+      .then(() => {
+        if (!live()) return;
+        return hydrateNoteEmbeds(body, file.path, {
+          openLink: (target) => void openWikilink(target),
+          shouldContinue: live,
+        });
+      })
       .catch((error) => console.warn("[right pane embed]", error));
     hydrateTableOfContents(body);
   } catch (e) {
+    if (!live()) return;
     body.innerHTML = `<pre class="dv-error">${escapeHtml(String(e))}</pre>`;
   }
 }

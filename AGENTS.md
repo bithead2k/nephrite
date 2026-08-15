@@ -659,7 +659,7 @@ It is to create the open-source implementation of the mature local-first knowled
 
 ## Implementation Status (2026-08-15)
 
-AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.5` (0.5.0): minor upgrade from 0.4, not a full rebuild.
+AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.6` (0.6.0): minor upgrade from 0.5, not a full rebuild.
 
 Implemented and verified (behavior details live in `docs/`): vault reader + metadata index + search + editor/viewer + watcher; native PostgreSQL SQL (`libpg_query` + `page` lowering, read-only); Dataview DQL/DataviewJS; Vim, Markdown/Obsidian rendering, Excalidraw, tasks dashboard, Git, declarative automation + Templater subset; plugin permission host.
 

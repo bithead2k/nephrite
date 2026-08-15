@@ -15,7 +15,7 @@ import {
 } from "../ui/src/dv-engine";
 import { rowToDvPage } from "../ui/src/dv-context";
 import { findScalarPropertyEdit, renderPropertiesHtml, splitFrontmatter } from "../ui/src/frontmatter";
-import { splitWikilinkTarget } from "../ui/src/wikilinks";
+import { shortestWikilinkTargets, splitWikilinkTarget } from "../ui/src/wikilinks";
 import { formatQueryUri } from "../ui/src/query-uri";
 import { renderPreview } from "../ui/src/preview";
 import { extractBlock, extractHeadingSection } from "../ui/src/note-embed";
@@ -27,6 +27,15 @@ import { findTaskCheckboxEdit } from "../ui/src/tasks";
 import { RefreshGate } from "../ui/src/refresh-gate";
 import { canPersistSession } from "../ui/src/session-guard";
 import { vaultChangeTouchesFileTree } from "../ui/src/vault-change";
+import {
+  countWikilinks,
+  DirtyReactor,
+  shouldCommitRightPane,
+  shouldKeepPreviewWork,
+  shouldRefreshPreviewFromOtherPages,
+  shouldRefreshVaultStats,
+  shouldReloadEditorFromVault,
+} from "../ui/src/editor-lock";
 import { previewPatchWindow } from "../ui/src/preview-patch";
 import { parseVimrc } from "../ui/src/vimrc";
 import { graphRelationships, layoutGraph, selectGraphData } from "../ui/src/graph-view";
@@ -422,6 +431,16 @@ test("filename is not synthesized into a missing YAML title", () => {
   assert.equal(page.file.name, "Example Person");
 });
 
+test("closing a pane drops in-flight preview work", () => {
+  assert.equal(shouldKeepPreviewWork("split"), true);
+  assert.equal(shouldKeepPreviewWork("preview"), true);
+  assert.equal(shouldKeepPreviewWork("source"), false);
+  assert.equal(shouldKeepPreviewWork("live"), false);
+  assert.equal(shouldCommitRightPane(3, 3, "people/Ada.md"), true);
+  assert.equal(shouldCommitRightPane(3, 4, "people/Ada.md"), false);
+  assert.equal(shouldCommitRightPane(3, 3, null), false);
+});
+
 test("cancelled preview work never reads the document", () => {
   const timers = new FakeTimers();
   const work = new DeferredDocumentWork(350, timers);
@@ -484,7 +503,137 @@ test("YAML boolean decoration scans only frontmatter, not a large note body", ()
   assert.equal(frontmatter.source, "---\nBible: true\nsleep: false\n---");
   assert.ok(frontmatter.end < 64);
   assert.doesNotMatch(frontmatter.source, /BODY_SENTINEL/);
-  assert.ok(scanMs < 250, `frontmatter scan took ${scanMs.toFixed(1)}ms`);
+  assert.ok(scanMs < 10, `frontmatter scan took ${scanMs.toFixed(1)}ms`);
+});
+
+test("keystroke markDirty does no work until the reactor interval", () => {
+  let reactions = 0;
+  const timers = {
+    setInterval: (callback: () => void, _ms: number) => {
+      (timers as { tick?: () => void }).tick = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    },
+    clearInterval: () => {},
+    tick: undefined as undefined | (() => void),
+  };
+  const reactor = new DirtyReactor(() => {
+    reactions += 1;
+  }, 50, timers);
+  reactor.start();
+  const started = performance.now();
+  for (let key = 0; key < 10_000; key++) reactor.markDirty();
+  const markMs = performance.now() - started;
+  assert.equal(reactions, 0);
+  assert.equal(reactor.isDirty, true);
+  assert.ok(markMs < 10, `markDirty x10000 took ${markMs.toFixed(1)}ms`);
+  timers.tick?.();
+  assert.equal(reactions, 1);
+  reactor.stop();
+});
+
+test("autosave does not cancel the pending preview refresh", () => {
+  let now = 0;
+  const timers = {
+    setInterval: (callback: () => void, _ms: number) => {
+      (timers as { tick?: () => void }).tick = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    },
+    clearInterval: () => {},
+    tick: undefined as undefined | (() => void),
+  };
+  let reactions = 0;
+  const reactor = new DirtyReactor(() => {
+    reactions += 1;
+  }, 50, timers, () => now);
+  reactor.start();
+  reactor.markDirty();
+  now = 800;
+  assert.deepEqual(reactor.consumeIdle(1_000, 800), { preview: false, save: true });
+  reactor.clearDirty();
+  assert.equal(reactor.isDirty, false);
+  assert.equal(reactor.previewPending, true);
+  timers.tick?.();
+  assert.equal(reactions, 1);
+  now = 1_000;
+  assert.deepEqual(reactor.consumeIdle(1_000, 800), { preview: true, save: false });
+  assert.equal(reactor.previewPending, false);
+  reactor.stop();
+});
+
+test("splitWikilinkTarget strips image width and aliases", () => {
+  assert.deepEqual(splitWikilinkTarget("myself.png|250"), {
+    note: "myself.png",
+    heading: null,
+    block: null,
+  });
+  assert.deepEqual(splitWikilinkTarget("Note#Heading|alias"), {
+    note: "Note",
+    heading: "Heading",
+    block: null,
+  });
+});
+
+test("editor lock predicates never reload on a save echo of the open dirty note", () => {
+  assert.equal(
+    shouldReloadEditorFromVault("journals/today.md", "markdown", true, ["journals/today.md"]),
+    false,
+  );
+  assert.equal(
+    shouldReloadEditorFromVault("journals/today.md", "markdown", false, ["other.md"]),
+    false,
+  );
+  assert.equal(
+    shouldReloadEditorFromVault("journals/today.md", "markdown", false, ["journals/today.md"]),
+    true,
+  );
+  assert.equal(
+    shouldRefreshPreviewFromOtherPages("journals/today.md", "split", ["other.md"]),
+    true,
+  );
+  assert.equal(
+    shouldRefreshPreviewFromOtherPages("journals/today.md", "source", ["other.md"]),
+    false,
+  );
+  assert.equal(shouldRefreshVaultStats(false, 0, 0), false);
+  assert.equal(shouldRefreshVaultStats(true, 0, 0), true);
+});
+
+test("wikilink unique-suffix map for a 5k vault stays under 10ms", () => {
+  const files = Array.from({ length: 5_000 }, (_, index) => ({
+    path: `people/Person ${index}.md`,
+  }));
+  shortestWikilinkTargets(files.slice(0, 100));
+  const started = performance.now();
+  const targets = shortestWikilinkTargets(files);
+  const ms = performance.now() - started;
+  assert.equal(targets.get("people/Person 1"), "Person 1");
+  assert.ok(ms < 10, `shortestWikilinkTargets took ${ms.toFixed(1)}ms`);
+});
+
+test("wikilink highlight scan of a large source note stays under 10ms", () => {
+  const source = Array.from({ length: 4_000 }, (_, index) =>
+    `See [[Note ${index}]] and more text on this line.`,
+  ).join("\n");
+  const started = performance.now();
+  const count = countWikilinks(source);
+  const ms = performance.now() - started;
+  assert.equal(count, 4_000);
+  assert.ok(ms < 10, `wikilink scan took ${ms.toFixed(1)}ms`);
+});
+
+test("typing does not serialize the document until the preview quiet period", () => {
+  const timers = new FakeTimers();
+  const work = new DeferredDocumentWork(350, timers);
+  let reads = 0;
+  for (let key = 0; key < 40; key++) {
+    work.schedule(() => {
+      reads++;
+      return "doc";
+    }, () => {});
+  }
+  assert.equal(reads, 0);
+  timers.flush();
+  assert.equal(reads, 1);
 });
 
 test("a note without frontmatter does not scan its body", () => {

@@ -27,6 +27,7 @@ pub use parse::MarkdownFacts;
 pub use resolve::{wikilink_key, IndexedFile, LinkResolver};
 pub use version::{Version, PROJECT_VERSION};
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,8 +40,9 @@ use walkdir::WalkDir;
 
 use file_kind::FileKind as FK;
 use parse::parse_markdown;
+pub use pathutil::should_skip_rel;
 use pathutil::{
-    abs_from_rel, name_of, normalize_rel, parent_of, rel_from_abs_cached, should_skip_rel, stem_ext,
+    abs_from_rel, name_of, normalize_rel, parent_of, rel_from_abs_cached, stem_ext,
 };
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -48,6 +50,7 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 pub struct VaultIndex {
     vault_root: PathBuf,
     conn: Connection,
+    resolver: RefCell<Option<LinkResolver>>,
 }
 
 /// Stats from open reconcile / full rebuild.
@@ -69,6 +72,95 @@ pub enum ProgressPhase {
 }
 
 pub type ProgressFn<'a> = dyn FnMut(ProgressPhase, usize, usize, Option<&str>) + 'a;
+
+/// Filesystem-vs-index delta. Computing this does not write the database.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcilePlan {
+    pub scanned: usize,
+    pub unchanged: usize,
+    pub updated: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl ReconcilePlan {
+    pub fn has_work(&self) -> bool {
+        !self.updated.is_empty() || !self.removed.is_empty()
+    }
+
+    pub fn from_scan(
+        disk: &[(String, i64, i64)],
+        indexed: &HashMap<String, (i64, i64)>,
+    ) -> Self {
+        let mut updated = Vec::new();
+        let mut unchanged = 0;
+        let mut disk_paths = HashSet::new();
+        for (path, mtime, size) in disk {
+            disk_paths.insert(path.clone());
+            match indexed.get(path) {
+                Some((im, is)) if *im == *mtime && *is == *size => unchanged += 1,
+                _ => updated.push(path.clone()),
+            }
+        }
+        let removed: Vec<String> = indexed
+            .keys()
+            .filter(|path| !disk_paths.contains(*path))
+            .cloned()
+            .collect();
+        Self {
+            scanned: disk.len(),
+            unchanged,
+            updated,
+            removed,
+        }
+    }
+}
+
+/// Index everything that is not on screen first; visible pages last so the
+/// UI can keep reading them while the rest of the vault catches up.
+pub fn background_then_visible(
+    paths: impl IntoIterator<Item = String>,
+    visible: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut rest = Vec::new();
+    let mut showing = Vec::new();
+    for path in paths {
+        if visible.contains(&path) {
+            showing.push(path);
+        } else {
+            rest.push(path);
+        }
+    }
+    (rest, showing)
+}
+
+/// Strip Obsidian `#heading` / `|alias` / `|250` from a wikilink target.
+fn link_note(raw: &str) -> String {
+    let no_alias = raw.split_once('|').map(|(note, _)| note).unwrap_or(raw);
+    no_alias
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Archive-bit work list: only dirty paths, on-screen dirty files last.
+/// Never invents extra pages to reindex.
+pub fn archive_index_order(
+    dirty: impl IntoIterator<Item = String>,
+    visible: &HashSet<String>,
+) -> Vec<String> {
+    let (rest, showing) = background_then_visible(dirty, visible);
+    rest.into_iter().chain(showing).collect()
+}
+
+/// Result of applying one archive bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexTouch {
+    Unchanged,
+    Updated,
+    Removed,
+}
 
 impl VaultIndex {
     /// Open (or create) `.nephrite/index.db` under the vault and **reconcile on open**.
@@ -98,9 +190,14 @@ impl VaultIndex {
              PRAGMA temp_store = MEMORY;",
         )?;
 
-        let mut idx = Self { vault_root, conn };
+        let mut idx = Self {
+            vault_root,
+            conn,
+            resolver: RefCell::new(None),
+        };
         idx.ensure_schema()?;
         let stats = idx.reconcile_with_progress(&mut progress)?;
+        let _ = idx.resolve_link("__nephrite_warm__", None);
         Ok((idx, stats))
     }
 
@@ -188,11 +285,11 @@ impl VaultIndex {
     /// Compare a previously scanned filesystem snapshot with the index. The
     /// database is touched only for this short in-memory comparison.
     pub fn filesystem_changed_from(&self, files: &[(String, i64, i64)]) -> Result<bool> {
-        let disk: HashMap<String, (i64, i64)> = files
-            .iter()
-            .cloned()
-            .map(|(path, mtime, size)| (path, (mtime, size)))
-            .collect();
+        Ok(self.plan_from_scan(files)?.has_work())
+    }
+
+    /// Snapshot of indexed path → (mtime_ms, size_bytes). Short DB read.
+    pub fn file_metas(&self) -> Result<HashMap<String, (i64, i64)>> {
         let mut indexed = HashMap::new();
         let mut statement = self
             .conn
@@ -202,7 +299,19 @@ impl VaultIndex {
             let (path, metadata) = row?;
             indexed.insert(path, metadata);
         }
-        Ok(disk != indexed)
+        Ok(indexed)
+    }
+
+    /// Diff a filesystem scan against the index without writing.
+    pub fn plan_from_scan(&self, files: &[(String, i64, i64)]) -> Result<ReconcilePlan> {
+        let indexed = self.file_metas()?;
+        Ok(ReconcilePlan::from_scan(files, &indexed))
+    }
+
+    /// Best-effort WAL trim. PASSIVE does not block readers.
+    pub fn wal_checkpoint_passive(&self) -> Result<()> {
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        Ok(())
     }
 
     pub fn reconcile_with_progress(
@@ -427,6 +536,46 @@ impl VaultIndex {
         Ok(stats)
     }
 
+    /// One-row lookup. Used to clear an archive bit without reparsing.
+    pub fn file_meta(&self, rel: &str) -> Result<Option<(i64, i64)>> {
+        let rel = normalize_rel(rel)?;
+        let result = self.conn.query_row(
+            "SELECT mtime_ms, size_bytes FROM files WHERE path = ?1",
+            params![rel],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(meta) => Ok(Some(meta)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Apply one archive bit. If disk mtime/size already match the index, this
+    /// is a no-op and must stay off the editor's critical path.
+    pub fn touch_path(&mut self, rel: &str) -> Result<IndexTouch> {
+        let rel = normalize_rel(rel)?;
+        if should_skip_rel(&rel) {
+            return Ok(IndexTouch::Unchanged);
+        }
+        let abs = abs_from_rel(&self.vault_root, &rel)?;
+        if !abs.is_file() {
+            if self.file_meta(&rel)?.is_some() {
+                self.remove_path(&rel)?;
+                return Ok(IndexTouch::Removed);
+            }
+            return Ok(IndexTouch::Unchanged);
+        }
+        let meta = abs.metadata().map_err(IndexError::Io)?;
+        let mtime_ms = mtime_to_ms(meta.modified().ok());
+        let size = meta.len() as i64;
+        if self.file_meta(&rel)? == Some((mtime_ms, size)) {
+            return Ok(IndexTouch::Unchanged);
+        }
+        self.index_path(&rel)?;
+        Ok(IndexTouch::Updated)
+    }
+
     /// Re-index a single vault-relative path (create/update).
     pub fn index_path(&mut self, rel: &str) -> Result<()> {
         self.index_path_with_content(rel, None)
@@ -452,7 +601,12 @@ impl VaultIndex {
         let tx = self.conn.unchecked_transaction()?;
         write_file_index(&tx, &prepared)?;
         tx.commit()?;
+        self.invalidate_resolver();
         Ok(())
+    }
+
+    fn invalidate_resolver(&self) {
+        self.resolver.borrow_mut().take();
     }
 
     /// Re-index many vault-relative paths inside one transaction. Used by
@@ -506,6 +660,7 @@ impl VaultIndex {
             }
         }
         tx.commit()?;
+        self.invalidate_resolver();
         Ok(())
     }
 
@@ -515,6 +670,7 @@ impl VaultIndex {
             .execute("DELETE FROM files_fts WHERE path = ?1", params![rel])?;
         self.conn
             .execute("DELETE FROM files WHERE path = ?1", params![rel])?;
+        self.invalidate_resolver();
         Ok(())
     }
 
@@ -597,6 +753,119 @@ impl VaultIndex {
 
     /// Build the Obsidian-order link resolver from the current index.
     pub fn link_resolver(&self) -> Result<LinkResolver> {
+        self.build_link_resolver()
+    }
+
+    /// Resolve a wikilink. Exact indexed paths skip building the vault map.
+    pub fn resolve_link(&self, raw: &str, from_path: Option<&str>) -> Result<Option<String>> {
+        let note = link_note(raw);
+        if let Some(hit) = self.exact_indexed_path(&note)? {
+            return Ok(Some(hit));
+        }
+        if let Some(hit) = self.indexed_by_name(&note, from_path)? {
+            return Ok(Some(hit));
+        }
+        if let Some(hit) = self.existing_file_candidate(&note, from_path) {
+            return Ok(Some(hit));
+        }
+        {
+            let cache = self.resolver.borrow();
+            if let Some(existing) = cache.as_ref() {
+                return Ok(existing.resolve(&note, from_path));
+            }
+        }
+        let built = self.build_link_resolver()?;
+        let hit = built.resolve(&note, from_path);
+        *self.resolver.borrow_mut() = Some(built);
+        Ok(hit)
+    }
+
+    fn exact_indexed_path(&self, raw: &str) -> Result<Option<String>> {
+        let note = link_note(raw);
+        if note.is_empty() {
+            return Ok(None);
+        }
+        let key = note.replace('\\', "/").trim_start_matches('/').to_string();
+        if key.is_empty() || key.contains("..") {
+            return Ok(None);
+        }
+        match self.file_meta(&key) {
+            Ok(Some(_)) => Ok(Some(key)),
+            Ok(None) => Ok(None),
+            Err(IndexError::InvalidPath(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `![[myself.png]]` is a filename, not a vault-root path. Use the index
+    /// name column instead of building the 12k-file resolver.
+    fn indexed_by_name(&self, raw: &str, from_path: Option<&str>) -> Result<Option<String>> {
+        let name = raw
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() || name.contains("..") {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT path FROM files WHERE name = ?1")?;
+        let paths = stmt
+            .query_map(params![name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        if paths.len() == 1 {
+            return Ok(Some(paths[0].clone()));
+        }
+        if let Some(from) = from_path {
+            let parent = from.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            let beside = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}/{name}")
+            };
+            if let Some(hit) = paths.iter().find(|path| *path == &beside) {
+                return Ok(Some(hit.clone()));
+            }
+        }
+        Ok(Some(paths[0].clone()))
+    }
+
+    /// Cheap existence checks only — never walk the vault.
+    fn existing_file_candidate(&self, raw: &str, from_path: Option<&str>) -> Option<String> {
+        let key = raw.replace('\\', "/").trim_start_matches('/').to_string();
+        if key.is_empty() || key.contains("..") {
+            return None;
+        }
+        let file_name = key.rsplit('/').next().unwrap_or(&key);
+        let mut candidates = Vec::with_capacity(4);
+        candidates.push(key.clone());
+        if let Some(from) = from_path {
+            let parent = from.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            if parent.is_empty() {
+                candidates.push(file_name.to_string());
+            } else {
+                candidates.push(format!("{parent}/{file_name}"));
+            }
+        }
+        if !key.starts_with("assets/") {
+            candidates.push(format!("assets/{file_name}"));
+        }
+        for rel in candidates {
+            let abs = self.vault_root.join(&rel);
+            if abs.is_file() {
+                return Some(rel);
+            }
+        }
+        None
+    }
+
+    fn build_link_resolver(&self) -> Result<LinkResolver> {
         let mut files_stmt = self.conn.prepare("SELECT path, name, stem FROM files")?;
         let files = files_stmt
             .query_map([], |r| {
@@ -1359,6 +1628,161 @@ Rating:: 5
         assert_eq!(stats.updated, 1);
         assert!(!idx.filesystem_changed().unwrap());
         assert_eq!(idx.count("tasks").unwrap(), 2);
+    }
+
+    #[test]
+    fn background_then_visible_indexes_on_screen_pages_last() {
+        let visible = HashSet::from(["open.md".to_string(), "right.md".to_string()]);
+        let (rest, showing) = background_then_visible(
+            ["a.md", "open.md", "b.md", "right.md"].map(str::to_string),
+            &visible,
+        );
+        assert_eq!(rest, vec!["a.md", "b.md"]);
+        assert_eq!(showing, vec!["open.md", "right.md"]);
+    }
+
+    #[test]
+    fn archive_index_order_does_not_reindex_clean_visible_pages() {
+        let visible = HashSet::from(["open.md".to_string(), "other-tab.md".to_string()]);
+        let order = archive_index_order(
+            ["sync.md".to_string(), "open.md".to_string()],
+            &visible,
+        );
+        assert_eq!(order, vec!["sync.md", "open.md"]);
+        assert!(!order.contains(&"other-tab.md".to_string()));
+    }
+
+    #[test]
+    fn resolve_link_exact_image_path_stays_under_10ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        fs::write(vault.join("pic.png"), [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        fs::write(vault.join("note.md"), "![[pic.png]]\n").unwrap();
+        let (idx, _) = VaultIndex::open(vault).unwrap();
+        assert_eq!(
+            idx.resolve_link("pic.png", Some("note.md")).unwrap().as_deref(),
+            Some("pic.png")
+        );
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            assert_eq!(
+                idx.resolve_link("pic.png", Some("note.md")).unwrap().as_deref(),
+                Some("pic.png")
+            );
+        }
+        assert!(
+            started.elapsed() / 50 < std::time::Duration::from_millis(10),
+            "exact image resolve averaged {:?}",
+            started.elapsed() / 50
+        );
+    }
+
+    #[test]
+    fn resolve_link_basename_image_uses_index_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        fs::create_dir_all(vault.join("assets")).unwrap();
+        fs::write(
+            vault.join("assets/myself.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+        fs::write(vault.join("job.md"), "![[myself.png|250]]\n").unwrap();
+        let (idx, _) = VaultIndex::open(vault).unwrap();
+        assert_eq!(
+            idx.resolve_link("myself.png|250", Some("job.md"))
+                .unwrap()
+                .as_deref(),
+            Some("assets/myself.png")
+        );
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            assert_eq!(
+                idx.resolve_link("myself.png", Some("job.md"))
+                    .unwrap()
+                    .as_deref(),
+                Some("assets/myself.png")
+            );
+        }
+        assert!(
+            started.elapsed() / 50 < std::time::Duration::from_millis(10),
+            "basename image resolve averaged {:?}",
+            started.elapsed() / 50
+        );
+    }
+
+    #[test]
+    fn resolve_link_finds_unindexed_image_beside_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        fs::create_dir_all(vault.join("job_search")).unwrap();
+        fs::write(vault.join("job_search/note.md"), "x\n").unwrap();
+        let (idx, _) = VaultIndex::open(vault).unwrap();
+        fs::write(
+            vault.join("job_search/later.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+        assert_eq!(
+            idx.resolve_link("later.png", Some("job_search/note.md"))
+                .unwrap()
+                .as_deref(),
+            Some("job_search/later.png")
+        );
+    }
+
+    #[test]
+    fn touch_path_skips_current_files_in_under_10ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        fs::write(vault.join("A.md"), "# a\n").unwrap();
+        let (mut idx, _) = VaultIndex::open(vault).unwrap();
+        assert_eq!(idx.touch_path("A.md").unwrap(), IndexTouch::Unchanged);
+
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            assert_eq!(idx.touch_path("A.md").unwrap(), IndexTouch::Unchanged);
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed / 50 < std::time::Duration::from_millis(10),
+            "clean touch_path averaged {elapsed:?} / 50"
+        );
+    }
+
+    #[test]
+    fn touch_path_updates_only_when_disk_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        fs::write(vault.join("A.md"), "- [ ] old\n").unwrap();
+        let (mut idx, _) = VaultIndex::open(vault).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(vault.join("A.md"), "- [ ] one\n- [x] two\n").unwrap();
+        assert_eq!(idx.touch_path("A.md").unwrap(), IndexTouch::Updated);
+        assert_eq!(idx.count("tasks").unwrap(), 2);
+        assert_eq!(idx.touch_path("A.md").unwrap(), IndexTouch::Unchanged);
+        fs::remove_file(vault.join("A.md")).unwrap();
+        assert_eq!(idx.touch_path("A.md").unwrap(), IndexTouch::Removed);
+        assert_eq!(idx.touch_path("A.md").unwrap(), IndexTouch::Unchanged);
+    }
+
+    #[test]
+    fn reconcile_plan_detects_mtime_and_removals() {
+        let disk = vec![
+            ("keep.md".into(), 10, 4),
+            ("changed.md".into(), 20, 8),
+            ("new.md".into(), 1, 1),
+        ];
+        let indexed = HashMap::from([
+            ("keep.md".into(), (10, 4)),
+            ("changed.md".into(), (1, 8)),
+            ("gone.md".into(), (1, 1)),
+        ]);
+        let plan = ReconcilePlan::from_scan(&disk, &indexed);
+        assert_eq!(plan.scanned, 3);
+        assert_eq!(plan.unchanged, 1);
+        assert_eq!(plan.updated, vec!["changed.md", "new.md"]);
+        assert_eq!(plan.removed, vec!["gone.md"]);
     }
 
     #[test]

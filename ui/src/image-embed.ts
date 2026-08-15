@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { MediaFile } from "./types";
 
 export function isImagePath(path: string): boolean {
@@ -12,10 +12,9 @@ export async function hydrateWikilinkImage(
   target: string,
 ): Promise<boolean> {
   if (!isImagePath(resolved)) return false;
-  const media = await invoke<MediaFile>("read_media_file", { path: resolved });
   const image = document.createElement("img");
   image.className = "image-embed";
-  image.src = mediaSource(media);
+  image.src = await vaultMediaSrc(resolved);
   image.alt = target.split("/").pop()?.split("#")[0] || "Embedded image";
   image.loading = "lazy";
   image.decoding = "async";
@@ -46,8 +45,7 @@ export async function hydrateMarkdownImages(
       fromPath,
     });
     if (!resolved || !isImagePath(resolved)) return;
-    const media = await invoke<MediaFile>("read_media_file", { path: resolved });
-    image.src = mediaSource(media);
+    image.src = await vaultMediaSrc(resolved);
     image.dataset.vaultImage = "1";
     image.loading = "lazy";
     image.decoding = "async";
@@ -55,8 +53,22 @@ export async function hydrateMarkdownImages(
   }));
 }
 
-function mediaSource(media: MediaFile): string {
-  return `data:${media.mime};base64,${media.data}`;
+const mediaSrcCache = new Map<string, string>();
+
+export async function vaultMediaSrc(path: string): Promise<string> {
+  const cached = mediaSrcCache.get(path);
+  if (cached) return cached;
+  try {
+    const absolute = await invoke<string>("absolute_path", { path });
+    const src = convertFileSrc(absolute);
+    mediaSrcCache.set(path, src);
+    return src;
+  } catch {
+    const media = await invoke<MediaFile>("read_media_file", { path });
+    const src = `data:${media.mime};base64,${media.data}`;
+    mediaSrcCache.set(path, src);
+    return src;
+  }
 }
 
 function applyImageDimensions(image: HTMLImageElement, options?: string): void {

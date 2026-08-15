@@ -5,11 +5,14 @@ mod state;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
-use nephrite_index::{plan_open, ProgressPhase, VaultIndex, PROJECT_VERSION};
+use nephrite_index::{
+    archive_index_order, plan_open, should_skip_rel, IndexTouch, ProgressPhase, VaultIndex,
+    PROJECT_VERSION,
+};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use state::AppState;
+use state::{AppState, VisiblePages};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -716,6 +719,7 @@ async fn open_vault(
     start_vault_watcher(
         app,
         Arc::clone(&index_state),
+        Arc::clone(&state.visible),
         Arc::clone(&watcher_generation),
         generation,
     );
@@ -731,103 +735,126 @@ pub struct VaultChangeEvent {
     pub paths: Vec<String>,
 }
 
-fn indexed_file_state(index: &VaultIndex) -> Result<HashMap<String, (i64, i64)>, String> {
-    let mut statement = index
-        .connection()
-        .prepare("SELECT path, mtime_ms, size_bytes FROM files")
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<HashMap<_, _>, _>>()
-        .map_err(|error| error.to_string())
-}
-
-fn reconcile_vault(index: &mut VaultIndex) -> Result<VaultChangeEvent, String> {
-    let before = indexed_file_state(index)?;
-    let stats = index.reconcile().map_err(|error| error.to_string())?;
-    let after = indexed_file_state(index)?;
-    let mut paths: Vec<String> = before
-        .keys()
-        .chain(after.keys())
-        .filter(|path| before.get(*path) != after.get(*path))
-        .cloned()
-        .collect();
-    paths.sort_unstable();
-    paths.dedup();
-    Ok(VaultChangeEvent {
-        scanned: stats.scanned,
-        updated: stats.updated,
-        removed: stats.removed,
-        paths,
-    })
-}
-
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(350);
-const WATCH_SAFETY_RECONCILE: Duration = Duration::from_secs(60);
-
-fn watcher_event_is_relevant(root: &Path, event: &Event) -> bool {
-    if matches!(event.kind, EventKind::Access(_)) {
-        return false;
+/// Archive-bit pass: only dirty watcher paths. On-screen dirty files go last.
+/// Already-current files (mtime/size match) are a no-op so a save echo cannot
+/// reparse the open editor note.
+fn index_dirty_then_visible(
+    index: &Arc<Mutex<Option<VaultIndex>>>,
+    visible: &VisiblePages,
+    dirty: impl IntoIterator<Item = String>,
+) -> Result<VaultChangeEvent, String> {
+    let showing = visible.snapshot();
+    let order = archive_index_order(dirty, &showing);
+    if order.is_empty() {
+        return Ok(VaultChangeEvent {
+            scanned: 0,
+            updated: 0,
+            removed: 0,
+            paths: Vec::new(),
+        });
     }
-    // Some backends report a rescan/overflow without individual paths. A full
-    // reconciliation is the only safe response to those notifications.
-    if event.paths.is_empty() {
-        return true;
-    }
-    event.paths.iter().any(|path| {
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        let relative_text = relative.to_string_lossy().replace('\\', "/");
-        if relative_text == ".git" || relative_text.starts_with(".git/") {
-            return false;
+
+    let mut changed = Vec::new();
+    let mut updated = 0usize;
+    let mut removed = 0usize;
+
+    for path in order {
+        let mut guard = index.lock();
+        let Some(open) = guard.as_mut() else {
+            return Err("No vault open".to_string());
+        };
+        match open.touch_path(&path).map_err(|error| error.to_string())? {
+            IndexTouch::Unchanged => {}
+            IndexTouch::Updated => {
+                updated += 1;
+                changed.push(path);
+            }
+            IndexTouch::Removed => {
+                removed += 1;
+                changed.push(path);
+            }
         }
-        // SQLite changes these files while reconciling. Watching them would
-        // turn every index update into another index update.
-        !matches!(
-            relative_text.as_str(),
-            ".nephrite/index.db"
-                | ".nephrite/index.db-shm"
-                | ".nephrite/index.db-wal"
-                | ".nephrite/index.db-journal"
-        )
+    }
+
+    Ok(VaultChangeEvent {
+        scanned: changed.len(),
+        updated,
+        removed,
+        paths: changed,
     })
 }
 
-fn reconcile_and_emit(
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
+
+fn event_dirty_paths(root: &Path, event: &Event) -> HashSet<String> {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return HashSet::new();
+    }
+    let mut dirty = HashSet::new();
+    for path in &event.paths {
+        if let Some(rel) = archive_rel(root, path) {
+            dirty.insert(rel);
+        }
+    }
+    dirty
+}
+
+/// Watcher path → vault-relative file. Directories are not expanded; inotify
+/// already names the file that flipped the archive bit.
+fn archive_rel(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let relative_text = relative.to_string_lossy().replace('\\', "/");
+    if relative_text.is_empty() {
+        return None;
+    }
+    if should_skip_rel(&relative_text) {
+        return None;
+    }
+    if matches!(
+        relative_text.as_str(),
+        ".nephrite/index.db"
+            | ".nephrite/index.db-shm"
+            | ".nephrite/index.db-wal"
+            | ".nephrite/index.db-journal"
+    ) {
+        return None;
+    }
+    if path.is_dir() {
+        return None;
+    }
+    Some(relative_text)
+}
+
+fn apply_archive_bits(
     app: &AppHandle,
     index: &Arc<Mutex<Option<VaultIndex>>>,
+    visible: &VisiblePages,
+    dirty: HashSet<String>,
     watcher_generation: &AtomicU64,
     generation: u64,
 ) -> bool {
     if watcher_generation.load(Ordering::Acquire) != generation {
         return false;
     }
-    let result = {
-        let mut guard = index.lock();
-        let Some(index) = guard.as_mut() else {
-            return false;
-        };
-        reconcile_vault(index)
-    };
-    if watcher_generation.load(Ordering::Acquire) != generation {
-        return false;
+    if dirty.is_empty() {
+        return true;
     }
-    match result {
+    match index_dirty_then_visible(index, visible, dirty) {
         Ok(change) if change.updated > 0 || change.removed > 0 => {
             let _ = app.emit("vault-index-changed", change);
         }
         Ok(_) => {}
-        Err(error) => eprintln!("vault watcher reconcile failed: {error}"),
+        Err(error) => eprintln!("vault watcher archive pass failed: {error}"),
     }
-    true
+    watcher_generation.load(Ordering::Acquire) == generation
 }
 
-/// Use the operating system's recursive file watcher for prompt external
-/// updates. Bursts are coalesced before reconciling, and a slow periodic pass
-/// remains as a safety net for backend overflows and network filesystems.
+/// inotify/FSEvents names the files whose archive bit flipped. Coalesce a
+/// burst, index those files, then the pages on screen. Never walk the vault.
 fn start_vault_watcher(
     app: AppHandle,
     index: Arc<Mutex<Option<VaultIndex>>>,
+    visible: Arc<VisiblePages>,
     watcher_generation: Arc<AtomicU64>,
     generation: u64,
 ) {
@@ -847,12 +874,6 @@ fn start_vault_watcher(
             Ok(watcher) => watcher,
             Err(error) => {
                 eprintln!("native vault watcher unavailable: {error}");
-                while watcher_generation.load(Ordering::Acquire) == generation {
-                    std::thread::sleep(WATCH_SAFETY_RECONCILE);
-                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
-                        return;
-                    }
-                }
                 return;
             }
         };
@@ -864,55 +885,59 @@ fn start_vault_watcher(
             return;
         }
 
-        let mut last_reconcile = Instant::now();
         while watcher_generation.load(Ordering::Acquire) == generation {
-            let safety_due = WATCH_SAFETY_RECONCILE.saturating_sub(last_reconcile.elapsed());
-            match receiver.recv_timeout(safety_due) {
-                Ok(Ok(event)) if watcher_event_is_relevant(&root, &event) => {
-                    // Drain and coalesce the rest of this save/sync burst. The
-                    // deadline moves forward for each relevant event.
-                    let mut deadline = Instant::now() + WATCH_DEBOUNCE;
-                    loop {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        match receiver.recv_timeout(remaining) {
-                            Ok(Ok(event)) if watcher_event_is_relevant(&root, &event) => {
-                                deadline = Instant::now() + WATCH_DEBOUNCE;
-                            }
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => eprintln!("vault watcher event error: {error}"),
-                            Err(mpsc::RecvTimeoutError::Timeout) => break,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        }
-                    }
-                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
-                        return;
-                    }
-                    last_reconcile = Instant::now();
+            let first = match receiver.recv() {
+                Ok(Ok(event)) => event,
+                Ok(Err(error)) => {
+                    eprintln!("vault watcher event error: {error}");
+                    continue;
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => eprintln!("vault watcher event error: {error}"),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if !reconcile_and_emit(&app, &index, &watcher_generation, generation) {
-                        return;
-                    }
-                    last_reconcile = Instant::now();
+                Err(_) => return,
+            };
+            let mut dirty = event_dirty_paths(&root, &first);
+            let mut deadline = Instant::now() + WATCH_DEBOUNCE;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                match receiver.recv_timeout(remaining) {
+                    Ok(Ok(event)) => {
+                        let extra = event_dirty_paths(&root, &event);
+                        if !extra.is_empty() {
+                            dirty.extend(extra);
+                            deadline = Instant::now() + WATCH_DEBOUNCE;
+                        }
+                    }
+                    Ok(Err(error)) => eprintln!("vault watcher event error: {error}"),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            if !apply_archive_bits(
+                &app,
+                &index,
+                &visible,
+                dirty,
+                &watcher_generation,
+                generation,
+            ) {
+                return;
             }
         }
     });
 }
 
-/// Explicit repair/refresh path for the toolbar. This runs the same complete
-/// filesystem reconciliation immediately rather than waiting for the watcher.
+/// Toolbar refresh reindexes on-screen pages only. The watcher owns dirty bits.
 #[tauri::command]
 fn refresh_vault(state: State<'_, AppState>) -> Result<VaultChangeEvent, String> {
-    let mut guard = state.index.lock();
-    let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
-    reconcile_vault(index)
+    index_dirty_then_visible(&state.index, &state.visible, state.visible.snapshot())
+}
+
+#[tauri::command]
+fn set_visible_paths(paths: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    state.visible.set(paths);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1642,9 +1667,11 @@ fn read_file(path: String, state: State<'_, AppState>) -> Result<OpenFile, Strin
 #[tauri::command]
 fn read_media_file(path: String, state: State<'_, AppState>) -> Result<MediaFile, String> {
     const MAX_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
-    let guard = state.index.lock();
-    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
-    let abs = vault_abs(index, &path)?;
+    let abs = {
+        let guard = state.index.lock();
+        let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+        vault_abs(index, &path)?
+    };
     let extension = abs
         .extension()
         .and_then(|value| value.to_str())
@@ -3766,8 +3793,9 @@ fn resolve_wikilink(
 ) -> Result<Option<String>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
-    let resolver = index.link_resolver().map_err(|e| e.to_string())?;
-    Ok(resolver.resolve(&target, from_path.as_deref()))
+    index
+        .resolve_link(&target, from_path.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 fn vault_info_from(index: &VaultIndex, stats: &nephrite_index::ReconcileStats) -> VaultInfo {
@@ -5070,7 +5098,7 @@ pub struct VimPowerlineResult {
 /// Nephrite only consumes the terminal row; it does not reinterpret the
 /// user's Powerline theme or replace the editor with a hidden Vim process.
 #[tauri::command]
-fn render_vim_powerline(
+async fn render_vim_powerline(
     path: String,
     line: usize,
     column: usize,
@@ -5083,10 +5111,11 @@ fn render_vim_powerline(
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let guard = state.index.lock();
-    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
-    let absolute = vault_abs(index, &path)?;
-    drop(guard);
+    let absolute = {
+        let guard = state.index.lock();
+        let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+        vault_abs(index, &path)?
+    };
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let vimrc = home.as_ref().map(|home| home.join(".vimrc"));
@@ -5114,6 +5143,7 @@ fn render_vim_powerline(
     );
     let cursor_command = format!("call cursor({}, {})", line.max(1), column.max(1));
 
+    tauri::async_runtime::spawn_blocking(move || {
     let mut command = Command::new("vim");
     command.arg("--not-a-term").arg("-n");
     if let Some(path) = vimrc.as_ref().filter(|path| path.is_file()) {
@@ -5168,6 +5198,9 @@ fn render_vim_powerline(
         columns,
         ok: status.map(|value| value.success()).unwrap_or(false),
     })
+    })
+    .await
+    .map_err(|error| format!("Vim Powerline task failed: {error}"))?
 }
 
 fn vim_option_escape(value: &str) -> String {
@@ -5293,6 +5326,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             index: Arc::new(Mutex::new(None)),
+            visible: Arc::new(VisiblePages::new()),
             watcher_generation: Arc::new(AtomicU64::new(0)),
         })
         .invoke_handler(tauri::generate_handler![
@@ -5302,6 +5336,7 @@ pub fn run() {
             templater_templates_folder,
             open_vault,
             refresh_vault,
+            set_visible_paths,
             vault_stats,
             list_files,
             list_attachments,

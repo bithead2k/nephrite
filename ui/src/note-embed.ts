@@ -16,6 +16,7 @@ type EmbedOptions = {
   openLink: (target: string) => void;
   ancestors?: ReadonlySet<string>;
   depth?: number;
+  shouldContinue?: () => boolean;
 };
 
 const MAX_EMBED_DEPTH = 4;
@@ -28,6 +29,8 @@ export async function hydrateNoteEmbeds(
 ): Promise<void> {
   const depth = options.depth ?? 0;
   if (depth >= MAX_EMBED_DEPTH) return;
+  const shouldContinue = options.shouldContinue ?? (() => true);
+  if (!shouldContinue()) return;
 
   const embeds = Array.from(
     root.querySelectorAll<HTMLAnchorElement>(
@@ -36,7 +39,7 @@ export async function hydrateNoteEmbeds(
   );
   await Promise.all(embeds.map(async (link) => {
     // Skip only if this node was already removed/replaced by another hydrator.
-    if (!root.contains(link)) return;
+    if (!shouldContinue() || !root.contains(link)) return;
     const target = link.dataset.wikilink?.trim();
     if (!target) return;
     const { note, heading, block } = splitWikilinkTarget(target);
@@ -44,6 +47,7 @@ export async function hydrateNoteEmbeds(
       target: note || fromPath,
       fromPath,
     });
+    if (!shouldContinue() || !root.contains(link)) return;
     if (!resolved) {
       link.classList.add("embed-unresolved");
       link.title = `Embedded note not found: ${target}`;
@@ -65,6 +69,7 @@ export async function hydrateNoteEmbeds(
     }
 
     const file = await invoke<OpenFile>("read_file", { path: resolved });
+    if (!shouldContinue() || !root.contains(link)) return;
     // Standalone Excalidraw JSON is handled by the drawing hydrator. If drawing
     // hydration failed, do not dump its JSON into a Markdown transclusion.
     if (resolved.toLowerCase().endsWith(".excalidraw")) return;

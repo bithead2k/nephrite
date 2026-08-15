@@ -48,18 +48,38 @@ export function shortestWikilinkTarget(
   path: string,
   files: readonly { path: string }[],
 ): string {
-  const key = wikilinkKey(path);
-  const parts = key.split("/").filter(Boolean);
-  if (parts.length === 0) return key;
-  const keys = files.map((file) => wikilinkKey(file.path));
-  for (let length = 1; length <= parts.length; length++) {
-    const suffix = parts.slice(-length).join("/");
-    const hits = keys.filter((candidate) =>
-      candidate === suffix || candidate.endsWith(`/${suffix}`),
-    );
-    if (hits.length <= 1) return suffix;
+  return shortestWikilinkTargets(files).get(wikilinkKey(path)) ?? wikilinkKey(path);
+}
+
+function walkSuffixes(key: string, visit: (suffix: string) => void): void {
+  visit(key);
+  for (let index = key.length - 1; index >= 0; index--) {
+    if (key.charCodeAt(index) === 47) visit(key.slice(index + 1));
   }
-  return key;
+}
+
+/** O(n) unique-suffix map. Do not call the single-file helper in a loop. */
+export function shortestWikilinkTargets(
+  files: readonly { path: string }[],
+): Map<string, string> {
+  const keys = files.map((file) => wikilinkKey(file.path));
+  const suffixCount = new Map<string, number>();
+  for (const key of keys) {
+    walkSuffixes(key, (suffix) => {
+      suffixCount.set(suffix, (suffixCount.get(suffix) ?? 0) + 1);
+    });
+  }
+  const out = new Map<string, string>();
+  for (const key of keys) {
+    let chosen = key;
+    walkSuffixes(key, (suffix) => {
+      if ((suffixCount.get(suffix) ?? 0) <= 1 && suffix.length <= chosen.length) {
+        chosen = suffix;
+      }
+    });
+    out.set(key, chosen);
+  }
+  return out;
 }
 
 /** Extract note path and optional heading from a wikilink target. */
@@ -68,12 +88,14 @@ export function splitWikilinkTarget(target: string): {
   heading: string | null;
   block: string | null;
 } {
-  const hash = target.indexOf("#");
+  const pipe = target.lastIndexOf("|");
+  const core = pipe >= 0 ? target.slice(0, pipe) : target;
+  const hash = core.indexOf("#");
   if (hash < 0) {
-    return { note: target.trim(), heading: null, block: null };
+    return { note: core.trim(), heading: null, block: null };
   }
-  const note = target.slice(0, hash).trim();
-  const frag = target.slice(hash + 1);
+  const note = core.slice(0, hash).trim();
+  const frag = core.slice(hash + 1);
   if (frag.startsWith("^")) {
     return { note, heading: null, block: frag.slice(1) };
   }

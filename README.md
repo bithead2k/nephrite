@@ -1,6 +1,6 @@
 # Nephrite
 
-**PROJECT_VERSION 0.5** — knowledge that doesn’t fracture.
+**PROJECT_VERSION 0.6** — knowledge that doesn’t fracture.
 
 Open-source, local-first knowledge app. Markdown is storage; the SQLite index is disposable. Opens an existing Obsidian vault without import or conversion.
 

@@ -225,6 +225,42 @@ test("the main preview hydration path expands an Obsidian heading embed", async 
   assert.equal(root.querySelector("a.preview-wikilink.embed"), null);
 });
 
+test("note embed hydration turns a wikilink image into an img", async () => {
+  document.body.replaceChildren();
+  const root = document.createElement("main");
+  root.innerHTML = renderPreview("![[myself.png|250]]");
+  document.body.append(root);
+  assert.ok(root.querySelector("a.preview-wikilink.embed"));
+
+  Object.defineProperty(dom.window, "__TAURI_INTERNALS__", {
+    configurable: true,
+    value: {
+      invoke: async (command: string, args?: { path?: string; target?: string }) => {
+        if (command === "resolve_wikilink") {
+          assert.equal(args?.target, "myself.png");
+          return "assets/myself.png";
+        }
+        if (command === "absolute_path") {
+          throw new Error("asset protocol unavailable in unit test");
+        }
+        if (command === "read_media_file") {
+          return { path: "assets/myself.png", mime: "image/png", data: "AAAA" };
+        }
+        throw new Error(`Unexpected command: ${command}`);
+      },
+    },
+  });
+
+  await hydrateNoteEmbeds(root, "job_search/2026/aaa-sr-data-engineer.md", {
+    openLink: () => {},
+  });
+  const image = root.querySelector<HTMLImageElement>("img.image-embed");
+  assert.ok(image);
+  assert.match(image.src, /data:image\/png;base64,AAAA/);
+  assert.equal(image.style.width, "250px");
+  assert.equal(root.querySelector("a.preview-wikilink.embed"), null);
+});
+
 test("a bundled plugin registers post/code processors that the sandbox can run", () => {
   const descriptor: PluginDescriptor = {
     id: "processor-smoke",

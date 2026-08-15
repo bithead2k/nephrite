@@ -58,7 +58,6 @@ export type EditorCallbacks = {
   onVimMessage?: (message: string, isError?: boolean) => void;
   onCursor: (line: number, col: number, totalLines: number) => void;
   onOpenWikilink: (target: string) => void;
-  onDocChange?: () => void;
   onFoldsChanged?: () => void;
   onSaveAttachments?: (files: File[]) => Promise<string[]>;
 };
@@ -85,6 +84,7 @@ export function frontmatterFoldRange(
 export class NephriteEditor {
   readonly view: EditorView;
   private vimCompartment = new Compartment();
+  private languageCompartment = new Compartment();
   private livePreviewCompartment = new Compartment();
   private vimOn = false;
   private suppressDirty = false;
@@ -182,20 +182,21 @@ export class NephriteEditor {
       ),
       foldGutter(),
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-      markdown(),
+      this.languageCompartment.of(markdown()),
       autocompletion({
         override: [
           slashCompletionSource(),
           wikilinkCompletionSource(() => this.completionFiles),
         ],
+        // Only pop when a source returns a result ([[ or /). Never scan the
+        // vault on ordinary letters.
         activateOnTyping: true,
         maxRenderedOptions: 80,
       }),
-      // Source-aware Markdown decorations and YAML controls.
       wikilinkPlugin(),
       sectionBreakPlugin(),
       yamlBooleanPlugin,
-      highlightSelectionMatches(),
+      highlightSelectionMatches({ minSelectionLength: 4, wholeWords: true }),
       Prec.highest(keymap.of([
         {
           key: "Alt-d",
@@ -260,11 +261,9 @@ export class NephriteEditor {
       }),
       EditorView.updateListener.of((u) => {
         if (u.docChanged) self.documentRevision++;
+        // Keystroke path: flip dirty. Preview, save, and chrome react off-thread.
         if (u.docChanged && !self.suppressDirty) {
           self.callbacks.onDirty(true);
-          // Do not serialize the document here. Consumers schedule any
-          // document-derived work and read it once after typing settles.
-          self.callbacks.onDocChange?.();
         }
         if (u.selectionSet || u.docChanged) {
           const head = u.state.selection.main.head;
@@ -680,11 +679,13 @@ export class NephriteEditor {
         insert: text, // exact vault content
       },
       selection: { anchor: 0 },
-      effects: unfold,
+      effects: [
+        ...unfold,
+        this.languageCompartment.reconfigure(text.length > 80_000 ? [] : markdown()),
+      ],
     });
     this.suppressDirty = false;
     this.callbacks.onDirty(false);
-    this.callbacks.onDocChange?.();
   }
 
   /** Replace a clean document after an external edit without throwing the
@@ -698,10 +699,10 @@ export class NephriteEditor {
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
       selection: { anchor, head },
+      effects: this.languageCompartment.reconfigure(text.length > 80_000 ? [] : markdown()),
     });
     this.suppressDirty = false;
     this.callbacks.onDirty(false);
-    this.callbacks.onDocChange?.();
     requestAnimationFrame(() => {
       this.view.scrollDOM.scrollTop = scrollTop;
     });

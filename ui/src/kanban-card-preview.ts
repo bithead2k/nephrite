@@ -9,6 +9,7 @@ import { splitFrontmatter } from "./frontmatter";
 import { makeEngineContext } from "./dv-context";
 import { executeBlocksInPreview } from "./dv-engine";
 import { hydrateMarkdownImages } from "./image-embed";
+import { hydrateNoteEmbeds } from "./note-embed";
 import { hydrateMermaid } from "./mermaid";
 import { hydrateCsvFences } from "./csv-view";
 import type { KanbanCard } from "./kanban";
@@ -168,6 +169,7 @@ async function renderNotePreview(
     makeEngineContext(file.path, file.content, openLink),
   );
   await hydrateMarkdownImages(page, file.path);
+  await hydrateNoteEmbeds(page, file.path, { openLink });
   hydrateCsvFences(page);
   await hydrateMermaid(page);
   hydrateTableOfContents(page);
