@@ -20,41 +20,92 @@ License: [AGPL-3.0](LICENSE)
 
 ## Native integrations
 
-- **Excalidraw:** press **Draw**, use **New Excalidraw drawing** in a folder's
-  context menu, or open an existing `.excalidraw` / Obsidian
-  `.excalidraw.md` file. Drawings autosave to their vault file. Fonts are
-  bundled for offline use.
-- **Templater compatibility:** press **Template** in a Markdown note. Nephrite
-  recognizes template folders and supports common `tp.file`, `tp.date`,
-  `tp.frontmatter`, `tp.system.prompt`, file include, and cursor commands.
-  Arbitrary `<%* JavaScript %>` is preserved with a warning, not executed
-  unsandboxed.
-- **Tasks:** press **Tasks** for the vault dashboard. Status changes surgically
-  edit the Markdown checkbox. Due, scheduled, start, done, and created dates,
-  recurrence, priority, and tags use common Obsidian Tasks syntax in the shared
-  index.
-- **Git:** press **Git** for staging, conflict resolution, upstream sync status,
+These replace the community plugins that should have been core a long time ago.
+Markdown on disk is still the store. Indexes and viewers are disposable.
+
+- **Excalidraw:** press **Draw**, use **New Excalidraw drawing** in a folder
+  context menu, or open an existing `.excalidraw` / Obsidian `.excalidraw.md`
+  file. Drawings autosave to their vault file. Fonts are bundled for offline use.
+- **Templater compatibility:** press **Template** in a Markdown note. Recognizes
+  template folders and common `tp.file`, `tp.date`, `tp.frontmatter`,
+  `tp.system.prompt`, file include, and cursor commands. Arbitrary
+  `<%* JavaScript %>` is preserved with a warning, not executed unsandboxed.
+- **Tasks:** press **Tasks** for the vault dashboard (today / week / overdue).
+  Status changes surgically edit the checkbox. Due, scheduled, start, done, and
+  created dates, recurrence, priority, and tags use common Obsidian Tasks
+  syntax. Extra statuses `[/] [>] [<] [?] [!] [-]` are indexed and cycled.
+- **Kanban:** Markdown boards (`kanban-plugin` frontmatter) as a first-class
+  view. Lane moves write the file. No separate board store.
+- **Git:** press **Git** for staging, conflict resolution, upstream status,
   branches, commit details, per-file history, and confirmed version restores.
-- **Search and graph:** ranked full-vault content search plus a filterable view
-  of indexed wikilinks and backlinks.
-- **Canvas:** open and edit Obsidian `.canvas` files directly; unknown JSON
-  fields are preserved while nodes and edges remain indexed and searchable.
-- **Dataview** SQL-ish query language
-- **SQL** Actual SQL language largely based on PostgreSQL syntax.
-- **Plugins:** native permissioned plugins plus an Obsidian compatibility host
-  for enabled bundled plugins already installed in `.obsidian/plugins/`.
+  Full-file merge UI is started, not a `git mergetool` replacement.
+- **Dataview:** DQL and DataviewJS over the index (`dv.pages`, tables, lists,
+  tasks, calendars, `dv.view`). Scripts that poke undocumented Obsidian
+  internals are not a compatibility target.
+- **SQL:** real PostgreSQL-shaped `SELECT` over vault pages via `libpg_query`.
+  Only fenced ` ```pgsql ` blocks execute. `sql` / `sqlpostgresql` highlight
+  only. Read-only; no server admin, no mutation.
+- **Plugins:** browse and install into `.obsidian/plugins/` (same directories
+  Obsidian uses). Native permissioned host plus an Obsidian compatibility
+  facade. Plugins Nephrite already implements in core (Dataview, Tasks,
+  Kanban, Excalidraw, Templater, Git, Mermaid, Calendar, TOC, Vim add-ons)
+  are hidden from the community catalog and not loaded twice.
+- **Callouts and TOC:** Obsidian callouts in preview; table-of-contents
+  hydration for notes that ask for one.
 
 ## Core features
 
-- Open a vault folder (same tree as Obsidian); remembers last vault
-- Build / reconcile `.nephrite/index.db` on open (`PROJECT_VERSION` major ⇒ full rebuild)
-- Browse / **filter** indexed Markdown, canvases, and Excalidraw drawings
-- **CodeMirror 6** editor (raw text I/O — no silent rewrite on open)
-- View modes: **Source · Preview · Split** (live preview via `marked`)
-- **Ctrl/Cmd+Enter** task cycle (plain → todo → half → done → plain)
-- Wikilink highlighting; **Ctrl/Cmd+click** (or click in preview) to open target
-- Optional **Vim** bindings and a practical vimrc/Vimscript compatibility subset
-- 800 ms autosave plus **Ctrl/Cmd+S**; re-indexes that path only
+- Open a vault folder (same tree as Obsidian); remembers last vault. No import.
+- Disposable SQLite index at `.nephrite/index.db` (WAL). Named, resumable
+  backfills; `PROJECT_VERSION` major ⇒ full rebuild, minor ⇒ reconcile.
+- Browse / **filter** indexed Markdown, canvases, Excalidraw, and attachments.
+- **CodeMirror 6** editor (raw text I/O — no silent rewrite on open/save).
+- View modes: **Source · Preview · Split**.
+- **Wikilinks:** `[[Note]]`, aliases, heading and block targets. Insertion uses
+  the shortest unique path. Resolution follows Obsidian search order; existing
+  shorts are not rewritten when a namesake appears. **Ctrl/Cmd+click** (or
+  click in preview) opens the target. Hover preview on links.
+- **Properties:** YAML frontmatter parsed and indexed; Properties table in
+  preview. Hierarchical YAML is read; write-back stays surgical.
+- **Ctrl/Cmd+Enter** task cycle through the extended status set.
+- Slash commands in the editor (`/task`, `/table`, `/mermaid`, `/callout`, …).
+- **Daily notes / calendar:** reads `.obsidian/daily-notes.json` when present.
+  Today, previous/next day, overmorrow and ereyesterday. Month pane marks
+  existing notes and creates from the configured template. Period notes are
+  flat vault-root files: `2026-W02.md`, `2026-08.md`, `2026-Q03.md`.
+- **Search:** ranked full-vault content + YAML property search.
+- **Graph:** local and global, index-backed. Filters; color by folder or first
+  tag. Not 3D.
+- **Canvas:** open and edit Obsidian `.canvas` files. Unknown JSON is
+  preserved. File cards are indexed as links (graph + backlinks).
+- **Outline / links / tags:** activity-rail panes for headings, backlinks,
+  outgoing links, unlinked mentions, and a vault tag browser.
+- **Orphans and placeholders:** notes with no incoming links, and unresolved
+  wikilinks with create-from-source.
+- **Session:** restore tabs, active file, right pane, pinned tabs, cursor
+  position. Reopen closed tab (`Mod+Shift+T`).
+- **Smart paste:** HTML from a browser becomes Markdown; a URL over a
+  selection becomes a link; already-Markdown text is left alone. Image
+  drag/drop and paste write into the vault (`attachmentFolderPath` when set)
+  and insert `![[…]]`.
+- **Preview viewers** (never rewrite source):
+  - PDF in-app; `![[file.pdf]]` embeds the same viewer
+  - Audio / video in-app; `![[clip.mp3]]` / `![[clip.mp4]]` embed
+  - KaTeX for `$…$`, `$$…$$`, and ` ```math ` / ` ```tex `
+  - Mermaid / `mmd` fences → SVG (vault mermaid plugins are not loaded)
+  - highlight.js on fenced code; opening `.rs` / `.ts` / `.py` / … uses a
+    read-only highlighted code viewer
+  - CSV as a table; JSON / YAML as a structured tree
+  - Note embeds `![[note]]` / `![[note#Heading]]` / block embeds
+- Optional **Vim** bindings and a practical vimrc/Vimscript subset (common
+  `set`s; `syntax` / `filetype` / `autocmd` / `colorscheme` are no-ops).
+- 800 ms autosave plus **Ctrl/Cmd+S**; re-indexes that path only.
+- File-tree drag to a folder uses in-app rename so dependent wikilinks update.
+
+Not in core, on purpose: mobile, official sync, a WYSIWYG/block editor, Notion
+Bases, persisting GFM table column widths, and unsandboxed Node/Electron
+plugin APIs. Use the files (or Unison) for sync. Point databases at `pgsql` +
+Dataview, not another query language.
 
 ## Requirements
 
