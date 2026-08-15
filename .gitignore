@@ -15,3 +15,5 @@ src-tauri/target
 .aider*
 .nanocoder.env
 .nanocoder/
+Modelfile
+apply.sh
