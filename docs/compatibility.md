@@ -60,6 +60,14 @@ Both wikilinks and Markdown links get rename updates, unresolved styling, and ba
 
 ---
 
+## Obsidian Bases
+
+`.base` files and ` ```base ` fences parse the Obsidian Bases YAML shape (filters, formulas, properties, views). Nephrite renders table, list, and cards views from the vault index. Command bar: **Create base**. Sync is not part of this surface.
+
+## Plugin settings
+
+Obsidian `Plugin.addSettingTab` / `PluginSettingTab` / `Setting` now open in a host settings panel from **Plugins → Settings** or **Plugin settings**. `data.json` remains available as **Data…**.
+
 ## YAML / properties (hierarchical)
 
 ### Problem with the Obsidian-shaped world

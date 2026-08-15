@@ -8,6 +8,7 @@ export const DEFAULT_SHORTCUTS: ShortcutMap = {
   find: "Mod+F",
   templates: "Mod+Y",
   "reopen-tab": "Mod+Shift+T",
+  "refresh-pane": "F5",
 };
 
 const MODIFIER_ORDER = ["Mod", "Ctrl", "Alt", "Shift", "Meta"];

@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { JSDOM } from "jsdom";
 import {
+  dqlContains,
   evaluateDql,
   filterPagesBySource,
   parseDql,
@@ -99,6 +100,39 @@ test("Dataview source selectors compose folders, tags, links, and booleans", () 
   assert.deepEqual(filterPagesBySource(pages, '"people" AND (#recruiter OR #interviewer)').map((p) => p.file.name), ["Brady Gunter", "Josh Flanders"]);
   assert.deepEqual(filterPagesBySource(pages, "#recruiter AND -#interviewer").map((p) => p.file.name), ["Brady Gunter"]);
   assert.deepEqual(filterPagesBySource(pages, "[[Brady Gunter]]").map((p) => p.file.name), ["Nephrite"]);
+});
+
+test("contains matches file.tags with or without a leading hash", () => {
+  const journal = page("journals/2026_08_15.md", ["#📝journal"]);
+  assert.equal(dqlContains(journal.file.tags, "📝journal"), true);
+  assert.equal(dqlContains(journal.file.tags, "#📝journal"), true);
+  assert.equal(evaluateDql('contains(file.tags, "📝journal")', journal, journal), true);
+  assert.equal(evaluateDql('contains(file.path, "2022")', journal, journal), false);
+  assert.equal(evaluateDql('contains(file, "tags")', journal, journal), true);
+});
+
+test("habit daily DQL returns journals filtered by the journal tag", async () => {
+  const journal = page("journals/2026_08_15.md", ["#📝journal"], {
+    Bible_Study: false,
+    Exercise: false,
+  });
+  const old = page("journals/2022_01_01.md", ["#📝journal"]);
+  const mount = document.createElement("div");
+  await runDqlBlock(
+    `TABLE WITHOUT ID file.name AS date
+FROM "journals"
+WHERE !contains(file.path,"2022")
+AND contains(file.tags,"📝journal")
+SORT file.name DESC
+LIMIT 1`,
+    mount,
+    {
+      ...context(),
+      loadPages: async () => [...pages, journal, old],
+    },
+  );
+  assert.match(mount.textContent ?? "", /2026_08_15/);
+  assert.doesNotMatch(mount.textContent ?? "", /2022_01_01|Brady/);
 });
 
 test("DQL functions cover collection, string, date, and duration operations", () => {

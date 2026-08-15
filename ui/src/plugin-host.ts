@@ -7,6 +7,7 @@ import {
   type AppHostServices,
   type AppPermission,
 } from "./app-api";
+import { installObsidianDom } from "./obsidian-dom";
 
 export const PLUGIN_API_VERSION = 1;
 
@@ -30,6 +31,7 @@ export type PluginStatus = PluginDescriptor & {
   enabled: boolean;
   loaded: boolean;
   error: string | null;
+  hasSettings: boolean;
 };
 
 export type PluginHostServices = AppHostServices & {
@@ -47,7 +49,7 @@ type RpcRequest = { nephritePlugin: true; pluginId: string; type: "request"; req
 type PluginMessage = RpcRequest | {
   nephritePlugin: true;
   pluginId: string;
-  type: "ready" | "error" | "processor-registered";
+  type: "ready" | "error" | "processor-registered" | "settings-tab";
   message?: string;
   kind?: "post" | "code";
   language?: string;
@@ -70,6 +72,9 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
   const bootstrap = `
 (() => {
   "use strict";
+  (${installObsidianDom.toString()})(window);
+  window.activeDocument = window.document;
+  window.activeWindow = window;
   const pluginId = ${JSON.stringify(plugin.id)};
   const callbacks = new Map();
   const views = new Map();
@@ -257,14 +262,112 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
     showAtPosition() { return this; }
     hide() {}
   }
-  class PluginSettingTab { constructor(app, plugin) { this.app = app; this.plugin = plugin; this.containerEl = document.createElement("div"); } display() {} hide() {} }
+  class PluginSettingTab {
+    constructor(app, plugin) {
+      this.app = app;
+      this.plugin = plugin;
+      this.id = plugin?.manifest?.id || "settings";
+      this.name = plugin?.manifest?.name || "Settings";
+      this.containerEl = document.createElement("div");
+    }
+    display() {}
+    hide() {}
+  }
   class Setting {
-    constructor(container) { this.settingEl = document.createElement("div"); container?.append?.(this.settingEl); }
-    setName(value) { this.name = value; return this; }
-    setDesc(value) { this.desc = value; return this; }
-    addText(callback) { const inputEl = document.createElement("input"); const control = { inputEl, setValue: (v) => (inputEl.value = v, control), setPlaceholder: (v) => (inputEl.placeholder = v, control), onChange: (fn) => (inputEl.addEventListener("input", () => fn(inputEl.value)), control) }; callback(control); return this; }
-    addToggle(callback) { const toggleEl = document.createElement("input"); toggleEl.type = "checkbox"; const control = { toggleEl, setValue: (v) => (toggleEl.checked = !!v, control), onChange: (fn) => (toggleEl.addEventListener("change", () => fn(toggleEl.checked)), control) }; callback(control); return this; }
-    addButton(callback) { const buttonEl = document.createElement("button"); const control = { buttonEl, setButtonText: (v) => (buttonEl.textContent = v, control), setCta: () => control, onClick: (fn) => (buttonEl.addEventListener("click", fn), control) }; callback(control); return this; }
+    constructor(container) {
+      this.settingEl = document.createElement("div");
+      this.settingEl.className = "setting-item";
+      this.infoEl = document.createElement("div");
+      this.infoEl.className = "setting-item-info";
+      this.nameEl = document.createElement("div");
+      this.nameEl.className = "setting-item-name";
+      this.descEl = document.createElement("div");
+      this.descEl.className = "setting-item-description";
+      this.controlEl = document.createElement("div");
+      this.controlEl.className = "setting-item-control";
+      this.infoEl.append(this.nameEl, this.descEl);
+      this.settingEl.append(this.infoEl, this.controlEl);
+      container?.append?.(this.settingEl);
+    }
+    setName(value) {
+      this.name = value;
+      this.nameEl.replaceChildren();
+      if (value && typeof value === "object" && value.nodeType) this.nameEl.append(value);
+      else this.nameEl.textContent = String(value ?? "");
+      return this;
+    }
+    setDesc(value) {
+      this.desc = value;
+      this.descEl.replaceChildren();
+      if (value && typeof value === "object" && value.nodeType) this.descEl.append(value);
+      else this.descEl.textContent = String(value ?? "");
+      return this;
+    }
+    setHeading() { this.settingEl.classList.add("setting-item-heading"); this.controlEl.remove(); return this; }
+    setClass(value) { this.settingEl.classList.add(value); return this; }
+    setDisabled(value) {
+      this.settingEl.classList.toggle("is-disabled", !!value);
+      for (const input of this.settingEl.querySelectorAll("input, textarea, select, button")) input.disabled = !!value;
+      return this;
+    }
+    addText(callback) {
+      const inputEl = document.createElement("input");
+      inputEl.type = "text";
+      this.controlEl.append(inputEl);
+      const control = { inputEl, setValue: (v) => (inputEl.value = v, control), setPlaceholder: (v) => (inputEl.placeholder = v, control), onChange: (fn) => (inputEl.addEventListener("input", () => fn(inputEl.value)), control) };
+      callback(control);
+      return this;
+    }
+    addToggle(callback) {
+      const toggleEl = document.createElement("input");
+      toggleEl.type = "checkbox";
+      this.controlEl.append(toggleEl);
+      const control = { toggleEl, setValue: (v) => (toggleEl.checked = !!v, control), onChange: (fn) => (toggleEl.addEventListener("change", () => fn(toggleEl.checked)), control) };
+      callback(control);
+      return this;
+    }
+    addButton(callback) {
+      const buttonEl = document.createElement("button");
+      this.controlEl.append(buttonEl);
+      const control = { buttonEl, setButtonText: (v) => (buttonEl.textContent = v, control), setCta: () => (buttonEl.classList.add("mod-cta"), control), onClick: (fn) => (buttonEl.addEventListener("click", fn), control) };
+      callback(control);
+      return this;
+    }
+    addTextArea(callback) {
+      const inputEl = document.createElement("textarea");
+      this.controlEl.append(inputEl);
+      const control = { inputEl, setValue: (v) => (inputEl.value = v, control), setPlaceholder: (v) => (inputEl.placeholder = v, control), setDisabled: (v) => (inputEl.disabled = !!v, control), onChange: (fn) => (inputEl.addEventListener("input", () => fn(inputEl.value)), control) };
+      callback(control);
+      return this;
+    }
+    addExtraButton(callback) {
+      const extraButtonEl = document.createElement("button");
+      extraButtonEl.type = "button";
+      this.controlEl.append(extraButtonEl);
+      const control = { extraButtonEl, setIcon: (v) => (extraButtonEl.textContent = v, control), setTooltip: (v) => (extraButtonEl.title = v, control), onClick: (fn) => (extraButtonEl.addEventListener("click", fn), control) };
+      callback(control);
+      return this;
+    }
+    addSlider(callback) {
+      const sliderEl = document.createElement("input");
+      sliderEl.type = "range";
+      this.controlEl.append(sliderEl);
+      const control = { sliderEl, setLimits: (min, max, step) => (sliderEl.min = min, sliderEl.max = max, sliderEl.step = step, control), setValue: (v) => (sliderEl.value = v, control), setDynamicTooltip: () => control, onChange: (fn) => (sliderEl.addEventListener("input", () => fn(Number(sliderEl.value))), control) };
+      callback(control);
+      return this;
+    }
+    addDropdown(callback) {
+      const selectEl = document.createElement("select");
+      this.controlEl.append(selectEl);
+      const control = {
+        selectEl,
+        addOption: (value, display) => { const option = document.createElement("option"); option.value = value; option.textContent = display ?? value; selectEl.append(option); return control; },
+        setValue: (v) => (selectEl.value = v, control),
+        onChange: (fn) => (selectEl.addEventListener("change", () => fn(selectEl.value)), control),
+      };
+      callback(control);
+      return this;
+    }
   }
   class Plugin extends Component {
     constructor(app, manifest) { super(); this.app = app; this.manifest = manifest; this._data = {}; }
@@ -287,7 +390,18 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
     registerView(type, creator) { return registerView({ id: type, name: type, onOpen: () => creator({ type, openFile: (file) => app.workspace.getLeaf().openFile(file) }) }); }
     addRibbonIcon(_icon, _title, callback) { const el = document.createElement("button"); el.addEventListener("click", callback); return el; }
     addStatusBarItem() { return document.createElement("span"); }
-    addSettingTab(tab) { return tab; }
+    addSettingTab(tab) {
+      this._settingTabs = this._settingTabs || [];
+      this._settingTabs.push(tab);
+      parent.postMessage({
+        nephritePlugin: true,
+        pluginId,
+        type: "settings-tab",
+        id: tab.id || pluginId,
+        name: tab.name || this.manifest?.name || pluginId,
+      }, "*");
+      return tab;
+    }
     registerMarkdownPostProcessor(processor) {
       this._postProcessor = processor;
       parent.postMessage({ nephritePlugin: true, pluginId, type: "processor-registered", kind: "post" }, "*");
@@ -310,6 +424,12 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
     debounce: (callback, wait = 0) => { let timer; return (...args) => { clearTimeout(timer); timer = setTimeout(() => callback(...args), wait); }; },
     MarkdownRenderer: Object.freeze({ render: async (_app, markdown, element) => { element.textContent = String(markdown); } }),
     requestUrl: async () => { throw new Error("Network access is not granted by the app host"); },
+    request: async () => { throw new Error("Network access is not granted by the app host"); },
+    createFragment: (callback) => {
+      const fragment = document.createDocumentFragment();
+      callback?.(fragment);
+      return fragment;
+    },
   });
   const commonModule = { exports: {} };
   window.module = commonModule;
@@ -362,6 +482,30 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       else if (message.type === "unload") for (const handler of unloadHandlers) result = await handler();
       else if (message.type === "command") result = await callbacks.get(message.id)?.();
       else if (message.type === "view") result = await views.get(message.id)?.();
+      else if (message.type === "display-settings") {
+        document.body.className = "plugin-settings-host";
+        document.body.replaceChildren();
+        const tabs = window.__obsidianPluginInstance?._settingTabs || [];
+        if (!tabs.length) {
+          const empty = document.createElement("p");
+          empty.textContent = "This plugin did not register a settings tab.";
+          document.body.append(empty);
+        }
+        for (const tab of tabs) {
+          const mount = document.createElement("div");
+          mount.className = "plugin-settings-tab";
+          document.body.append(mount);
+          tab.containerEl = mount;
+          try { tab.display?.(); }
+          catch (error) {
+            const failed = document.createElement("p");
+            failed.className = "plugin-settings-error";
+            failed.textContent = String(error);
+            mount.append(failed);
+          }
+        }
+        result = true;
+      }
       else if (message.type === "process-post") {
         const host = document.createElement("div");
         host.innerHTML = String(message.html || "");
@@ -390,17 +534,24 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
   const source = plugin.source.replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
   const style = (plugin.style ?? "").replace(/<\/style/gi, "<\\/style");
   const startCompatibility = plugin.compatibility === "obsidian" ? "window.__startObsidianPlugin();" : "";
-  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"><style>${style}</style>
+  const settingsCss = `html,body{height:100%;box-sizing:border-box}body.plugin-settings-host{margin:0;padding:18px 22px 28px;font:16px/1.5 system-ui,sans-serif;color:#e7eef7;background:#101820}body.plugin-settings-host p{color:#9aacbf;font-size:14px}.plugin-settings-error{color:#ff9c9c}.setting-item{display:flex;gap:16px;align-items:flex-start;justify-content:space-between;padding:12px 0;border-bottom:1px solid #243041}.setting-item-heading{display:block;border-bottom:1px solid #3a4d63;margin-top:12px;padding-top:4px}.setting-item-info{min-width:0;flex:1}.setting-item-name{font-size:16px;font-weight:650}.setting-item-description{color:#9aacbf;font-size:13px;margin-top:3px}.setting-item-control{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.setting-item-control input[type=text],.setting-item-control textarea,.setting-item-control select{background:#0b1119;color:#e7eef7;border:1px solid #53677e;border-radius:6px;padding:7px 10px;font-size:15px;min-width:18rem}.setting-item-control textarea{min-width:min(36rem,100%);min-height:5rem}.setting-item-control input[type=checkbox]{width:1.05rem;height:1.05rem}.setting-item-control button{background:#1e4b3b;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:14px}.setting-item-control button.mod-cta{background:#2f7d5b}.kroki-header-row{display:grid;gap:6px;margin-top:8px;width:100%}.kroki-header-label{color:#9aacbf;font-size:13px}.kroki-header-textarea{width:100%;min-height:5rem;background:#0b1119;color:#e7eef7;border:1px solid #53677e;border-radius:6px;padding:8px 10px;font:14px ui-monospace,monospace}`;
+  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"><style>${settingsCss}${style}</style>
 <script>${bootstrap}\ntry {\n${source}\n${startCompatibility}\nparent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"ready"},"*");\n} catch(error) { parent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"error",message:String(error)},"*"); }<\/script>`;
 }
 
-class IsolatedPlugin {
+export class IsolatedPlugin {
   readonly contributions = new Map<string, Contribution>();
   readonly iframe: HTMLIFrameElement;
   error: string | null = null;
   ready = false;
+  loadFinished = false;
+  hasSettings = false;
+  settingTabs: Array<{ id: string; name: string }> = [];
   private callbackSequence = 0;
   private callbacks = new Map<number, { resolve: (value: unknown) => void; reject: (reason: unknown) => void }>();
+  private readyWaiters: Array<() => void> = [];
+  private loadWaiters: Array<() => void> = [];
+  private generation = 0;
   private app: ObsidianApp;
 
   constructor(readonly descriptor: PluginDescriptor, private services: PluginHostServices, private changed: () => void) {
@@ -413,8 +564,93 @@ class IsolatedPlugin {
     this.iframe.hidden = true;
     this.iframe.sandbox.add("allow-scripts");
     this.iframe.title = `Nephrite plugin: ${descriptor.name}`;
+    this.iframe.addEventListener("load", () => {
+      this.generation += 1;
+      if (this.generation > 1) this.resetAfterReload();
+    });
     this.iframe.srcdoc = pluginIframeDocument(descriptor);
-    document.body.appendChild(this.iframe);
+    (document.getElementById("plugin-host") ?? document.body).appendChild(this.iframe);
+  }
+
+  markReady(): void {
+    this.ready = true;
+    const waiters = this.readyWaiters;
+    this.readyWaiters = [];
+    for (const waiter of waiters) waiter();
+  }
+
+  markLoadFinished(): void {
+    this.loadFinished = true;
+    const waiters = this.loadWaiters;
+    this.loadWaiters = [];
+    for (const waiter of waiters) waiter();
+  }
+
+  waitUntilReady(timeoutMs = 4000): Promise<void> {
+    if (this.ready) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      this.readyWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  waitUntilLoadFinished(timeoutMs = 6000): Promise<void> {
+    if (this.loadFinished) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      this.loadWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
+  private resetAfterReload(): void {
+    this.ready = false;
+    this.loadFinished = false;
+    this.error = null;
+    for (const callback of this.callbacks.values()) callback.reject(new Error("Plugin frame reloaded"));
+    this.callbacks.clear();
+  }
+
+  private styleSettingsFrame(): void {
+    this.iframe.hidden = false;
+    this.iframe.classList.add("plugin-settings-frame");
+    this.iframe.setAttribute("aria-hidden", "false");
+    this.iframe.removeAttribute("width");
+    this.iframe.removeAttribute("height");
+    this.iframe.style.cssText = [
+      "display:block",
+      "width:100%",
+      "height:100%",
+      "min-height:32rem",
+      "flex:1 1 auto",
+      "border:0",
+      "background:#101820",
+    ].join(";");
+  }
+
+  async attachSettings(host: HTMLElement): Promise<void> {
+    this.styleSettingsFrame();
+    if (this.iframe.parentElement === host) {
+      await this.waitUntilLoadFinished();
+      return;
+    }
+    const generation = this.generation;
+    const sawLoad = new Promise<void>((resolve) => {
+      const onLoad = () => resolve();
+      this.iframe.addEventListener("load", onLoad, { once: true });
+      window.setTimeout(() => {
+        this.iframe.removeEventListener("load", onLoad);
+        resolve();
+      }, 120);
+    });
+    host.appendChild(this.iframe);
+    await sawLoad;
+    if (this.generation !== generation || !this.loadFinished) await this.waitUntilLoadFinished();
   }
 
   accepts(event: MessageEvent, message: PluginMessage): boolean {
@@ -439,10 +675,18 @@ class IsolatedPlugin {
     this.changed();
   }
 
-  invoke(type: "load" | "unload" | "command" | "view", id?: string): Promise<unknown> {
+  invoke(type: "load" | "unload" | "command" | "view" | "display-settings", id?: string): Promise<unknown> {
     const requestId = ++this.callbackSequence;
     return new Promise((resolve, reject) => {
-      this.callbacks.set(requestId, { resolve, reject });
+      const timer = window.setTimeout(() => {
+        if (!this.callbacks.has(requestId)) return;
+        this.callbacks.delete(requestId);
+        reject(new Error(`Plugin ${type} timed out`));
+      }, type === "display-settings" ? 8000 : 15000);
+      this.callbacks.set(requestId, {
+        resolve: (value) => { window.clearTimeout(timer); resolve(value); },
+        reject: (reason) => { window.clearTimeout(timer); reject(reason); },
+      });
       const dispatch = async () => {
         const canRead = this.descriptor.permissions.includes("vault.read");
         const canReadEditor = this.descriptor.permissions.includes("editor.read");
@@ -452,6 +696,7 @@ class IsolatedPlugin {
               this.services.metadataSnapshot?.() ?? [],
             ])
           : [[], []];
+        if (type === "display-settings") this.styleSettingsFrame();
         this.iframe.contentWindow?.postMessage({
           nephriteHost: true,
           pluginId: this.descriptor.id,
@@ -499,6 +744,14 @@ class IsolatedPlugin {
         ...payload,
       }, "*");
     });
+  }
+
+  hideSettings(): void {
+    this.iframe.hidden = true;
+    this.iframe.classList.remove("plugin-settings-frame");
+    this.iframe.setAttribute("aria-hidden", "true");
+    const host = document.getElementById("plugin-host") ?? document.body;
+    if (this.iframe.parentElement !== host) host.appendChild(this.iframe);
   }
 
   async dispose() {
@@ -590,8 +843,36 @@ export class PluginManager {
           : localStorage.getItem(this.enabledKey(descriptor.id)) !== "0",
         loaded: plugin?.ready ?? false,
         error: plugin?.error ?? validatePluginDescriptor(descriptor),
+        hasSettings: plugin?.hasSettings ?? false,
       };
     });
+  }
+
+  get(id: string): IsolatedPlugin | undefined {
+    return this.plugins.get(id);
+  }
+
+  pluginsWithSettings(): IsolatedPlugin[] {
+    return [...this.plugins.values()].filter((plugin) => plugin.hasSettings);
+  }
+
+  hideAllSettings(exceptId?: string): void {
+    for (const plugin of this.plugins.values()) {
+      if (plugin.descriptor.id !== exceptId) plugin.hideSettings();
+    }
+  }
+
+  async showSettings(id: string, host: HTMLElement): Promise<HTMLIFrameElement | null> {
+    const plugin = this.plugins.get(id);
+    if (!plugin) return null;
+    this.hideAllSettings(id);
+    try {
+      await plugin.attachSettings(host);
+      await plugin.invoke("display-settings");
+    } catch (error) {
+      plugin.error = String(error);
+    }
+    return plugin.iframe;
   }
 
   commands(): AppCommand[] {
@@ -668,14 +949,22 @@ export class PluginManager {
     if (!plugin || event.source !== plugin.iframe.contentWindow) return;
     if (message.type === "request") await plugin.request(message as RpcRequest);
     else if (message.type === "ready") {
-      plugin.ready = true;
+      plugin.markReady();
       await plugin.invoke("load").catch((error) => { plugin.error = String(error); });
+      plugin.markLoadFinished();
       this.changed();
     } else if (message.type === "error") {
       plugin.error = message.message || "Plugin failed to load";
       this.changed();
     } else if (message.type === "callback" && message.requestId != null) plugin.resolveCallback({ requestId: message.requestId, result: message.result, error: message.error });
-    else if (message.type === "processor-registered") {
+    else if (message.type === "settings-tab") {
+      plugin.hasSettings = true;
+      const tabId = String((message as { id?: string }).id || message.pluginId);
+      const tabName = String((message as { name?: string }).name || plugin.descriptor.name);
+      plugin.settingTabs = plugin.settingTabs.filter((tab) => tab.id !== tabId);
+      plugin.settingTabs.push({ id: tabId, name: tabName });
+      this.changed();
+    } else if (message.type === "processor-registered") {
       if (message.kind === "post") this.postProcessors.add(message.pluginId);
       else if (message.kind === "code" && message.language) {
         const language = message.language.toLowerCase();

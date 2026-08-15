@@ -30,6 +30,7 @@ import { vaultChangeTouchesFileTree } from "../ui/src/vault-change";
 import {
   countWikilinks,
   DirtyReactor,
+  paneToRefresh,
   shouldCommitRightPane,
   shouldKeepPreviewWork,
   shouldRefreshPreviewFromOtherPages,
@@ -77,6 +78,8 @@ import {
 import { NephriteApp, ObsidianApp, normalizeAppVaultPath } from "../ui/src/app-api";
 import { mergeTexts, mergeTwoWay } from "../ui/src/file-merge";
 import { findInKanbanLane, kanbanCardSearchText } from "../ui/src/kanban-find";
+import { isKanbanPreviewSuppressed, suppressKanbanCardPreview } from "../ui/src/kanban-card-preview";
+import { extractKanbanCoverValue, parseKanbanCoverRef } from "../ui/src/kanban-cover";
 import {
   bindScrollSync,
   clearScrollSync,
@@ -1201,6 +1204,22 @@ test("shortcut assignments normalize cross-platform modifier aliases", () => {
   assert.equal(normalizeShortcut("control + shift + f"), "Ctrl+Shift+F");
   assert.equal(normalizeShortcut("cmd+p"), "Meta+P");
   assert.equal(normalizeShortcut("mod + alt + k"), "Mod+Alt+K");
+  assert.equal(normalizeShortcut("F5"), "F5");
+});
+
+test("F5 refresh targets the focused pane", () => {
+  assert.equal(paneToRefresh({
+    rightOpen: true, rightFocused: true, kanbanVisible: true, viewMode: "split",
+  }), "right");
+  assert.equal(paneToRefresh({
+    rightOpen: true, rightFocused: false, kanbanVisible: true, viewMode: "split",
+  }), "kanban");
+  assert.equal(paneToRefresh({
+    rightOpen: false, rightFocused: false, kanbanVisible: false, viewMode: "preview",
+  }), "preview");
+  assert.equal(paneToRefresh({
+    rightOpen: false, rightFocused: false, kanbanVisible: false, viewMode: "source",
+  }), "source");
 });
 
 test("native automations validate macros and expand prompts, functions, dates, and active-note fields", () => {
@@ -1429,4 +1448,35 @@ test("Kanban find searches complete card data and collapses lanes without matche
   assert.deepEqual(noMatch.cardMatches, [false]);
   assert.equal(noMatch.collapse, true);
   assert.equal(findInKanbanLane({ name: "Empty", cards: [] }, "").collapse, true);
+  assert.equal(findInKanbanLane({ name: "Empty", cards: [] }, "x").collapse, true);
+});
+
+test("Kanban cards read a YAML cover or image field", () => {
+  assert.equal(
+    extractKanbanCoverValue("title: AAA\ncover: [[myself.png|250]]\nstage: open\n"),
+    "[[myself.png|250]]",
+  );
+  assert.equal(
+    extractKanbanCoverValue('company: AAA\nimage: "assets/logo.png"\n'),
+    "assets/logo.png",
+  );
+  assert.equal(extractKanbanCoverValue("title: No picture\n"), null);
+  assert.deepEqual(parseKanbanCoverRef("[[myself.png|250]]"), {
+    kind: "vault",
+    target: "myself.png",
+  });
+  assert.deepEqual(parseKanbanCoverRef("https://example.com/logo.png"), {
+    kind: "url",
+    href: "https://example.com/logo.png",
+  });
+  assert.deepEqual(parseKanbanCoverRef("![logo](assets/logo.png)"), {
+    kind: "vault",
+    target: "assets/logo.png",
+  });
+});
+
+test("kanban hover preview is suppressed while a lane is scrolling", () => {
+  assert.equal(isKanbanPreviewSuppressed(0), false);
+  suppressKanbanCardPreview(250);
+  assert.equal(isKanbanPreviewSuppressed(), true);
 });

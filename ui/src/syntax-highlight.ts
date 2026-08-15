@@ -14,6 +14,8 @@ const SKIP_LANGUAGES = new Set([
   "mermaid",
   "mmd",
   "csv",
+  "base",
+  "bases",
 ]);
 
 /** Fenced languages owned by the query/script engine — not highlight.js. */

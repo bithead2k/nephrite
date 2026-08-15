@@ -32,6 +32,7 @@ type ManagerOptions = {
   installed: () => readonly PluginStatus[];
   reload: () => Promise<void>;
   setEnabled: (id: string, enabled: boolean) => Promise<void>;
+  openSettings?: (id: string) => void | Promise<void>;
 };
 
 export function renderPluginManager(host: HTMLElement, options: ManagerOptions): void {
@@ -153,9 +154,20 @@ function installedRow(
       void uiAlert(String(error));
     }
   })());
+  const settings = document.createElement("button");
+  settings.type = "button";
+  settings.textContent = "Settings";
+  settings.disabled = !plugin.hasSettings || !options.openSettings;
+  settings.title = plugin.hasSettings
+    ? `Open ${plugin.name} settings`
+    : "This plugin did not register a settings tab";
+  settings.addEventListener("click", () => {
+    if (options.openSettings) void options.openSettings(plugin.id);
+  });
   const configure = document.createElement("button");
   configure.type = "button";
   configure.textContent = "Data…";
+  configure.title = "Edit data.json";
   configure.addEventListener("click", () => void editPluginData(plugin.id, plugin.name));
   const uninstall = document.createElement("button");
   uninstall.type = "button";
@@ -178,7 +190,7 @@ function installedRow(
       void uiAlert(String(error));
     }
   })());
-  actions.append(toggle, configure, uninstall);
+  actions.append(toggle, settings, configure, uninstall);
   row.append(title, meta, desc, actions);
   return row;
 }

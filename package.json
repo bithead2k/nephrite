@@ -13,9 +13,10 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "test": "npm run test:performance && npm run test:ui && npm run test:dataview",
+    "test": "npm run test:performance && npm run test:ui && npm run test:dataview && npm run test:bases",
     "test:ui": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/ui-interactions.test.ts",
     "test:dataview": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/dataview.test.ts",
+    "test:bases": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/bases.test.ts tests/air-gaps.test.ts",
     "test:performance": "esbuild tests/editor-performance.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/nephrite-editor-performance.test.cjs && node --test /tmp/nephrite-editor-performance.test.cjs"
   },
   "dependencies": {

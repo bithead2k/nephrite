@@ -80,16 +80,18 @@ export function parseSimpleYaml(source: string): unknown {
         const rest = next.trim().slice(2);
         index += 1;
         if (!rest) list.push(parseValue(current + 2));
-        else if (rest.includes(": ")) {
-          const colon = rest.indexOf(": ");
+        else if (rest.includes(":")) {
+          const colon = rest.indexOf(":");
           const key = rest.slice(0, colon).trim();
-          const value = rest.slice(colon + 2).trim();
+          const value = rest.slice(colon + 1).trim();
           const child = parseValue(current + 2);
-          const object: Record<string, unknown> = { [unquote(key)]: value ? scalar(value) : child };
-          if (child && typeof child === "object" && !Array.isArray(child) && !value) {
-            Object.assign(object, child);
-            delete object[unquote(key)];
-            object[unquote(key)] = child;
+          const object: Record<string, unknown> = {};
+          if (value) object[unquote(key)] = scalar(value);
+          else if (child !== null) object[unquote(key)] = child;
+          if (child && typeof child === "object" && !Array.isArray(child)) {
+            for (const [childKey, childValue] of Object.entries(child)) {
+              if (!(childKey in object)) object[childKey] = childValue;
+            }
           }
           list.push(object);
         } else {

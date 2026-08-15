@@ -34,13 +34,34 @@ export function filterCommands(commands: AppCommand[], rawQuery: string): AppCom
     .map((candidate) => candidate.command);
 }
 
+export type CommandBarContext = {
+  vault?: string;
+  file?: string | null;
+  mode?: string;
+};
+
 export function renderCommandBar(
   host: HTMLElement,
   commands: AppCommand[],
   close: () => void,
+  context: CommandBarContext = {},
 ) {
   host.replaceChildren();
   host.classList.add("command-bar");
+  const prompt = document.createElement("div");
+  prompt.className = "command-bar-powerline";
+  prompt.setAttribute("aria-hidden", "true");
+  const segments = [
+    context.vault || "vault",
+    context.file || "no-file",
+    context.mode || "source",
+  ];
+  for (const [index, text] of segments.entries()) {
+    const segment = document.createElement("span");
+    segment.className = `command-bar-segment command-bar-segment-${index}`;
+    segment.textContent = text;
+    prompt.appendChild(segment);
+  }
   const input = document.createElement("input");
   input.type = "search";
   input.className = "command-bar-input";
@@ -48,7 +69,7 @@ export function renderCommandBar(
   input.autocomplete = "off";
   const list = document.createElement("div");
   list.className = "command-bar-results";
-  host.append(input, list);
+  host.append(prompt, input, list);
   let matches = commands;
   let active = 0;
 

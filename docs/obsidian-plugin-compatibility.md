@@ -38,8 +38,12 @@ explicit approval; shell access is never inferred.
 - `Component`, `TFile`, `TFolder`, `Notice`, `Modal`, `ItemView`,
   `PluginSettingTab`, `Setting`, `Menu`, `MenuItem`, `MarkdownRenderChild`,
   `Platform`, `normalizePath`, and `debounce`.
-- Plugin commands, simple views, settings controls, DOM/event cleanup, and
-  persistent `loadData`/`saveData` storage.
+- Plugin commands, simple views, settings tabs (`addSettingTab` / `Setting`),
+  Obsidian HTMLElement helpers (`empty`, `createEl`, `createDiv`, `addClass`),
+  DOM/event cleanup, and persistent `loadData`/`saveData` storage.
+  Settings open from the plugin manager instead of only editing `data.json`.
+  A settings tab that throws is shown as an error in that plugin's panel;
+  it does not replace the host UI.
 
 The `app` object available to DataviewJS inherits the same superclass. It is
 read-only by default and therefore cannot gain write or shell authority merely

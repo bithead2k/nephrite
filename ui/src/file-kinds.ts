@@ -84,6 +84,10 @@ export function isStructuredPath(path: string): boolean {
   return ["json", "yml", "yaml"].includes(fileExtension(path));
 }
 
+export function isBasePath(path: string): boolean {
+  return fileExtension(path) === "base";
+}
+
 export function isCodePath(path: string): boolean {
   const ext = fileExtension(path);
   if (!ext || ext === "md" || ext === "markdown") return false;

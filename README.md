@@ -35,7 +35,8 @@ Markdown on disk is still the store. Indexes and viewers are disposable.
   created dates, recurrence, priority, and tags use common Obsidian Tasks
   syntax. Extra statuses `[/] [>] [<] [?] [!] [-]` are indexed and cycled.
 - **Kanban:** Markdown boards (`kanban-plugin` frontmatter) as a first-class
-  view. Lane moves write the file. No separate board store.
+  view. Lane moves write the file. No separate board store.  canvas: tag with an
+  image will display on kanban card summary.
 - **Git:** press **Git** for staging, conflict resolution, upstream status,
   branches, commit details, per-file history, and confirmed version restores.
   Full-file merge UI is started, not a `git mergetool` replacement.
@@ -96,14 +97,17 @@ Markdown on disk is still the store. Indexes and viewers are disposable.
   - highlight.js on fenced code; opening `.rs` / `.ts` / `.py` / … uses a
     read-only highlighted code viewer
   - CSV as a table; JSON / YAML as a structured tree
+  - Obsidian `.base` files and ` ```base ` fences (table / list / cards)
   - Note embeds `![[note]]` / `![[note#Heading]]` / block embeds
 - Optional **Vim** bindings and a practical vimrc/Vimscript subset (common
   `set`s; `syntax` / `filetype` / `autocmd` / `colorscheme` are no-ops).
 - 800 ms autosave plus **Ctrl/Cmd+S**; re-indexes that path only.
 - File-tree drag to a folder uses in-app rename so dependent wikilinks update.
+- Attachment inventory, SQL console over the index, nested YAML properties,
+  and plugin settings tabs (`addSettingTab` / `Setting`).
 
-Not in core, on purpose: mobile, official sync, a WYSIWYG/block editor, Notion
-Bases, persisting GFM table column widths, and unsandboxed Node/Electron
+Not in core, on purpose: mobile, official sync, a WYSIWYG/block editor,
+persisting GFM table column widths, and unsandboxed Node/Electron
 plugin APIs. Use the files (or Unison) for sync. Point databases at `pgsql` +
 Dataview, not another query language.
 

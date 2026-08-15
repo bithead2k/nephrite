@@ -75,7 +75,8 @@ import {
   withoutScrollSync,
 } from "./scroll-sync";
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
-import { bindKanbanCardPreview, dismissKanbanCardPreview } from "./kanban-card-preview";
+import { bindKanbanCardPreview, bindKanbanScrollPreviewGuard, dismissKanbanCardPreview } from "./kanban-card-preview";
+import { clearKanbanCoverCache, hydrateKanbanCardCovers } from "./kanban-cover";
 import { findTaskCheckboxEdit, findTaskStatusEdit, hydratePreviewTaskMarkers } from "./tasks";
 import { nextTaskStatusChar } from "./task-status";
 import { VimPowerlineClient } from "./vim-powerline";
@@ -90,7 +91,7 @@ import { planTemplateApplication } from "./template-application";
 import { hydrateExcalidrawEmbeds } from "./excalidraw-embed";
 import { hydrateNoteEmbeds } from "./note-embed";
 import { hydrateMarkdownImages } from "./image-embed";
-import { isAudioPath, isCodePath, isCsvPath, isPdfPath, isStructuredPath, isVideoPath } from "./file-kinds";
+import { isAudioPath, isBasePath, isCodePath, isCsvPath, isPdfPath, isStructuredPath, isVideoPath } from "./file-kinds";
 import { highlightPreviewCode } from "./syntax-highlight";
 import { hydrateMermaid } from "./mermaid";
 import { clearCodeView, renderCodeView } from "./code-view";
@@ -98,6 +99,12 @@ import { clearPdfView, renderPdfView } from "./pdf-view";
 import { clearMediaView, renderAudioView, renderVideoView } from "./media-view";
 import { clearCsvView, hydrateCsvFences, renderCsvView } from "./csv-view";
 import { clearStructuredView, renderStructuredView } from "./structured-view";
+import { renderAttachmentPanel } from "./attachment-panel";
+import { renderSqlConsole } from "./sql-console";
+import { emptyBaseSource } from "./bases";
+import { hydrateBaseFences, pagesFromListRows, renderBaseView } from "./base-view";
+import { renderPropertiesEditor } from "./properties-editor";
+import type { SqlQueryResult } from "./dv-engine";
 import { DeferredDocumentWork } from "./edit-scheduler";
 import { RefreshGate } from "./refresh-gate";
 import { resizedKanbanLaneWidth } from "./kanban-resize";
@@ -106,6 +113,7 @@ import { bindQueryUriLinks } from "./query-uri";
 import { vaultChangeTouchesFileTree } from "./vault-change";
 import {
   DirtyReactor,
+  paneToRefresh,
   shouldCommitRightPane,
   shouldKeepPreviewWork,
   shouldRefreshPreviewFromOtherPages,
@@ -151,6 +159,7 @@ import {
   type AppearanceFonts,
 } from "./appearance";
 import type {
+  AttachmentRow,
   FileEntry,
   GitCommit,
   GitBranches,
@@ -285,6 +294,7 @@ let vimPowerline: VimPowerlineClient | null = null;
 let expanded = loadExpanded();
 let treeRoot: TreeNode = { name: "", path: "", kind: "dir", children: [] };
 let kanbanBoard: KanbanBoard | null = null;
+let kanbanCoverRevision = 0;
 /** Open file tabs for this vault (restored on open). */
 let openTabs: string[] = [];
 let pinnedTabs = new Set<string>();
@@ -601,7 +611,7 @@ function $(id: string): HTMLElement {
   return document.getElementById(id)!;
 }
 
-type ActivityId = "files" | "search" | "graph" | "links" | "tags" | "tasks" | "bookmarks" | "git" | "query-log";
+type ActivityId = "files" | "search" | "graph" | "links" | "tags" | "tasks" | "bookmarks" | "git" | "query-log" | "attachments" | "sql";
 
 function activityIcon(name: ActivityId | "settings" | "file-search" | "panel-close" | "folder-open" | "refresh"): string {
   const paths: Record<string, string> = {
@@ -614,6 +624,8 @@ function activityIcon(name: ActivityId | "settings" | "file-search" | "panel-clo
     bookmarks: '<path d="M6 3h12v18l-6-4-6 4Z"/>',
     git: '<circle cx="6" cy="4" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="6" cy="20" r="2"/><path d="M6 6v12M8 6h6a4 4 0 0 1 4 4v0"/>',
     "query-log": '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>',
+    attachments: '<path d="M21.4 11.6 10.1 22.9a5 5 0 0 1-7.1-7.1l12.7-12.7a3.5 3.5 0 0 1 5 5L9.1 19.7a2 2 0 1 1-2.8-2.8l10.6-10.6"/>',
+    sql: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16"/>',
     settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
     "file-search": '<path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><circle cx="12" cy="13" r="3"/><path d="m14.5 15.5 2 2"/>',
     "panel-close": '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18m7-13-4 4 4 4"/>',
@@ -658,6 +670,8 @@ async function renderShell() {
           <button type="button" id="activity-bookmarks" class="activity-button" title="Bookmarks" aria-label="Bookmarks" aria-pressed="false" disabled>${activityIcon("bookmarks")}</button>
           <button type="button" id="activity-git" class="activity-button" title="Git" aria-label="Git" aria-pressed="false" disabled>${activityIcon("git")}</button>
           <button type="button" id="activity-query-log" class="activity-button" title="Query log" aria-label="Query log" aria-pressed="false">${activityIcon("query-log")}</button>
+          <button type="button" id="activity-attachments" class="activity-button" title="Attachments" aria-label="Attachments" aria-pressed="false" disabled>${activityIcon("attachments")}</button>
+          <button type="button" id="activity-sql" class="activity-button" title="SQL console" aria-label="SQL console" aria-pressed="false" disabled>${activityIcon("sql")}</button>
         </div>
         <button type="button" id="btn-preferences" class="activity-button" title="Preferences" aria-label="Preferences" aria-expanded="false" aria-controls="preferences-popover">${activityIcon("settings")}</button>
         <section id="preferences-popover" class="preferences-popover hidden" role="dialog" aria-modal="false" aria-labelledby="preferences-title">
@@ -809,6 +823,7 @@ async function renderShell() {
         </footer>
       </section>
     </div>
+    <div id="plugin-host" hidden></div>
     <div id="feature-panel" class="feature-panel hidden" role="dialog" aria-modal="true">
       <div class="feature-card">
         <header><h2 id="feature-title"></h2><button type="button" id="feature-close" title="Close">×</button></header>
@@ -900,6 +915,8 @@ async function renderShell() {
   $("activity-bookmarks").addEventListener("click", showBookmarksPanel);
   $("activity-git").addEventListener("click", () => void showGitPanel());
   $("activity-query-log").addEventListener("click", showQueryLogPanel);
+  $("activity-attachments").addEventListener("click", () => void showAttachmentsPanel());
+  $("activity-sql").addEventListener("click", () => showSqlConsole());
   $("btn-preferences").addEventListener("click", togglePreferences);
   ($("task-scope-folders") as HTMLInputElement).value = taskScope.folders.join(", ");
   ($("task-scope-tags") as HTMLInputElement).value = taskScope.tags.join(", ");
@@ -1423,6 +1440,62 @@ function schedulePreviewRead(read: () => string) {
   });
 }
 
+function forceRenderCurrentDocument(): void {
+  lastPreviewBody = null;
+  lastPreviewPath = null;
+  previewWork.cancel();
+  previewRenderer.cancel();
+  const revision = ++previewRevision;
+  void renderRightPane(editor?.getDoc() ?? "", revision);
+}
+
+function refreshCurrentPane(): void {
+  const rightHost = document.getElementById("right-body");
+  const target = paneToRefresh({
+    rightOpen: Boolean(rightPath),
+    rightFocused: Boolean(rightHost && document.activeElement && rightHost.contains(document.activeElement)),
+    kanbanVisible: Boolean(
+      currentFileKind === "markdown" &&
+      kanbanBoard &&
+      !$("kanban").classList.contains("hidden"),
+    ),
+    viewMode,
+  });
+  if (target === "right") {
+    void updateRightPane();
+    setTransientStatus("Refreshed right pane", "#5ecf9a");
+    return;
+  }
+  if (target === "kanban") {
+    clearKanbanCoverCache();
+    forceRenderCurrentDocument();
+    setTransientStatus("Refreshed board", "#5ecf9a");
+    return;
+  }
+  if (target === "preview") {
+    forceRenderCurrentDocument();
+    setTransientStatus("Refreshed preview", "#5ecf9a");
+    return;
+  }
+  if (!currentPath) return;
+  if (currentFileKind === "markdown") {
+    if (dirty) {
+      setTransientStatus("Unsaved edits — not reloading source", "#e9ad55");
+      return;
+    }
+    void invoke<OpenFile>("read_file", { path: currentPath }).then((file) => {
+      if (currentPath !== file.path || dirty) return;
+      editor?.setDoc(file.content);
+      setTransientStatus("Reloaded from disk", "#5ecf9a");
+    }).catch((error) => {
+      setTransientStatus(`Reload failed: ${String(error)}`, "#e9ad55");
+    });
+    return;
+  }
+  void openNote(currentPath);
+  setTransientStatus("Refreshed", "#5ecf9a");
+}
+
 async function renderRightPane(text: string, revision: number) {
   dismissLinkPreview();
   const previewEl = $("preview");
@@ -1860,6 +1933,9 @@ function bindPreviewContent(root: HTMLElement, path: string, revision?: number) 
   if (!live()) return;
   highlightPreviewCode(root);
   hydrateCsvFences(root);
+  void loadBasePages()
+    .then((pages) => hydrateBaseFences(root, pages, (path) => void openNote(path)))
+    .catch((error) => console.warn("[base fence]", error));
   void hydrateMermaid(root).catch((error) => console.warn("[mermaid]", error));
   bindLinkPreviews(root, {
     fromPath: path,
@@ -1961,6 +2037,72 @@ async function applyPluginPreviewProcessors(html: string, path: string): Promise
   return template.innerHTML;
 }
 
+function acceptKanbanDrop(event: DragEvent, toCol: number): void {
+  event.preventDefault();
+  const raw =
+    event.dataTransfer?.getData("application/x-nephrite-kanban") ||
+    event.dataTransfer?.getData("text/plain") ||
+    "";
+  if (!raw || !kanbanBoard) {
+    setHookStatus("Drop ignored (no drag payload)", true);
+    return;
+  }
+  let fromCol = -1;
+  let fromIdx = -1;
+  try {
+    const parsed = JSON.parse(raw) as { fromCol: number; fromIdx: number };
+    fromCol = parsed.fromCol;
+    fromIdx = parsed.fromIdx;
+  } catch {
+    setHookStatus("Drop ignored (bad payload)", true);
+    return;
+  }
+  if (fromCol === toCol) return;
+  const toIdx = kanbanBoard.columns[toCol].cards.length;
+  const card = kanbanBoard.columns[fromCol]?.cards[fromIdx];
+  if (!card) {
+    setHookStatus("Drop ignored (card not found)", true);
+    return;
+  }
+  const fromName = kanbanBoard.columns[fromCol].name;
+  const toName = kanbanBoard.columns[toCol].name;
+  const prevCols = kanbanBoard.columns;
+  setHookStatus(`Moving “${card.label}”: ${fromName} → ${toName}…`);
+  const leaveEv: KanbanCardTransitEvent = {
+    boardPath: currentPath || "",
+    card,
+    fromColumn: fromName,
+    toColumn: toName,
+    fromColumnIndex: fromCol,
+    toColumnIndex: toCol,
+    fromIndex: fromIdx,
+    toIndex: toIdx,
+    columns: prevCols,
+    phase: "leave",
+  };
+  void (async () => {
+    try {
+      await fireKanbanCardLeft(leaveEv);
+      const nextCols = moveCard(prevCols, fromCol, fromIdx, toCol, toIdx);
+      kanbanBoard = { ...kanbanBoard!, columns: nextCols };
+      persistKanban();
+      renderKanbanBoard(kanbanBoard);
+      const landEv: KanbanCardMovedEvent = {
+        ...leaveEv,
+        columns: nextCols,
+        phase: "land",
+      };
+      await fireKanbanCardMoved(landEv);
+      setHookStatus(`Hooks done: ${card.label.slice(0, 40)} → ${toName}`);
+    } catch (err) {
+      setHookStatus(
+        `Hook failed: ${err instanceof Error ? err.message : String(err)}`,
+        true,
+      );
+    }
+  })();
+}
+
 function renderKanbanBoard(board: KanbanBoard) {
   dismissKanbanCardPreview();
   const host = $("kanban");
@@ -2005,6 +2147,8 @@ function renderKanbanBoard(board: KanbanBoard) {
 
   const scroller = document.createElement("div");
   scroller.className = "kanban-scroll";
+  bindKanbanScrollPreviewGuard(host);
+  bindKanbanScrollPreviewGuard(scroller);
   const savedWidths = currentPath ? (kanbanLaneWidths.get(currentPath) || {}) : {};
 
   board.columns.forEach((col, colIdx) => {
@@ -2047,86 +2191,26 @@ function renderKanbanBoard(board: KanbanBoard) {
     const list = document.createElement("div");
     list.className = "kanban-cards";
     list.dataset.col = String(colIdx);
+    bindKanbanScrollPreviewGuard(list);
 
     list.addEventListener("dragover", (e) => {
       e.preventDefault();
       list.classList.add("drag-over");
     });
     list.addEventListener("dragleave", () => list.classList.remove("drag-over"));
-    list.addEventListener("drop", (e) => {
+    colEl.addEventListener("dragover", (e) => {
       e.preventDefault();
+      if (colEl.classList.contains("kanban-col-collapsed")) colEl.classList.add("drag-over");
+    });
+    colEl.addEventListener("dragleave", (e) => {
+      if (e.relatedTarget instanceof Node && colEl.contains(e.relatedTarget)) return;
+      colEl.classList.remove("drag-over");
       list.classList.remove("drag-over");
-      const raw =
-        e.dataTransfer?.getData("application/x-nephrite-kanban") ||
-        e.dataTransfer?.getData("text/plain") ||
-        "";
-      if (!raw || !kanbanBoard) {
-        setHookStatus("Drop ignored (no drag payload)", true);
-        return;
-      }
-      let fromCol = -1;
-      let fromIdx = -1;
-      try {
-        const parsed = JSON.parse(raw) as { fromCol: number; fromIdx: number };
-        fromCol = parsed.fromCol;
-        fromIdx = parsed.fromIdx;
-      } catch {
-        setHookStatus("Drop ignored (bad payload)", true);
-        return;
-      }
-      if (fromCol === colIdx) return; // same column — no stage change
-      const toCol = colIdx;
-      const toIdx = kanbanBoard.columns[toCol].cards.length;
-      const card = kanbanBoard.columns[fromCol]?.cards[fromIdx];
-      if (!card) {
-        setHookStatus("Drop ignored (card not found)", true);
-        return;
-      }
-      const fromName = kanbanBoard.columns[fromCol].name;
-      const toName = kanbanBoard.columns[toCol].name;
-      const prevCols = kanbanBoard.columns;
-
-      setHookStatus(`Moving “${card.label}”: ${fromName} → ${toName}…`);
-
-      // 1) Leave swim lane (board still has card in fromColumn)
-      const leaveEv: KanbanCardTransitEvent = {
-        boardPath: currentPath || "",
-        card,
-        fromColumn: fromName,
-        toColumn: toName,
-        fromColumnIndex: fromCol,
-        toColumnIndex: toCol,
-        fromIndex: fromIdx,
-        toIndex: toIdx,
-        columns: prevCols,
-        phase: "leave",
-      };
-      void (async () => {
-        try {
-          await fireKanbanCardLeft(leaveEv);
-
-          const nextCols = moveCard(prevCols, fromCol, fromIdx, toCol, toIdx);
-          kanbanBoard = { ...kanbanBoard!, columns: nextCols };
-          persistKanban();
-          renderKanbanBoard(kanbanBoard);
-
-          // 2) Land in swim lane (board rewritten)
-          const landEv: KanbanCardMovedEvent = {
-            ...leaveEv,
-            columns: nextCols,
-            phase: "land",
-          };
-          await fireKanbanCardMoved(landEv);
-          setHookStatus(
-            `Hooks done: ${card.label.slice(0, 40)} → ${toName}`,
-          );
-        } catch (err) {
-          setHookStatus(
-            `Hook failed: ${err instanceof Error ? err.message : String(err)}`,
-            true,
-          );
-        }
-      })();
+    });
+    colEl.addEventListener("drop", (e) => {
+      list.classList.remove("drag-over");
+      colEl.classList.remove("drag-over");
+      acceptKanbanDrop(e, colIdx);
     });
 
     col.cards.forEach((card, cardIdx) => {
@@ -2136,6 +2220,7 @@ function renderKanbanBoard(board: KanbanBoard) {
       cardEl.dataset.col = String(colIdx);
       cardEl.dataset.idx = String(cardIdx);
       cardEl.dataset.searchMatch = "false";
+      if (card.link) cardEl.dataset.kanbanLink = card.link;
 
       const label = document.createElement("button");
       label.type = "button";
@@ -2222,6 +2307,9 @@ function renderKanbanBoard(board: KanbanBoard) {
   host.appendChild(scroller);
   applyKanbanFind();
   if (kanbanFindOpen) requestAnimationFrame(() => findInput.focus());
+  const coverPass = ++kanbanCoverRevision;
+  void hydrateKanbanCardCovers(host, currentPath, () => coverPass === kanbanCoverRevision)
+    .catch((error) => console.warn("[kanban cover]", error));
 }
 
 function openKanbanFind() {
@@ -2543,6 +2631,8 @@ function updateChrome() {
   ($("activity-tasks") as HTMLButtonElement).disabled = !hasVault;
   ($("activity-bookmarks") as HTMLButtonElement).disabled = !hasVault;
   ($("activity-git") as HTMLButtonElement).disabled = !hasVault;
+  ($("activity-attachments") as HTMLButtonElement).disabled = !hasVault;
+  ($("activity-sql") as HTMLButtonElement).disabled = !hasVault;
   updateVimPowerline();
 }
 
@@ -2739,6 +2829,7 @@ function isDocumentEntry(entry: FileEntry): boolean {
     || isVideoPath(entry.path)
     || isCsvPath(entry.path)
     || isStructuredPath(entry.path)
+    || isBasePath(entry.path)
     || isCodePath(entry.path);
 }
 
@@ -2751,7 +2842,7 @@ function focusActiveDocumentPane() {
     document.getElementById("pdf-host")?.focus();
   } else if (currentFileKind === "audio" || currentFileKind === "video") {
     document.getElementById("av-host")?.focus();
-  } else if (currentFileKind === "csv" || currentFileKind === "data") {
+  } else if (currentFileKind === "csv" || currentFileKind === "data" || currentFileKind === "base") {
     document.getElementById("data-host")?.focus();
   } else if (currentFileKind === "code") {
     document.getElementById("code-host")?.focus();
@@ -3091,6 +3182,7 @@ async function openNoteSerialized(
     : isVideoPath(file.path) ? "video"
     : isCsvPath(file.path) ? "csv"
     : isStructuredPath(file.path) ? "data"
+    : isBasePath(file.path) ? "base"
     : isCodePath(file.path) ? "code"
     : mdFilesAll.find((entry) => entry.path === file.path)?.file_kind ??
     (file.path.toLowerCase().endsWith(".excalidraw") ? "excalidraw" :
@@ -3177,7 +3269,7 @@ async function openNoteSerialized(
     } catch (error) {
       setTransientStatus(`Could not open media: ${String(error)}`, "#e07070");
     }
-  } else if (currentFileKind === "csv" || currentFileKind === "data") {
+  } else if (currentFileKind === "csv" || currentFileKind === "data" || currentFileKind === "base") {
     drawingContent = "";
     drawingDocument = null;
     excalidrawView?.clear();
@@ -3187,7 +3279,18 @@ async function openNoteSerialized(
     canvasView?.clear();
     showMediaWorkspace(currentFileKind);
     if (currentFileKind === "csv") renderCsvView($("data-host"), file.path, file.content);
-    else renderStructuredView($("data-host"), file.path, file.content);
+    else if (currentFileKind === "base") {
+      try {
+        const pages = await loadBasePages();
+        if (generation !== openNoteGeneration) return;
+        renderBaseView($("data-host"), file.content, pages, {
+          path: file.path,
+          onOpen: (path) => void openNote(path),
+        });
+      } catch (error) {
+        $("data-host").innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+      }
+    } else renderStructuredView($("data-host"), file.path, file.content);
   } else if (currentFileKind === "code") {
     drawingContent = "";
     drawingDocument = null;
@@ -3249,13 +3352,13 @@ function showCanvasWorkspace(active: boolean) {
   if (active) clearScrollSync();
 }
 
-function showMediaWorkspace(kind: "pdf" | "code" | "audio" | "video" | "csv" | "data" | null) {
+function showMediaWorkspace(kind: "pdf" | "code" | "audio" | "video" | "csv" | "data" | "base" | null) {
   $("panes").classList.toggle("media-active", kind !== null);
   $("media-workspace").classList.toggle("hidden", kind === null);
   $("pdf-host").classList.toggle("hidden", kind !== "pdf");
   $("code-host").classList.toggle("hidden", kind !== "code");
   $("av-host").classList.toggle("hidden", kind !== "audio" && kind !== "video");
-  $("data-host").classList.toggle("hidden", kind !== "csv" && kind !== "data");
+  $("data-host").classList.toggle("hidden", kind !== "csv" && kind !== "data" && kind !== "base");
   document.querySelectorAll<HTMLButtonElement>(".seg-btn").forEach((button) => {
     button.disabled = kind !== null;
   });
@@ -3263,7 +3366,7 @@ function showMediaWorkspace(kind: "pdf" | "code" | "audio" | "video" | "csv" | "
   if (kind !== "pdf") clearPdfView($("pdf-host"));
   if (kind !== "code") clearCodeView($("code-host"));
   if (kind !== "audio" && kind !== "video") clearMediaView($("av-host"));
-  if (kind !== "csv" && kind !== "data") {
+  if (kind !== "csv" && kind !== "data" && kind !== "base") {
     clearCsvView($("data-host"));
     clearStructuredView($("data-host"));
   }
@@ -3682,6 +3785,7 @@ function saveFile(automatic = false): Promise<void> {
     || currentFileKind === "video"
     || currentFileKind === "csv"
     || currentFileKind === "data"
+    || currentFileKind === "base"
   ) return Promise.resolve();
   if (currentFileKind === "markdown" && !editor) return Promise.resolve();
   const pending: PendingSave = {
@@ -3742,6 +3846,7 @@ async function performSave(pending: PendingSave) {
 }
 
 function openFeaturePanel(title: string): HTMLElement {
+  pluginManager?.hideAllSettings();
   closePreferences();
   const activityByTitle: Partial<Record<string, ActivityId>> = {
     Bookmarks: "bookmarks",
@@ -3752,6 +3857,8 @@ function openFeaturePanel(title: string): HTMLElement {
     Tags: "tags",
     Tasks: "tasks",
     Git: "git",
+    Attachments: "attachments",
+    "SQL console": "sql",
   };
   const activity = activityByTitle[title];
   if (activity) setActiveActivity(activity);
@@ -3764,6 +3871,7 @@ function openFeaturePanel(title: string): HTMLElement {
 }
 
 function closeFeaturePanel() {
+  pluginManager?.hideAllSettings();
   $("feature-panel").classList.add("hidden");
   $("feature-body").replaceChildren();
   setActiveActivity(sidebarCollapsed ? null : "files");
@@ -4261,7 +4369,154 @@ async function showPluginManager() {
       await pluginManager?.setEnabled(id, enabled);
       await reloadPlugins();
     },
+    openSettings: (id) => void showPluginSettings(id),
   });
+}
+
+let basePagesCache: { at: number; pages: ReturnType<typeof pagesFromListRows> } | null = null;
+
+async function loadBasePages() {
+  if (basePagesCache && Date.now() - basePagesCache.at < 4000) return basePagesCache.pages;
+  const rows = await invoke<Array<{
+    path: string;
+    name: string;
+    folder?: string;
+    size_bytes?: number;
+    tags?: unknown;
+    links?: unknown;
+    properties?: Record<string, unknown> | null;
+  }>>("list_pages", { source: null });
+  const pages = pagesFromListRows(rows);
+  basePagesCache = { at: Date.now(), pages };
+  return pages;
+}
+
+async function showAttachmentsPanel() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  const body = openFeaturePanel("Attachments");
+  body.innerHTML = `<div class="feature-loading">Reading attachment index…</div>`;
+  try {
+    const rows = await invoke<AttachmentRow[]>("list_attachments");
+    renderAttachmentPanel(body, rows, (path) => {
+      closeFeaturePanel();
+      void openVaultEntry(path);
+    });
+  } catch (error) {
+    body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+function showSqlConsole() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  const body = openFeaturePanel("SQL console");
+  renderSqlConsole(body, {
+    run: (sql) => invoke<SqlQueryResult>("query_vault_sql", { sql }),
+    onOpen: (path) => {
+      closeFeaturePanel();
+      void openNote(path);
+    },
+  });
+}
+
+function showPropertiesPanel() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  if (!currentPath || currentFileKind !== "markdown" || !editor) {
+    void uiAlert("Open a Markdown note to edit its properties.");
+    return;
+  }
+  const path = currentPath;
+  const body = openFeaturePanel("Note properties");
+  renderPropertiesEditor(body, editor.getDoc(), (next) => {
+    if (!editor || currentPath !== path || currentFileKind !== "markdown") {
+      void uiAlert("The note is no longer active.");
+      return;
+    }
+    editor.setDoc(next);
+    dirty = true;
+    updateChrome();
+    scheduleAutosave();
+    setTransientStatus("Properties updated", "#5ecf9a");
+  });
+}
+
+async function showPluginSettings(id?: string) {
+  if (!vaultOpen || !pluginManager) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  const available = pluginManager.statuses().filter((plugin) => plugin.hasSettings && plugin.enabled);
+  const target = id
+    ? available.find((plugin) => plugin.id === id)
+    : available.length === 1 ? available[0] : null;
+  if (!target) {
+    const body = openFeaturePanel("Plugin settings");
+    if (!available.length) {
+      body.innerHTML = `<div class="feature-empty">No loaded plugin registered a settings tab. Use Plugins → Data… for data.json.</div>`;
+      return;
+    }
+    const list = document.createElement("div");
+    list.className = "plugin-manager-list";
+    for (const plugin of available) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "link-health-row";
+      button.innerHTML = `<strong></strong><code></code>`;
+      button.querySelector("strong")!.textContent = plugin.name;
+      button.querySelector("code")!.textContent = plugin.id;
+      button.addEventListener("click", () => void showPluginSettings(plugin.id));
+      list.appendChild(button);
+    }
+    body.appendChild(list);
+    return;
+  }
+  const body = openFeaturePanel(`${target.name} settings`);
+  body.classList.add("plugin-settings-body");
+  body.innerHTML = `<div class="feature-loading">Opening settings…</div>`;
+  try {
+    const plugin = pluginManager.get(target.id);
+    if (!plugin) {
+      body.innerHTML = `<div class="feature-error">Plugin is not loaded.</div>`;
+      return;
+    }
+    body.replaceChildren();
+    const iframe = await pluginManager.showSettings(target.id, body);
+    if (!iframe) {
+      body.innerHTML = `<div class="feature-error">Plugin is not loaded.</div>`;
+      return;
+    }
+    if (plugin.error) {
+      const note = document.createElement("p");
+      note.className = "feature-help";
+      note.textContent = plugin.error;
+      body.prepend(note);
+    }
+  } catch (error) {
+    body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function createBase() {
+  const initialFolder = currentPath ? parentDir(currentPath) : "";
+  const entered = await promptName("New base", "Untitled.base");
+  if (!entered) return;
+  const filename = entered.endsWith(".base") ? entered : `${entered}.base`;
+  const path = joinPath(initialFolder, filename);
+  try {
+    await invoke("create_file", { path, content: emptyBaseSource() });
+    await refreshTree();
+    await openNote(path);
+  } catch (error) {
+    void uiAlert(String(error));
+  }
 }
 
 function renderPreferencesPlugins() {
@@ -4520,7 +4775,12 @@ async function exportCurrentPagePdf() {
 
 function showCommandBar() {
   const body = openFeaturePanel("Command bar");
-  renderCommandBar(body, commandCatalog(true), closeFeaturePanel);
+  const vault = document.getElementById("vault-label")?.textContent?.trim() || "vault";
+  renderCommandBar(body, commandCatalog(true), closeFeaturePanel, {
+    vault,
+    file: currentPath,
+    mode: currentFileKind === "markdown" ? viewMode : currentFileKind,
+  });
 }
 
 function openFindCommand() {
@@ -4541,6 +4801,12 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     { id: "command", title: "Open command bar", keywords: "palette actions", run: showCommandBar },
     { id: "file-search", title: "Search file names", keywords: "quick open", run: focusFileFilter },
     { id: "find", title: "Find in current note or board", keywords: "search current", run: openFindCommand },
+    {
+      id: "refresh-pane",
+      title: "Refresh current pane",
+      keywords: "reload preview board f5 rescan",
+      run: refreshCurrentPane,
+    },
     { id: "mode-source", title: "View: Source", keywords: "editor", run: () => setViewMode("source") },
     { id: "mode-live", title: "View: Live Preview", keywords: "editor rendered markdown", run: () => setViewMode("live") },
     { id: "mode-split", title: "View: Split", keywords: "editor preview", run: () => setViewMode("split") },
@@ -4576,6 +4842,11 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     } },
     { id: "preferences", title: "Open preferences", keywords: "settings", run: togglePreferences },
     { id: "plugins", title: "Manage plugins", keywords: "extensions permissions install browse community", run: () => void showPluginManager() },
+    { id: "plugin-settings", title: "Plugin settings", keywords: "obsidian configure options addsettingtab", run: () => void showPluginSettings() },
+    { id: "attachments", title: "Open attachments", keywords: "orphans images media inventory", run: () => void showAttachmentsPanel() },
+    { id: "sql", title: "Open SQL console", keywords: "pgsql postgres query index", run: () => showSqlConsole() },
+    { id: "properties", title: "Edit note properties", keywords: "yaml frontmatter nested metadata", run: () => showPropertiesPanel() },
+    { id: "base", title: "Create base", keywords: "obsidian bases table query", run: () => void createBase() },
     { id: "hotkeys", title: "Preferences: Keyboard shortcuts", keywords: "keys bindings", run: showHotkeysPanel },
     ...(automationConfig?.commands.map((automation): AppCommand => ({
       id: `automation:${automation.id}`,
@@ -4586,7 +4857,10 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     ...(pluginManager?.commands() ?? []),
     ...(includeFiles ? vaultFilesAll
       .filter((file) =>
-        file.file_kind === "markdown" || isPdfPath(file.path) || isCodePath(file.path),
+        file.file_kind === "markdown"
+        || isPdfPath(file.path)
+        || isBasePath(file.path)
+        || isCodePath(file.path),
       )
       .map((file): AppCommand => ({
         id: `open:${file.path}`,
@@ -4597,6 +4871,7 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
           : isVideoPath(file.path) ? "video"
           : isCsvPath(file.path) ? "csv"
           : isStructuredPath(file.path) ? "json yaml"
+          : isBasePath(file.path) ? "base"
           : isCodePath(file.path) ? "code" : ""
         }`,
         run: () => openNote(file.path),

@@ -107,6 +107,21 @@ export function shouldKeepPreviewWork(viewMode: string): boolean {
   return viewMode === "split" || viewMode === "preview";
 }
 
+export type RefreshPane = "right" | "kanban" | "preview" | "source";
+
+/** Which surface F5 should rebuild. Focused right pane wins. */
+export function paneToRefresh(input: {
+  rightOpen: boolean;
+  rightFocused: boolean;
+  kanbanVisible: boolean;
+  viewMode: string;
+}): RefreshPane {
+  if (input.rightOpen && input.rightFocused) return "right";
+  if (input.kanbanVisible) return "kanban";
+  if (input.viewMode === "split" || input.viewMode === "preview") return "preview";
+  return "source";
+}
+
 /** Right-pane render may commit only if this generation is still current. */
 export function shouldCommitRightPane(
   started: number,

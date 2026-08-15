@@ -11,6 +11,7 @@ import { hydrateNoteEmbeds } from "../ui/src/note-embed";
 import { renderPreview } from "../ui/src/preview";
 import { applyAppearanceFonts, normalizeAppearanceFonts } from "../ui/src/appearance";
 import { pluginIframeDocument, type PluginDescriptor } from "../ui/src/plugin-host";
+import { installObsidianDom } from "../ui/src/obsidian-dom";
 import { htmlToMarkdown, looksLikeMarkdown, smartPasteText } from "../ui/src/smart-paste";
 import { highlightPreviewCode, highlightSource, resolveHighlightLanguage } from "../ui/src/syntax-highlight";
 import { applyPandocInlineCodeAttrs, parsePandocAttributeBlock } from "../ui/src/pandoc-attrs";
@@ -41,7 +42,7 @@ import { nextTaskStatusChar } from "../ui/src/task-status";
 import { slashCompletionMatch } from "../ui/src/slash-commands";
 import { hydrateCsvFences, parseCsv } from "../ui/src/csv-view";
 import { parseSimpleYaml } from "../ui/src/structured-view";
-import { isAudioPath, isCsvPath, isStructuredPath, isVideoPath } from "../ui/src/file-kinds";
+import { isAudioPath, isBasePath, isCsvPath, isStructuredPath, isVideoPath } from "../ui/src/file-kinds";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -98,6 +99,57 @@ test("a bundled CommonJS Obsidian plugin receives the inherited app bootstrap", 
   assert.match(document, /generateMarkdownLink/);
   assert.match(document, /window\.__startObsidianPlugin\(\)/);
   assert.match(document, /module\.exports = class extends Plugin/);
+  assert.match(document, /function installObsidianDom/);
+  assert.match(document, /window\.activeDocument = window\.document/);
+  assert.match(document, /try \{ tab\.display\?\.\(\); \}/);
+});
+
+test("Obsidian DOM helpers implement empty, createEl, and addClass", () => {
+  installObsidianDom(dom.window);
+  const host = document.createElement("div");
+  host.textContent = "stale";
+  (host as HTMLElement & { empty: () => HTMLElement }).empty();
+  assert.equal(host.childNodes.length, 0);
+  const row = (host as HTMLElement & { createDiv: (info: object) => HTMLElement }).createDiv({ cls: "kroki-header-row" });
+  row.addClass("kroki-with-header");
+  const area = (row as HTMLElement & { createEl: (tag: string, info: object) => HTMLTextAreaElement })
+    .createEl("textarea", { cls: "kroki-header-textarea", attr: { rows: "3" } });
+  const fragment = document.createDocumentFragment() as DocumentFragment & {
+    createEl: (tag: string, info: object) => HTMLAnchorElement;
+  };
+  fragment.createEl("a", { text: "https://kroki.io", href: "https://kroki.io" });
+  assert.equal(host.querySelector(".kroki-header-row"), row);
+  assert.equal(row.classList.contains("kroki-with-header"), true);
+  assert.equal(area.getAttribute("rows"), "3");
+  assert.equal(fragment.querySelector("a")?.textContent, "https://kroki.io");
+});
+
+test("a Kroki-shaped settings tab can display after empty()", () => {
+  installObsidianDom(dom.window);
+  type ObsidianEl = HTMLElement & {
+    empty: () => ObsidianEl;
+    createDiv: (info: object) => ObsidianEl;
+    addClass: (name: string) => ObsidianEl;
+  };
+  const containerEl = document.createElement("div") as ObsidianEl;
+  containerEl.textContent = "previous";
+  const tab = {
+    containerEl,
+    display() {
+      const host = this.containerEl;
+      host.empty();
+      host.createDiv({ cls: "setting-item setting-item-heading", text: "Diagram types" }).addClass("shown");
+      const link = document.createDocumentFragment() as DocumentFragment & {
+        createEl: (tag: string, info: object) => HTMLElement;
+      };
+      link.createEl("a", { text: "https://kroki.io/", href: "https://kroki.io/" });
+      host.append(link);
+    },
+  };
+  tab.display();
+  assert.equal(containerEl.textContent?.includes("previous"), false);
+  assert.ok(containerEl.querySelector(".setting-item-heading"));
+  assert.equal(containerEl.querySelector("a")?.getAttribute("href"), "https://kroki.io/");
 });
 
 test("appearance fonts are sanitized and applied independently", () => {
@@ -399,7 +451,9 @@ test("file kind helpers recognize PDFs and source files", () => {
   assert.equal(isVideoPath("demo.webm"), true);
   assert.equal(isCsvPath("rows.csv"), true);
   assert.equal(isStructuredPath("config.yaml"), true);
+  assert.equal(isBasePath("Jobs.base"), true);
   assert.equal(isCodePath("config.yaml"), false);
+  assert.equal(isCodePath("Jobs.base"), false);
   assert.equal(languageFromPath("ui/src/main.ts"), "typescript");
   assert.equal(languageFromPath("Makefile"), "makefile");
 });
@@ -432,6 +486,10 @@ test("CSV and simple YAML parsers build tables and trees", () => {
   assert.equal(table.rows[0][0], "Ada, A");
   const yaml = parseSimpleYaml("title: Demo\ncount: 3\nok: true\n");
   assert.deepEqual(yaml, { title: "Demo", count: 3, ok: true });
+  assert.deepEqual(
+    parseSimpleYaml("views:\n  - type: table\n    name: Open\n    order:\n      - file.name\n"),
+    { views: [{ type: "table", name: "Open", order: ["file.name"] }] },
+  );
 
   const fence = document.createElement("div");
   fence.innerHTML = renderPreview("```csv\nname,qty\nAda,2\n```");

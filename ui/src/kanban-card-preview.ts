@@ -18,24 +18,52 @@ type OpenFile = { path: string; content: string };
 
 const SHOW_DELAY_MS = 280;
 const HIDE_DELAY_MS = 200;
+const SCROLL_SUPPRESS_MS = 220;
 const VIEWPORT_MARGIN = 12;
 
 let popup: HTMLElement | null = null;
-let showTimer: number | null = null;
-let hideTimer: number | null = null;
+let showTimer: ReturnType<typeof setTimeout> | null = null;
+let hideTimer: ReturnType<typeof setTimeout> | null = null;
 let requestId = 0;
 let activeCard: HTMLElement | null = null;
 let popupOpenLink: ((target: string) => void) | null = null;
+let scrollSuppressUntil = 0;
+let scrollSuppressTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function isKanbanPreviewSuppressed(now = performance.now()): boolean {
+  return now < scrollSuppressUntil;
+}
+
+/** Drop an in-flight hover preview and ignore new hovers until scrolling stops. */
+export function suppressKanbanCardPreview(ms = SCROLL_SUPPRESS_MS): void {
+  scrollSuppressUntil = performance.now() + ms;
+  dismissKanbanCardPreview();
+  if (scrollSuppressTimer != null) globalThis.clearTimeout(scrollSuppressTimer);
+  scrollSuppressTimer = globalThis.setTimeout(() => {
+    scrollSuppressTimer = null;
+    scrollSuppressUntil = 0;
+  }, ms);
+}
+
+/** Wheel/scroll on a lane must not open a full note preview under the pointer. */
+export function bindKanbanScrollPreviewGuard(root: HTMLElement): void {
+  if (root.dataset.kanbanScrollGuard === "1") return;
+  root.dataset.kanbanScrollGuard = "1";
+  const suppress = () => suppressKanbanCardPreview();
+  root.addEventListener("wheel", suppress, { passive: true, capture: true });
+  root.addEventListener("scroll", suppress, { passive: true, capture: true });
+  root.addEventListener("touchmove", suppress, { passive: true, capture: true });
+}
 
 export function dismissKanbanCardPreview(): void {
   requestId += 1;
   activeCard = null;
   if (showTimer != null) {
-    window.clearTimeout(showTimer);
+    globalThis.clearTimeout(showTimer);
     showTimer = null;
   }
   if (hideTimer != null) {
-    window.clearTimeout(hideTimer);
+    globalThis.clearTimeout(hideTimer);
     hideTimer = null;
   }
   const el = popup;
@@ -57,13 +85,14 @@ export function bindKanbanCardPreview(
   cardEl.dataset.kanbanPreviewBound = "1";
 
   cardEl.addEventListener("mouseenter", () => {
+    if (isKanbanPreviewSuppressed()) return;
     popupOpenLink = options.openLink;
     if (hideTimer != null) {
-      window.clearTimeout(hideTimer);
+      globalThis.clearTimeout(hideTimer);
       hideTimer = null;
     }
-    if (showTimer != null) window.clearTimeout(showTimer);
-    showTimer = window.setTimeout(() => {
+    if (showTimer != null) globalThis.clearTimeout(showTimer);
+    showTimer = globalThis.setTimeout(() => {
       showTimer = null;
       void showCardPreview(cardEl, card, options);
     }, SHOW_DELAY_MS);
@@ -71,7 +100,7 @@ export function bindKanbanCardPreview(
 
   cardEl.addEventListener("mouseleave", () => {
     if (showTimer != null) {
-      window.clearTimeout(showTimer);
+      globalThis.clearTimeout(showTimer);
       showTimer = null;
     }
     scheduleHide();
@@ -79,8 +108,8 @@ export function bindKanbanCardPreview(
 }
 
 function scheduleHide(): void {
-  if (hideTimer != null) window.clearTimeout(hideTimer);
-  hideTimer = window.setTimeout(() => {
+  if (hideTimer != null) globalThis.clearTimeout(hideTimer);
+  hideTimer = globalThis.setTimeout(() => {
     hideTimer = null;
     dismissKanbanCardPreview();
   }, HIDE_DELAY_MS);
@@ -91,6 +120,7 @@ async function showCardPreview(
   card: KanbanCard,
   options: { fromPath: string | null; openLink: (target: string) => void },
 ): Promise<void> {
+  if (isKanbanPreviewSuppressed()) return;
   const id = ++requestId;
   activeCard = cardEl;
   const el = ensurePopup();
@@ -191,7 +221,7 @@ function ensurePopup(): HTMLElement {
   popup.setAttribute("aria-hidden", "true");
   popup.addEventListener("mouseenter", () => {
     if (hideTimer != null) {
-      window.clearTimeout(hideTimer);
+      globalThis.clearTimeout(hideTimer);
       hideTimer = null;
     }
   });

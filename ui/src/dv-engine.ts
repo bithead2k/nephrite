@@ -1556,9 +1556,7 @@ export function evaluateDql(expression: string, row: DqlRow, current: DvPage): u
   const javascriptRewritten = rewriteDateArithmetic(javascript);
   const helpers = {
     current,
-    contains: (haystack: unknown, needle: unknown) => Array.isArray(haystack)
-      ? haystack.includes(needle)
-      : String(haystack ?? "").includes(String(needle ?? "")),
+    contains: dqlContains,
     icontains: (haystack: unknown, needle: unknown) => String(haystack ?? "").toLocaleLowerCase().includes(String(needle ?? "").toLocaleLowerCase()),
     econtains: (haystack: unknown, needle: unknown) => Array.isArray(haystack) ? haystack.includes(needle) : String(haystack ?? "") === String(needle ?? ""),
     containsword: (haystack: unknown, needle: unknown) => new RegExp(`(?:^|\\W)${escapeRegex(String(needle ?? ""))}(?:$|\\W)`, "iu").test(String(haystack ?? "")),
@@ -1628,6 +1626,23 @@ export function evaluateDql(expression: string, row: DqlRow, current: DvPage): u
     `with (helpers) { with (row) { return (${javascriptRewritten}); } }`,
   ) as (row: DqlRow, helpers: Record<string, unknown>) => unknown;
   return evaluator(row, helpers);
+}
+
+/**
+ * Dataview `contains`: object key, list membership (recursive), or substring.
+ * `file.tags` is `#tag`, but vault queries often pass `tag` without the hash.
+ */
+export function dqlContains(haystack: unknown, needle: unknown): boolean {
+  if (haystack == null) return false;
+  if (Array.isArray(haystack)) {
+    return haystack.some((item) =>
+      compareValues(item, needle) === 0 || dqlContains(item, needle)
+    );
+  }
+  if (typeof haystack === "object" && !(haystack instanceof Date)) {
+    return Object.prototype.hasOwnProperty.call(haystack, String(needle ?? ""));
+  }
+  return String(haystack).includes(String(needle ?? ""));
 }
 
 function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
