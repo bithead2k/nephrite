@@ -4,6 +4,8 @@ type Point = { x: number; y: number; vx: number; vy: number };
 
 export type GraphDirection = "both" | "incoming" | "outgoing";
 
+export type GraphColorMode = "folder" | "tag" | "none";
+
 export type GraphFilterOptions = {
   scope: "global" | "local";
   focus?: string | null;
@@ -188,12 +190,16 @@ export function renderGraph(
   const tags = [...new Set(data.nodes.flatMap((node) => node.tags))]
     .sort((left, right) => left.localeCompare(right));
   const tag = graphSelect(["", ...tags], "", "Tag filter", "All tags");
+  const color = graphSelect(["folder", "tag", "none"], "folder", "Color nodes");
+  color.options[0].textContent = "Color: folder";
+  color.options[1].textContent = "Color: tag";
+  color.options[2].textContent = "Color: none";
   const fit = document.createElement("button");
   fit.type = "button";
   fit.textContent = "Fit";
   fit.title = "Reset graph pan and zoom";
   const summary = document.createElement("span");
-  controls.append(scope, depth, direction, folder, tag, search, fit, summary);
+  controls.append(scope, depth, direction, folder, tag, color, search, fit, summary);
   const content = document.createElement("div");
   content.className = "graph-content";
   const viewport = document.createElement("div");
@@ -321,6 +327,8 @@ export function renderGraph(
       const circle = svgElement("circle");
       const d = visible.edges.filter((edge) => edge.source === node.path || edge.target === node.path).length;
       circle.setAttribute("r", String(Math.min(15, 5 + Math.sqrt(d) * 2.2)));
+      const fill = graphNodeColor(node.path, node.tags, color.value as GraphColorMode);
+      if (fill && node.path !== focusPath) circle.setAttribute("fill", fill);
       const title = svgElement("title");
       title.textContent = node.path;
       const label = svgElement("text");
@@ -386,7 +394,7 @@ export function renderGraph(
     applyTransform();
   });
   search.addEventListener("input", draw);
-  for (const control of [scope, depth, direction, folder, tag]) control.addEventListener("change", draw);
+  for (const control of [scope, depth, direction, folder, tag, color]) control.addEventListener("change", draw);
   draw();
 }
 
@@ -438,4 +446,26 @@ function appendRelationshipList(
 
 export function graphTitle(node: GraphNode): string {
   return node.title || node.path.replace(/\.md$/i, "").split("/").pop() || node.path;
+}
+
+export function graphNodeColor(
+  path: string,
+  tags: readonly string[],
+  mode: GraphColorMode,
+): string | null {
+  if (mode === "none") return null;
+  const key =
+    mode === "tag"
+      ? (tags[0] ?? path.split("/")[0] ?? path)
+      : path.includes("/")
+        ? path.split("/")[0]
+        : "(root)";
+  return hueFromKey(key);
+}
+
+function hueFromKey(key: string): string {
+  let hash = 2166136261;
+  for (const character of key) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  const hue = (hash >>> 0) % 360;
+  return `hsl(${hue} 38% 36%)`;
 }

@@ -27,7 +27,8 @@ impl FileKind {
             "canvas" => Self::Canvas,
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => Self::Image,
             "excalidraw" => Self::Excalidraw,
-            "pdf" | "mp3" | "mp4" | "webm" | "wav" | "ogg" | "zip" => Self::Attachment,
+            "pdf" => Self::Attachment,
+            "mp3" | "mp4" | "webm" | "wav" | "ogg" | "zip" => Self::Attachment,
             _ => Self::Other,
         }
     }

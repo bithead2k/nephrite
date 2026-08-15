@@ -1,6 +1,8 @@
 import { marked } from "marked";
 import { renderPropertiesHtml, splitFrontmatter } from "./frontmatter";
 import { blockHash, splitMarkdownBlocks } from "./preview-blocks";
+import { renderMarkdownMath } from "./math";
+import { applyPandocInlineCodeAttrs } from "./pandoc-attrs";
 
 marked.setOptions({
   gfm: true,
@@ -41,12 +43,7 @@ export function renderPreview(
   try {
     const blocks = splitMarkdownBlocks(body);
     for (let index = 0; index < blocks.length; index++) {
-      const block = blocks[index];
-      const withLinks = replaceWikilinksOutsideCode(block);
-      const rendered = marked.parse(withLinks, { async: false }) as string;
-      const inner = renderTocMarkers(renderCallouts(rendered));
-      const hash = blockHash(block);
-      html += `<div class="md-block" data-block-index="${index}" data-block-hash="${hash}">${inner}</div>`;
+      html += renderBlockHtml(blocks[index], index);
     }
   } catch {
     html += `<pre class="preview-error">${escapeHtml(body)}</pre>`;
@@ -201,10 +198,13 @@ function escapeAttr(s: string): string {
 
 /** Render a single markdown block to the same wrapper shape as renderPreview. */
 export function renderBlockHtml(block: string, index: number): string {
-  const withLinks = replaceWikilinksOutsideCode(block);
+  const math = renderMarkdownMath(block);
+  const withLinks = replaceWikilinksOutsideCode(math.markdown);
   try {
     const rendered = marked.parse(withLinks, { async: false }) as string;
-    const inner = renderTocMarkers(renderCallouts(rendered));
+    const inner = applyPandocInlineCodeAttrs(
+      math.restore(renderTocMarkers(renderCallouts(rendered))),
+    );
     const hash = blockHash(block);
     return `<div class="md-block" data-block-index="${index}" data-block-hash="${hash}">${inner}</div>`;
   } catch {

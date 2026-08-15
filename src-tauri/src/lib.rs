@@ -1,10 +1,11 @@
 mod page_sql;
+mod plugins;
 mod postgres_compat;
 mod state;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
-use nephrite_index::{ProgressPhase, VaultIndex, PROJECT_VERSION};
+use nephrite_index::{plan_open, ProgressPhase, VaultIndex, PROJECT_VERSION};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,18 @@ pub struct VaultInfo {
 pub struct VaultOpenPlan {
     pub rebuild: bool,
     pub action: String,
+    /// Pending feature backfills with truthful remaining counts, used to
+    /// compose `action` while `vault_open_plan` remains read-only. Always
+    /// serialized (possibly empty) so the frontend can read `migrations`.
+    pub migrations: Vec<VaultMigration>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VaultMigration {
+    pub id: String,
+    pub action: String,
+    pub remaining: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +110,7 @@ pub struct PluginDescriptor {
     pub source: String,
     pub compatibility: String,
     pub style: Option<String>,
+    pub enabled: bool,
 }
 
 const MAX_PLUGIN_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -110,6 +124,32 @@ const PLUGIN_PERMISSIONS: &[&str] = &[
     "workspace.views",
     "shell.execute",
 ];
+
+/// Obsidian community plugins whose functionality Nephrite now provides
+/// natively. These are hidden from the Plugins list and never loaded, so users
+/// are not offered redundant Obsidian packages (or scared by their errors).
+pub(crate) const CORE_OBSIDIAN_PLUGIN_IDS: &[&str] = &[
+    "dataview",
+    "obsidian-kanban",
+    "obsidian-tasks",
+    "templater-obsidian",
+    "obsidian-excalidraw-plugin",
+    // Mermaid is a native preview renderer. Do not load vault copies.
+    "mermaid",
+    "mermaid-tools",
+    "obsidian-mermaid",
+    "obsidian-mermaid-plugin",
+    "obsidian-mermaid-view",
+    "obsidian-git",
+    "obsidian-vimrc-support",
+    "obsidian-dynamic-toc",
+    "table-of-contents",
+    "table-of-content",
+];
+
+fn is_core_replaced_obsidian_plugin(id: &str) -> bool {
+    plugins::is_core_replaced_obsidian_plugin(id)
+}
 
 fn valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
@@ -130,22 +170,92 @@ fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, Str
             .canonicalize()
             .map_err(|error| error.to_string())?
     };
-    let mut plugins = discover_plugins(&root.join(".nephrite").join("plugins"), "nephrite")?;
+    let mut plugins = discover_plugins(&root.join(".nephrite").join("plugins"), "nephrite", None)?;
     let native_ids: HashSet<String> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
-    let enabled_obsidian: Option<HashSet<String>> =
-        std::fs::read_to_string(root.join(".obsidian").join("community-plugins.json"))
-            .ok()
-            .and_then(|source| serde_json::from_str::<Vec<String>>(&source).ok())
-            .map(|ids| ids.into_iter().collect());
-    let obsidian = discover_plugins(&root.join(".obsidian").join("plugins"), "obsidian")?;
+    let enabled_obsidian: HashSet<String> = plugins::read_enabled_ids(&root).into_iter().collect();
+    let obsidian = discover_plugins(
+        &root.join(".obsidian").join("plugins"),
+        "obsidian",
+        Some(&enabled_obsidian),
+    )?;
     plugins.extend(obsidian.into_iter().filter(|plugin| {
-        !native_ids.contains(&plugin.id)
-            && enabled_obsidian
-                .as_ref()
-                .map_or(true, |enabled| enabled.contains(&plugin.id))
+        !native_ids.contains(&plugin.id) && !is_core_replaced_obsidian_plugin(&plugin.id)
     }));
     plugins.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
     Ok(plugins)
+}
+
+#[tauri::command]
+fn plugin_catalog(state: State<'_, AppState>) -> Result<Vec<PluginCatalogItem>, String> {
+    let root = vault_root(&state)?;
+    let source = plugins::download_text(plugins::COMMUNITY_REGISTRY, 8 * 1024 * 1024)?;
+    let enabled: HashSet<String> = plugins::read_enabled_ids(&root).into_iter().collect();
+    let installed: HashSet<String> = std::fs::read_dir(root.join(".obsidian").join("plugins"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    Ok(plugins::parse_community_catalog(&source)?
+        .into_iter()
+        .filter(|entry| !plugins::hides_core_plugin(&entry.id, &entry.name, &entry.description))
+        .map(|entry| PluginCatalogItem {
+            native: false,
+            installed: installed.contains(&entry.id)
+                || plugins::plugin_dir(&root, &entry.id).is_dir(),
+            enabled: enabled.contains(&entry.id),
+            id: entry.id,
+            name: entry.name,
+            author: entry.author,
+            description: entry.description,
+            repo: entry.repo,
+        })
+        .collect())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct PluginCatalogItem {
+    id: String,
+    name: String,
+    author: String,
+    description: String,
+    repo: String,
+    installed: bool,
+    enabled: bool,
+    native: bool,
+}
+
+#[tauri::command]
+fn install_community_plugin(
+    id: String,
+    repo: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = vault_root(&state)?;
+    plugins::install_release_files(&root, &id, &repo)
+}
+
+#[tauri::command]
+fn uninstall_community_plugin(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let root = vault_root(&state)?;
+    plugins::uninstall_plugin_files(&root, &id)
+}
+
+#[tauri::command]
+fn set_community_plugin_enabled(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if !plugins::valid_plugin_id(&id) {
+        return Err("Invalid plugin id".into());
+    }
+    let root = vault_root(&state)?;
+    let next = plugins::set_enabled_id(&plugins::read_enabled_ids(&root), &id, enabled);
+    plugins::write_enabled_ids(&root, &next)
 }
 
 /// Read validated, bundled plugin entrypoints. Both native Nephrite packages
@@ -154,6 +264,7 @@ fn list_plugins(state: State<'_, AppState>) -> Result<Vec<PluginDescriptor>, Str
 fn discover_plugins(
     plugin_root: &Path,
     compatibility: &str,
+    enabled_ids: Option<&HashSet<String>>,
 ) -> Result<Vec<PluginDescriptor>, String> {
     if !plugin_root.is_dir() {
         return Ok(Vec::new());
@@ -162,7 +273,7 @@ fn discover_plugins(
         .canonicalize()
         .map_err(|error| error.to_string())?;
     let mut plugins = Vec::new();
-    let entries = std::fs::read_dir(&plugin_root).map_err(|error| error.to_string())?;
+    let entries = std::fs::read_dir(plugin_root).map_err(|error| error.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         if !entry
@@ -234,8 +345,15 @@ fn discover_plugins(
                 manifest.id
             ));
         }
+        let plugin_id = manifest.id;
+        let enabled = match compatibility {
+            "obsidian" => enabled_ids
+                .map(|ids| ids.contains(&plugin_id))
+                .unwrap_or(true),
+            _ => true,
+        };
         plugins.push(PluginDescriptor {
-            id: manifest.id,
+            id: plugin_id,
             name: manifest.name,
             version: manifest.version,
             description: manifest.description.unwrap_or_default(),
@@ -245,6 +363,7 @@ fn discover_plugins(
             source: std::fs::read_to_string(&canonical_main)
                 .map_err(|error| format!("{}: {error}", canonical_main.display()))?,
             compatibility: compatibility.to_string(),
+            enabled,
             style: {
                 let style_path = canonical_entry.join("styles.css");
                 std::fs::metadata(&style_path)
@@ -317,36 +436,27 @@ fn vault_open_plan(path: String) -> Result<VaultOpenPlan, String> {
                 "Building the Nephrite {} vault index for the first time…",
                 PROJECT_VERSION
             ),
+            migrations: Vec::new(),
         });
     }
-    let stored = rusqlite::Connection::open_with_flags(
+    let connection = rusqlite::Connection::open_with_flags(
         &database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
-    .ok()
-    .and_then(|connection| {
-        connection
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'project_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-    })
-    .and_then(|value| value.parse::<nephrite_index::Version>().ok());
-    let rebuild = stored
-        .map(|version| PROJECT_VERSION.requires_rebuild(version))
-        .unwrap_or(true);
+    .map_err(|e| e.to_string())?;
+    let plan = plan_open(&connection).map_err(|e| e.to_string())?;
     Ok(VaultOpenPlan {
-        rebuild,
-        action: if rebuild {
-            format!(
-                "Rebuilding the vault index for Nephrite {}…",
-                PROJECT_VERSION
-            )
-        } else {
-            "Checking the vault for changed files…".to_string()
-        },
+        rebuild: plan.rebuild,
+        action: plan.action,
+        migrations: plan
+            .migrations
+            .into_iter()
+            .map(|migration| VaultMigration {
+                id: migration.id.to_string(),
+                action: migration.action.to_string(),
+                remaining: migration.remaining,
+            })
+            .collect(),
     })
 }
 
@@ -1111,6 +1221,403 @@ fn graph_data(state: State<'_, AppState>) -> Result<GraphData, String> {
     Ok(GraphData { nodes, edges })
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LinkHealthNote {
+    pub path: String,
+    pub title: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LinkPlaceholder {
+    pub source: String,
+    pub target: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LinkHealth {
+    pub orphans: Vec<LinkHealthNote>,
+    pub placeholders: Vec<LinkPlaceholder>,
+}
+
+#[tauri::command]
+fn link_health(state: State<'_, AppState>) -> Result<LinkHealth, String> {
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let connection = index.connection();
+    let mut orphan_stmt = connection
+        .prepare(
+            "SELECT p.path, COALESCE(NULLIF(p.title, ''), p.name, p.path)
+             FROM pages p
+             WHERE p.file_kind = 'markdown'
+               AND NOT EXISTS (
+                 SELECT 1 FROM links l
+                 WHERE l.target_path = p.path AND l.path <> p.path
+             )
+             ORDER BY p.path COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let orphans = orphan_stmt
+        .query_map([], |row| {
+            Ok(LinkHealthNote {
+                path: row.get(0)?,
+                title: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut placeholder_stmt = connection
+        .prepare(
+            "SELECT path, target_raw, COUNT(*)
+             FROM links
+             WHERE target_path IS NULL
+               AND TRIM(target_raw) <> ''
+               AND link_kind = 'wikilink'
+             GROUP BY path, target_raw
+             ORDER BY target_raw COLLATE NOCASE, path COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let placeholders = placeholder_stmt
+        .query_map([], |row| {
+            Ok(LinkPlaceholder {
+                source: row.get(0)?,
+                target: row.get(1)?,
+                count: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(LinkHealth {
+        orphans,
+        placeholders,
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NoteLinkRef {
+    pub path: String,
+    pub title: String,
+    pub target: String,
+    pub heading: Option<String>,
+    pub block: Option<String>,
+    pub display: Option<String>,
+    pub embed: bool,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NoteHeading {
+    pub level: i64,
+    pub text: String,
+    pub line: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UnlinkedMention {
+    pub path: String,
+    pub title: String,
+    pub snippet: String,
+    pub line: Option<usize>,
+    pub term: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NoteContext {
+    pub path: String,
+    pub title: String,
+    pub aliases: Vec<String>,
+    pub tags: Vec<String>,
+    pub headings: Vec<NoteHeading>,
+    pub backlinks: Vec<NoteLinkRef>,
+    pub outgoing: Vec<NoteLinkRef>,
+    pub unlinked: Vec<UnlinkedMention>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VaultTag {
+    pub tag: String,
+    pub count: i64,
+}
+
+#[tauri::command]
+fn note_context(path: String, state: State<'_, AppState>) -> Result<NoteContext, String> {
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let connection = index.connection();
+    let title: String = connection
+        .query_row(
+            "SELECT COALESCE(NULLIF(title, ''), name, path) FROM pages WHERE path = ?1",
+            rusqlite::params![path],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| {
+            path.rsplit('/')
+                .next()
+                .unwrap_or(&path)
+                .trim_end_matches(".md")
+                .to_string()
+        });
+    let aliases = query_strings(
+        connection,
+        "SELECT alias FROM aliases WHERE path = ?1 ORDER BY alias COLLATE NOCASE",
+        &path,
+    )?;
+    let tags = query_strings(
+        connection,
+        "SELECT DISTINCT tag FROM tags WHERE path = ?1 ORDER BY tag COLLATE NOCASE",
+        &path,
+    )?;
+    let headings = {
+        let mut stmt = connection
+            .prepare(
+                "SELECT level, text, start_line FROM headings
+                 WHERE path = ?1 ORDER BY heading_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<NoteHeading> = stmt
+            .query_map(rusqlite::params![path], |row| {
+                Ok(NoteHeading {
+                    level: row.get(0)?,
+                    text: row.get(1)?,
+                    line: row.get(2)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let map_link = |row: &rusqlite::Row<'_>| -> rusqlite::Result<NoteLinkRef> {
+        let source: String = row.get(0)?;
+        let label: String = row.get(1)?;
+        let target_raw: String = row.get(2)?;
+        let target_path: Option<String> = row.get(3)?;
+        let resolved = target_path.is_some();
+        let dest = target_path.unwrap_or_else(|| target_raw.clone());
+        Ok(NoteLinkRef {
+            title: label,
+            path: source,
+            target: dest,
+            heading: row.get(4)?,
+            block: row.get(5)?,
+            display: row.get(6)?,
+            embed: row.get::<_, i64>(7)? != 0,
+            resolved,
+        })
+    };
+    let backlinks = {
+        let mut stmt = connection
+            .prepare(
+                "SELECT l.path,
+                        COALESCE(NULLIF(p.title, ''), p.name, l.path),
+                        l.target_raw, l.target_path, l.target_heading, l.target_block,
+                        l.display_text, l.is_embed
+                 FROM links l
+                 LEFT JOIN pages p ON p.path = l.path
+                 WHERE l.target_path = ?1 AND l.path <> ?1
+                 ORDER BY l.path COLLATE NOCASE, l.link_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<NoteLinkRef> = stmt
+            .query_map(rusqlite::params![path], map_link)
+            .map_err(|error| error.to_string())?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let outgoing = {
+        let mut stmt = connection
+            .prepare(
+                "SELECT l.path,
+                        COALESCE(NULLIF(p.title, ''), p.name, l.target_raw),
+                        l.target_raw, l.target_path, l.target_heading, l.target_block,
+                        l.display_text, l.is_embed
+                 FROM links l
+                 LEFT JOIN pages p ON p.path = l.target_path
+                 WHERE l.path = ?1
+                 ORDER BY COALESCE(l.target_path, l.target_raw) COLLATE NOCASE, l.link_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows: Vec<NoteLinkRef> = stmt
+            .query_map(rusqlite::params![path], map_link)
+            .map_err(|error| error.to_string())?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let linked = backlinks
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut terms = vec![wikilink_key(&path)];
+    if !title.is_empty() {
+        terms.push(title.clone());
+    }
+    terms.extend(aliases.iter().cloned());
+    terms.sort();
+    terms.dedup();
+    let mut unlinked = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for term in terms {
+        let cleaned = term.trim();
+        if cleaned.chars().count() < 3 {
+            continue;
+        }
+        let expression = fts_query(cleaned);
+        if expression.is_empty() {
+            continue;
+        }
+        let mut stmt = connection
+            .prepare(
+                "SELECT f.path,
+                        COALESCE(NULLIF(p.title, ''), f.path),
+                        snippet(files_fts, -1, '[[HIT]]', '[[/HIT]]', ' … ', 18)
+                 FROM files_fts f
+                 LEFT JOIN pages p ON p.path = f.path
+                 WHERE files_fts MATCH ?1 AND f.path <> ?2
+                 ORDER BY bm25(files_fts)
+                 LIMIT 24",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![expression, path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (source, mention_title, snippet) = row.map_err(|error| error.to_string())?;
+            if linked.contains(&source) || !seen.insert(source.clone()) {
+                continue;
+            }
+            let line = std::fs::read_to_string(index.vault_root().join(&source))
+                .ok()
+                .and_then(|content| {
+                    content.lines().position(|candidate| {
+                        candidate.to_lowercase().contains(&cleaned.to_lowercase())
+                            && !candidate.contains("[[")
+                    })
+                })
+                .map(|index| index + 1);
+            unlinked.push(UnlinkedMention {
+                path: source,
+                title: mention_title,
+                snippet,
+                line,
+                term: cleaned.to_string(),
+            });
+            if unlinked.len() >= 40 {
+                break;
+            }
+        }
+        if unlinked.len() >= 40 {
+            break;
+        }
+    }
+    Ok(NoteContext {
+        path,
+        title,
+        aliases,
+        tags,
+        headings,
+        backlinks,
+        outgoing,
+        unlinked,
+    })
+}
+
+#[tauri::command]
+fn vault_tags(state: State<'_, AppState>) -> Result<Vec<VaultTag>, String> {
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let mut stmt = index
+        .connection()
+        .prepare(
+            "SELECT TRIM(tag, '#'), COUNT(DISTINCT path)
+             FROM tags
+             WHERE TRIM(tag, '#') <> ''
+             GROUP BY 1
+             ORDER BY 2 DESC, 1 COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let tags: Vec<VaultTag> = stmt
+        .query_map([], |row| {
+            Ok(VaultTag {
+                tag: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(tags)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TagPage {
+    pub path: String,
+    pub title: String,
+}
+
+#[tauri::command]
+fn pages_for_tag(tag: String, state: State<'_, AppState>) -> Result<Vec<TagPage>, String> {
+    let needle = tag.trim().trim_start_matches('#').to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let mut stmt = index
+        .connection()
+        .prepare(
+            "SELECT DISTINCT t.path, COALESCE(NULLIF(p.title, ''), p.name, t.path)
+             FROM tags t
+             LEFT JOIN pages p ON p.path = t.path
+             WHERE lower(trim(t.tag, '#')) = ?1
+             ORDER BY t.path COLLATE NOCASE",
+        )
+        .map_err(|error| error.to_string())?;
+    let pages: Vec<TagPage> = stmt
+        .query_map(rusqlite::params![needle], |row| {
+            Ok(TagPage {
+                path: row.get(0)?,
+                title: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(pages)
+}
+
+fn query_strings(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    path: &str,
+) -> Result<Vec<String>, String> {
+    let mut stmt = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let rows: Vec<String> = stmt
+        .query_map(rusqlite::params![path], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
 #[tauri::command]
 fn read_file(path: String, state: State<'_, AppState>) -> Result<OpenFile, String> {
     let guard = state.index.lock();
@@ -1151,7 +1658,18 @@ fn read_media_file(path: String, state: State<'_, AppState>) -> Result<MediaFile
         "svg" => "image/svg+xml",
         "bmp" => "image/bmp",
         "ico" => "image/x-icon",
-        _ => return Err(format!("Unsupported embedded image type: {extension}")),
+        "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "mov" => "video/quicktime",
+        _ => return Err(format!("Unsupported embedded media type: {extension}")),
     };
     let metadata = std::fs::metadata(&abs).map_err(|e| e.to_string())?;
     if metadata.len() > MAX_MEDIA_BYTES {
@@ -1214,6 +1732,57 @@ fn write_file(path: String, content: String, state: State<'_, AppState>) -> Resu
     index
         .index_path_with_content(&path, Some(&content))
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Write a binary attachment (image, audio, …) from base64. Markdown is not rewritten.
+#[tauri::command]
+fn write_media_file(path: String, data: String, state: State<'_, AppState>) -> Result<(), String> {
+    let bytes = BASE64
+        .decode(data.trim())
+        .map_err(|error| format!("Invalid attachment encoding: {error}"))?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("Attachment exceeds the 64 MiB limit".into());
+    }
+    let (root, abs) = {
+        let guard = state.index.lock();
+        let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+        let root = index
+            .vault_root()
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let abs = vault_abs(index, &path)?;
+        (root, abs)
+    };
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let canonical_parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical_parent.starts_with(&root) {
+            return Err("Path escapes vault through a symbolic link".into());
+        }
+    }
+    if abs.exists() {
+        let canonical_target = abs.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical_target.starts_with(&root) {
+            return Err("Path escapes vault through a symbolic link".into());
+        }
+    }
+    std::fs::write(&abs, &bytes).map_err(|e| e.to_string())?;
+    let abs_c = abs.canonicalize().map_err(|e| e.to_string())?;
+    if !abs_c.starts_with(&root) {
+        return Err("Path escapes vault".into());
+    }
+    let mut guard = state.index.lock();
+    let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
+    if index
+        .vault_root()
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        != root
+    {
+        return Err("Vault changed while the file was being saved".into());
+    }
+    index.index_path(&path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3197,93 +3766,8 @@ fn resolve_wikilink(
 ) -> Result<Option<String>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
-    let note = target.split('#').next().unwrap_or("").trim();
-    if note.is_empty() {
-        return Ok(from_path);
-    }
-    let key = note.trim_end_matches(".md").replace('\\', "/");
-    let conn = index.connection();
-
-    // Prefer a path relative to the source note. Standard Markdown images and
-    // Obsidian links commonly use paths such as assets/photo.jpg that are
-    // relative to the note's folder rather than the vault root.
-    if let Some(from) = from_path.as_deref() {
-        let parent = from.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-        let relative = if parent.is_empty() {
-            key.clone()
-        } else {
-            format!("{parent}/{key}")
-        };
-        let relative_md = format!("{relative}.md");
-        let hit: Option<String> = conn
-            .query_row(
-                "SELECT path FROM files WHERE path = ?1 OR path = ?2 LIMIT 1",
-                [relative.as_str(), relative_md.as_str()],
-                |r| r.get(0),
-            )
-            .ok();
-        if hit.is_some() {
-            return Ok(hit);
-        }
-    }
-
-    // Exact vault-root path.
-    let exact = format!("{key}.md");
-    let hit: Option<String> = conn
-        .query_row(
-            "SELECT path FROM files WHERE path = ?1 OR path = ?2 LIMIT 1",
-            [key.as_str(), exact.as_str()],
-            |r| r.get(0),
-        )
-        .ok();
-    if hit.is_some() {
-        return Ok(hit);
-    }
-
-    // Stem match (filename without extension). This includes attachments so
-    // extensionless Obsidian embeds such as ![[Photo]] resolve naturally.
-    let filename = key.rsplit('/').next().unwrap_or(&key);
-    let stem = Path::new(filename)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(filename);
-    let mut stmt = conn
-        .prepare(
-            "SELECT path FROM files WHERE stem = ?1 \
-             ORDER BY CASE file_kind \
-                 WHEN 'markdown' THEN 0 WHEN 'image' THEN 1 \
-                 WHEN 'excalidraw' THEN 2 ELSE 3 END, path LIMIT 20",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<String> = stmt
-        .query_map([stem], |r| r.get(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if rows.is_empty() {
-        // alias table
-        let mut a = conn
-            .prepare("SELECT path FROM aliases WHERE alias = ?1 LIMIT 1")
-            .map_err(|e| e.to_string())?;
-        let ap: Option<String> = a.query_row([stem], |r| r.get(0)).ok();
-        return Ok(ap);
-    }
-    if rows.len() == 1 {
-        return Ok(Some(rows[0].clone()));
-    }
-    // Prefer same folder as from_path
-    if let Some(from) = from_path {
-        let parent = from.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-        if let Some(p) = rows.iter().find(|p| {
-            p.rsplit_once('/')
-                .map(|(dir, _)| dir == parent)
-                .unwrap_or(false)
-        }) {
-            return Ok(Some(p.clone()));
-        }
-    }
-    Ok(Some(rows[0].clone()))
+    let resolver = index.link_resolver().map_err(|e| e.to_string())?;
+    Ok(resolver.resolve(&target, from_path.as_deref()))
 }
 
 fn vault_info_from(index: &VaultIndex, stats: &nephrite_index::ReconcileStats) -> VaultInfo {
@@ -3336,6 +3820,394 @@ fn reindex_path(index: &mut VaultIndex, rel: &str) -> Result<(), String> {
     index.index_path(rel).map_err(|e| e.to_string())
 }
 
+fn wikilink_key(path: &str) -> String {
+    nephrite_index::wikilink_key(path)
+}
+
+fn base_segment(key: &str) -> String {
+    key.rsplit('/').next().unwrap_or(key).to_string()
+}
+
+/// Whether `base` uniquely identifies the renamed target across the whole vault.
+/// Matches the by_stem/name/no_ext resolution semantics used by `resolve_target`.
+fn base_target_unique(index: &VaultIndex, base: &str) -> Result<bool, String> {
+    let n: i64 = index
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE stem = ?1 OR name = ?1 OR path = ?1",
+            rusqlite::params![base],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n <= 1)
+}
+
+/// Compute the replacement text for one indexed wikilink/embed after a rename.
+/// Returns `None` when the link should be left untouched.
+fn compute_wikilink_rewrite(
+    target_raw: &str,
+    target_heading: &Option<String>,
+    target_block: &Option<String>,
+    display_text: &Option<String>,
+    is_embed: bool,
+    resolved_target_path: Option<&str>,
+    from: &str,
+    to: &str,
+    from_key: &str,
+    to_key: &str,
+    to_base_unique: bool,
+) -> Option<String> {
+    let new_raw: String = if let Some(rtp) = resolved_target_path {
+        // Resolved link: rewrite the resolved path, preserving link "shape".
+        let suffix = rtp.strip_prefix(from)?;
+        let new_full = if suffix.is_empty() {
+            to.to_string()
+        } else {
+            format!("{to}{suffix}")
+        };
+        let new_full_key = wikilink_key(&new_full);
+        if target_raw.contains('/') {
+            new_full_key
+        } else if to_base_unique {
+            base_segment(&new_full_key)
+        } else {
+            new_full_key
+        }
+    } else {
+        // Unresolved wikilink: match by raw identity against the old file.
+        let raw_key = wikilink_key(target_raw.trim());
+        let raw_base = base_segment(&raw_key);
+        let from_base = base_segment(from_key);
+        let to_base = base_segment(to_key);
+        if raw_key == from_key || raw_key == wikilink_key(from) {
+            to_key.to_string()
+        } else if raw_base == from_base {
+            if raw_key.contains('/') {
+                if let Some(rest) = raw_key.strip_prefix(from_key) {
+                    format!("{to_key}{rest}")
+                } else {
+                    to_key.to_string()
+                }
+            } else {
+                to_base
+            }
+        } else {
+            return None;
+        }
+    };
+    let mut inner = new_raw;
+    if let Some(h) = target_heading {
+        inner.push('#');
+        inner.push_str(h);
+    }
+    if let Some(b) = target_block {
+        inner.push_str("#^");
+        inner.push_str(b);
+    }
+    if let Some(d) = display_text {
+        if !d.is_empty() {
+            inner.push('|');
+            inner.push_str(d);
+        }
+    }
+    let mut link = String::new();
+    if is_embed {
+        link.push('!');
+    }
+    link.push_str("[[");
+    link.push_str(&inner);
+    link.push_str("]]");
+    Some(link)
+}
+
+struct LinkRewrite {
+    source: String,
+    start: i64,
+    end: i64,
+    new_text: String,
+}
+
+/// Collect wikilink/embed rewrites across every file that references `from`.
+fn collect_link_rewrites(
+    index: &VaultIndex,
+    from: &str,
+    to: &str,
+) -> Result<Vec<LinkRewrite>, String> {
+    let conn = index.connection();
+    let from_key = wikilink_key(from);
+    let to_key = wikilink_key(to);
+    let from_base = base_segment(&from_key);
+    let to_base_unique = base_target_unique(index, &base_segment(&to_key))?;
+    let mut rewrites: Vec<LinkRewrite> = Vec::new();
+
+    // Resolved links (target_path == from, or a child of `from` for dir moves).
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, target_raw, target_heading, target_block, display_text, is_embed, \
+                 start_offset, end_offset, target_path \
+                 FROM links \
+                 WHERE link_kind = 'wikilink' AND (target_path = ?1 OR target_path LIKE ?1 || '/%')",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![from], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (src, raw, heading, block, display, is_embed, start, end, target_path) =
+                row.map_err(|e| e.to_string())?;
+            if let Some(text) = compute_wikilink_rewrite(
+                &raw,
+                &heading,
+                &block,
+                &display,
+                is_embed != 0,
+                target_path.as_deref(),
+                from,
+                to,
+                &from_key,
+                &to_key,
+                to_base_unique,
+            ) {
+                rewrites.push(LinkRewrite {
+                    source: src,
+                    start,
+                    end,
+                    new_text: text,
+                });
+            }
+        }
+    }
+
+    // Unresolved wikilinks whose raw target identifies the old file.
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, target_raw, target_heading, target_block, display_text, is_embed, \
+                 start_offset, end_offset \
+                 FROM links \
+                 WHERE link_kind = 'wikilink' AND target_path IS NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (src, raw, heading, block, display, is_embed, start, end) =
+                row.map_err(|e| e.to_string())?;
+            let raw_key = wikilink_key(raw.trim());
+            let raw_base = base_segment(&raw_key);
+            let matches =
+                raw_key == from_key || raw_key == wikilink_key(from) || raw_base == from_base;
+            if !matches {
+                continue;
+            }
+            if let Some(text) = compute_wikilink_rewrite(
+                &raw,
+                &heading,
+                &block,
+                &display,
+                is_embed != 0,
+                None,
+                from,
+                to,
+                &from_key,
+                &to_key,
+                to_base_unique,
+            ) {
+                rewrites.push(LinkRewrite {
+                    source: src,
+                    start,
+                    end,
+                    new_text: text,
+                });
+            }
+        }
+    }
+
+    Ok(rewrites)
+}
+
+/// Rewrite the path portion of ordinary Markdown `[text](url)` / `![](url)` refs.
+fn rewrite_ref_url(url: &str, variants: &[(String, String)]) -> Option<String> {
+    let (path, fragment) = match url.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (url, None),
+    };
+    let path_trim = path.trim();
+    let norm = path_trim.trim_start_matches("./").trim_start_matches('/');
+    for (from, to) in variants {
+        if norm == *from {
+            let mut repl = to.clone();
+            if path_trim.starts_with("./") {
+                repl = format!("./{repl}");
+            } else if path_trim.starts_with('/') {
+                repl = format!("/{repl}");
+            }
+            if let Some(f) = fragment {
+                repl.push('#');
+                repl.push_str(f);
+            }
+            return Some(repl);
+        }
+    }
+    None
+}
+
+fn rewrite_markdown_refs(text: &str, variants: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b']' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b')' {
+                j += 1;
+            }
+            if j < bytes.len() {
+                let url = &text[i + 2..j];
+                if let Some(repl) = rewrite_ref_url(url, variants) {
+                    out.push_str("](");
+                    out.push_str(&repl);
+                    out.push(')');
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Scan every Markdown file for Markdown-style references to the renamed path and
+/// rewrite them, returning the set of changed files.
+fn collect_markdown_ref_rewrites(
+    index: &VaultIndex,
+    from: &str,
+    to: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let from_key = wikilink_key(from);
+    let to_key = wikilink_key(to);
+    let variants: Vec<(String, String)> = vec![
+        (from.to_string(), to.to_string()),
+        (from_key.clone(), to_key.clone()),
+        (base_segment(from), base_segment(to)),
+        (base_segment(&from_key), base_segment(&to_key)),
+    ];
+    let paths: Vec<String> = index
+        .connection()
+        .prepare("SELECT path FROM files WHERE file_kind = 'markdown'")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut changed = Vec::new();
+    for rel in paths {
+        let abs = vault_abs(index, &rel)?;
+        let raw = match std::fs::read(&abs) {
+            Ok(b) => match String::from_utf8(b) {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        let rewritten = rewrite_markdown_refs(&raw, &variants);
+        if rewritten != raw {
+            changed.push((rel, rewritten));
+        }
+    }
+    Ok(changed)
+}
+
+/// Apply collected rewrites to the vault: splice wikilinks by byte offset and
+/// rewrite Markdown refs, then re-index every changed file.
+fn apply_rewrites(
+    index: &mut VaultIndex,
+    from: &str,
+    to: &str,
+    mut rewrites: Vec<LinkRewrite>,
+) -> Result<Vec<String>, String> {
+    let from_key = wikilink_key(from);
+    let to_key = wikilink_key(to);
+    let variants: Vec<(String, String)> = vec![
+        (from.to_string(), to.to_string()),
+        (from_key.clone(), to_key.clone()),
+        (base_segment(from), base_segment(to)),
+        (base_segment(&from_key), base_segment(&to_key)),
+    ];
+
+    let mut by_source: HashMap<String, Vec<(i64, i64, String)>> = HashMap::new();
+    for rw in rewrites.drain(..) {
+        by_source
+            .entry(rw.source.clone())
+            .or_default()
+            .push((rw.start, rw.end, rw.new_text));
+    }
+    let mut modified: HashSet<String> = HashSet::new();
+
+    for (source, mut spans) in by_source {
+        // Apply descending so earlier offsets stay valid.
+        spans.sort_by(|a, b| b.0.cmp(&a.0));
+        let abs = vault_abs(index, &source)?;
+        let raw = std::fs::read(&abs).map_err(|e| e.to_string())?;
+        let mut text = String::from_utf8_lossy(&raw).into_owned();
+        for (start, end, new_text) in &spans {
+            let (s, e) = (*start as usize, *end as usize);
+            if s > text.len() || e > text.len() || s > e {
+                continue;
+            }
+            let before = text[..s].to_string();
+            let after = text[e..].to_string();
+            text = format!("{before}{new_text}{after}");
+        }
+        let text = rewrite_markdown_refs(&text, &variants);
+        std::fs::write(&abs, text.as_bytes()).map_err(|e| e.to_string())?;
+        reindex_path(index, &source)?;
+        modified.insert(source);
+    }
+
+    // The global Markdown-ref scan covers files that had no indexed wikilinks.
+    let markdown_rewrites = collect_markdown_ref_rewrites(index, from, to)?;
+    for (rel, content) in markdown_rewrites {
+        if modified.contains(&rel) {
+            continue;
+        }
+        let abs = vault_abs(index, &rel)?;
+        std::fs::write(&abs, content.as_bytes()).map_err(|e| e.to_string())?;
+        reindex_path(index, &rel)?;
+        modified.insert(rel);
+    }
+
+    Ok(modified.into_iter().collect())
+}
+
 #[tauri::command]
 fn create_folder(path: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.index.lock();
@@ -3362,7 +4234,11 @@ fn create_file(path: String, content: String, state: State<'_, AppState>) -> Res
 }
 
 #[tauri::command]
-fn rename_path(from: String, to: String, state: State<'_, AppState>) -> Result<(), String> {
+fn rename_path(
+    from: String,
+    to: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
     let mut guard = state.index.lock();
     let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
     let src = vault_abs(index, &from)?;
@@ -3377,6 +4253,9 @@ fn rename_path(from: String, to: String, state: State<'_, AppState>) -> Result<(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let was_dir = src.is_dir();
+    // Collect reference rewrites before the index identity changes, so links
+    // pointing at the old path are still resolvable in `links.target_path`.
+    let rewrites = collect_link_rewrites(index, &from, &to)?;
     std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
     // Drop old index identity; re-index new path (or full reconcile for dirs).
     let _ = index.remove_path(&from);
@@ -3385,7 +4264,8 @@ fn rename_path(from: String, to: String, state: State<'_, AppState>) -> Result<(
     } else {
         reindex_path(index, &to).map_err(|e| format!("renamed on disk but reindex failed: {e}"))?;
     }
-    Ok(())
+    let modified = apply_rewrites(index, &from, &to, rewrites)?;
+    Ok(modified)
 }
 
 #[tauri::command]
@@ -4110,6 +4990,45 @@ fn git_resolve_conflict(
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GitConflictSides {
+    pub path: String,
+    pub ours: Option<String>,
+    pub theirs: Option<String>,
+    pub base: Option<String>,
+    pub working: Option<String>,
+}
+
+fn git_show_stage(root: &Path, stage: u8, path: &str) -> Option<String> {
+    let spec = format!(":{stage}:{path}");
+    let output = git_output(root, &["show", &spec]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[tauri::command]
+fn git_conflict_sides(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<GitConflictSides, String> {
+    validate_git_paths(std::slice::from_ref(&path))?;
+    let root = vault_root(&state)?;
+    let working = {
+        let abs = root.join(&path);
+        std::fs::read_to_string(&abs).ok()
+    };
+    Ok(GitConflictSides {
+        path: path.clone(),
+        ours: git_show_stage(&root, 2, &path),
+        theirs: git_show_stage(&root, 3, &path),
+        base: git_show_stage(&root, 1, &path),
+        working,
+    })
+}
+
 #[tauri::command]
 fn git_continue(state: State<'_, AppState>) -> Result<String, String> {
     let root = vault_root(&state)?;
@@ -4388,10 +5307,19 @@ pub fn run() {
             list_attachments,
             search_vault,
             graph_data,
+            link_health,
+            note_context,
+            vault_tags,
+            pages_for_tag,
             list_plugins,
+            plugin_catalog,
+            install_community_plugin,
+            uninstall_community_plugin,
+            set_community_plugin_enabled,
             read_file,
             read_media_file,
             write_file,
+            write_media_file,
             resolve_wikilink,
             list_pages,
             note_file_meta,
@@ -4429,6 +5357,7 @@ pub fn run() {
             git_file_history,
             git_restore_from_commit,
             git_resolve_conflict,
+            git_conflict_sides,
             git_continue,
             git_abort,
             render_vim_powerline,
@@ -4440,11 +5369,23 @@ pub fn run() {
 #[cfg(test)]
 mod sql_query_tests {
     use super::{
-        discover_plugins, fts_query, is_conflict_status, next_recurrence_date, page_properties,
-        recurring_task_lines, run_readonly_sql, search_yaml_properties, translate_page_sql,
-        translate_page_sql_residual, vault_search_terms,
+        discover_plugins, fts_query, is_conflict_status, is_core_replaced_obsidian_plugin,
+        next_recurrence_date, page_properties, recurring_task_lines, run_readonly_sql,
+        search_yaml_properties, translate_page_sql, translate_page_sql_residual,
+        vault_search_terms,
     };
     use chrono::NaiveDate;
+
+    #[test]
+    fn mermaid_obsidian_plugins_are_treated_as_replaced_core() {
+        assert!(is_core_replaced_obsidian_plugin("mermaid-tools"));
+        assert!(is_core_replaced_obsidian_plugin("obsidian-mermaid-view"));
+        assert!(is_core_replaced_obsidian_plugin("My-Mermaid-Helper"));
+        assert!(is_core_replaced_obsidian_plugin("obsidian-git"));
+        assert!(is_core_replaced_obsidian_plugin("obsidian-vimrc-support"));
+        assert!(is_core_replaced_obsidian_plugin("calendar"));
+        assert!(is_core_replaced_obsidian_plugin("dataview"));
+    }
 
     #[test]
     fn discovers_native_and_obsidian_plugin_packages_with_distinct_defaults() {
@@ -4458,7 +5399,7 @@ mod sql_query_tests {
         .unwrap();
         std::fs::write(native.join("main.js"), "nephrite.onLoad(() => {});").unwrap();
         let native_plugins =
-            discover_plugins(&directory.path().join("native"), "nephrite").unwrap();
+            discover_plugins(&directory.path().join("native"), "nephrite", None).unwrap();
         assert_eq!(native_plugins[0].compatibility, "nephrite");
         assert_eq!(native_plugins[0].permissions, ["vault.read"]);
 
@@ -4475,7 +5416,7 @@ mod sql_query_tests {
         )
         .unwrap();
         let obsidian_plugins =
-            discover_plugins(&directory.path().join("obsidian"), "obsidian").unwrap();
+            discover_plugins(&directory.path().join("obsidian"), "obsidian", None).unwrap();
         assert_eq!(obsidian_plugins[0].compatibility, "obsidian");
         assert!(obsidian_plugins[0]
             .permissions

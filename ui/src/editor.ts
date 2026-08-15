@@ -42,13 +42,15 @@ import { CodeMirror, Vim, getCM, vim } from "@replit/codemirror-vim";
 import type { CodeMirrorV } from "@replit/codemirror-vim";
 import { cycleTaskLine } from "./tasks";
 import { formatTimestampPart, type TimestampPart } from "./timestamp-shortcuts";
-import { wikilinkPlugin, wikilinkAt } from "./wikilinks";
+import { shortestWikilinkTarget, wikilinkAt, wikilinkPlugin } from "./wikilinks";
 import { sectionBreakPlugin } from "./section-breaks";
 import { yamlBooleanPlugin } from "./yaml-booleans";
 import { livePreviewPlugin } from "./live-preview";
 import { parseVimrc, type ParsedVimrc } from "./vimrc";
 import { wikilinkCompletionSource } from "./wikilink-completion";
+import { slashCompletionSource } from "./slash-commands";
 import type { FileEntry, UserVimrc } from "./types";
+import { smartPasteText } from "./smart-paste";
 
 export type EditorCallbacks = {
   onDirty: (dirty: boolean) => void;
@@ -58,6 +60,7 @@ export type EditorCallbacks = {
   onOpenWikilink: (target: string) => void;
   onDocChange?: () => void;
   onFoldsChanged?: () => void;
+  onSaveAttachments?: (files: File[]) => Promise<string[]>;
 };
 
 export type FoldRange = { from: number; to: number };
@@ -181,7 +184,10 @@ export class NephriteEditor {
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
       markdown(),
       autocompletion({
-        override: [wikilinkCompletionSource(() => this.completionFiles)],
+        override: [
+          slashCompletionSource(),
+          wikilinkCompletionSource(() => this.completionFiles),
+        ],
         activateOnTyping: true,
         maxRenderedOptions: 80,
       }),
@@ -237,6 +243,19 @@ export class NephriteEditor {
           event.preventDefault();
           self.callbacks.onOpenWikilink(target);
           return true;
+        },
+        paste(event, view) {
+          return self.handlePaste(view, event);
+        },
+        drop(event, view) {
+          return self.handleDrop(view, event);
+        },
+        dragover(event) {
+          if (event.dataTransfer?.types.includes("Files")) {
+            event.preventDefault();
+            return true;
+          }
+          return false;
         },
       }),
       EditorView.updateListener.of((u) => {
@@ -541,18 +560,91 @@ export class NephriteEditor {
     return true;
   }
 
+  private handlePaste(view: EditorView, event: ClipboardEvent): boolean {
+    const data = event.clipboardData;
+    if (!data) return false;
+    const images = Array.from(data.files || []).filter((file) => file.type.startsWith("image/"));
+    if (images.length && this.callbacks.onSaveAttachments) {
+      event.preventDefault();
+      void this.insertAttachments(view, images);
+      return true;
+    }
+    const html = data.getData("text/html");
+    const text = data.getData("text/plain");
+    if (!html && !text) return false;
+    const selection = view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to);
+    const next = smartPasteText({ html, text, selection });
+    if (next === text && !html) return false;
+    event.preventDefault();
+    view.dispatch(view.state.replaceSelection(next));
+    return true;
+  }
+
+  private handleDrop(view: EditorView, event: DragEvent): boolean {
+    const files = Array.from(event.dataTransfer?.files ?? []).filter((file) =>
+      file.type.startsWith("image/"),
+    );
+    if (!files.length || !this.callbacks.onSaveAttachments) return false;
+    event.preventDefault();
+    const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+    if (pos != null) {
+      view.dispatch({ selection: { anchor: pos } });
+    }
+    void this.insertAttachments(view, files);
+    return true;
+  }
+
+  private async insertAttachments(view: EditorView, files: File[]): Promise<void> {
+    try {
+      const paths = await this.callbacks.onSaveAttachments?.(files) ?? [];
+      if (!paths.length) return;
+      const snippet = paths
+        .map((path) => `![[${shortestWikilinkTarget(path, [...this.completionFiles, { path }])}]]`)
+        .join("\n");
+      view.dispatch(view.state.replaceSelection(snippet));
+    } catch (error) {
+      this.callbacks.onVimMessage?.(`Could not save attachment: ${String(error)}`, true);
+    }
+  }
+
   private pasteClipboard(view: EditorView): boolean {
     if (!navigator.clipboard) {
       this.callbacks.onVimMessage?.("System clipboard access is unavailable", true);
       return true;
     }
-    void navigator.clipboard.readText().then((content) => {
+    void this.readSmartClipboard().then((content) => {
       view.dispatch(view.state.replaceSelection(content));
     }).catch((error) => {
       console.warn("[vimrc] system clipboard read failed", error);
       this.callbacks.onVimMessage?.("Could not read the system clipboard", true);
     });
     return true;
+  }
+
+  private async readSmartClipboard(): Promise<string> {
+    let html = "";
+    let text = "";
+    if (navigator.clipboard.read) {
+      try {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          if (!html && item.types.includes("text/html")) {
+            html = await (await item.getType("text/html")).text();
+          }
+          if (!text && item.types.includes("text/plain")) {
+            text = await (await item.getType("text/plain")).text();
+          }
+        }
+      } catch {
+        /* fall back to readText */
+      }
+    }
+    if (!text) text = await navigator.clipboard.readText();
+    const selection = this.view.state.sliceDoc(
+      this.view.state.selection.main.from,
+      this.view.state.selection.main.to,
+    );
+    return smartPasteText({ html, text, selection });
   }
 
   setVim(on: boolean) {
@@ -680,6 +772,15 @@ export class NephriteEditor {
     const line = this.view.state.doc.line(Math.max(1, Math.min(lineNumber, this.view.state.doc.lines)));
     this.view.dispatch({ selection: { anchor: line.from }, scrollIntoView: true });
     this.view.focus();
+  }
+
+  getCursor(): number {
+    return this.view.state.selection.main.head;
+  }
+
+  setCursor(position: number) {
+    const anchor = Math.max(0, Math.min(position, this.view.state.doc.length));
+    this.view.dispatch({ selection: { anchor }, scrollIntoView: true });
   }
 
   /** Apply a surgical source edit while retaining the current selection. */

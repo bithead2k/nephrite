@@ -67,8 +67,10 @@ or `{ type: "text" | "markdown", content: "..." }`. Markdown is rendered after
 raw HTML is escaped, so a plugin cannot use a view to escape its sandbox.
 
 Permission grants are tied to the vault, plugin ID, and exact permission set.
-Changing requested permissions requires fresh approval. Plugins can be disabled
-or reloaded through **Manage plugins** in the command bar.
+Changing requested permissions requires fresh approval. Browse, install, enable,
+and remove plugins through **Manage plugins**. Community packages install into
+`.obsidian/plugins/<id>/` and are toggled in `.obsidian/community-plugins.json`,
+the same files Obsidian uses. Plugin `data.json` lives in that folder.
 
 ## Compatibility
 

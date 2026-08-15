@@ -4,6 +4,7 @@ export type CtxTarget = {
   kind: CtxKind;
   /** Vault-relative path; "" for vault root */
   path: string;
+  pinned?: boolean;
 };
 
 export type CtxAction =
@@ -15,6 +16,8 @@ export type CtxAction =
   | "version-history"
   | "open-default-app"
   | "close-tab"
+  | "pin-tab"
+  | "unpin-tab"
   // folder create
   | "new-note"
   | "new-folder"
@@ -81,9 +84,14 @@ function fileItems(): MenuItem[] {
   ];
 }
 
-function tabItems(): MenuItem[] {
+function tabItems(pinned: boolean): MenuItem[] {
   return [
     { type: "item", id: "close-tab", label: "Close tab" },
+    {
+      type: "item",
+      id: pinned ? "unpin-tab" : "pin-tab",
+      label: pinned ? "Unpin tab" : "Pin tab",
+    },
     { type: "sep" },
     ...fileItems().slice(4),
   ];
@@ -91,7 +99,7 @@ function tabItems(): MenuItem[] {
 
 function itemsFor(target: CtxTarget): MenuItem[] {
   if (target.kind === "file") return fileItems();
-  if (target.kind === "tab") return tabItems();
+  if (target.kind === "tab") return tabItems(Boolean(target.pinned));
   // folder + empty (vault root)
   const items = folderItems();
   if (target.kind === "empty") {

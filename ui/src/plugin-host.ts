@@ -1,5 +1,6 @@
 import type { AppCommand } from "./command-bar";
 import type { FileEntry } from "./types";
+import { uiConfirm } from "./dialogs";
 import {
   ObsidianApp,
   permissionForAppMethod,
@@ -22,6 +23,7 @@ export type PluginDescriptor = {
   source: string;
   compatibility?: "nephrite" | "obsidian";
   style?: string | null;
+  enabled?: boolean;
 };
 
 export type PluginStatus = PluginDescriptor & {
@@ -33,13 +35,23 @@ export type PluginStatus = PluginDescriptor & {
 export type PluginHostServices = AppHostServices & {
   listFiles: () => readonly FileEntry[];
   showView: (title: string, result: PluginViewResult) => void;
+  readPluginData?: (id: string) => unknown | Promise<unknown>;
+  writePluginData?: (id: string, value: unknown) => void | Promise<void>;
+  persistPluginEnabled?: (id: string, enabled: boolean) => void | Promise<void>;
 };
 
 export type PluginViewResult = { type?: "text" | "markdown"; content?: string } | string | null;
 
 type Contribution = { id: string; title: string; keywords: string; pluginId: string; kind: "command" | "view" };
 type RpcRequest = { nephritePlugin: true; pluginId: string; type: "request"; requestId: number; method: string; args: unknown[] };
-type PluginMessage = RpcRequest | { nephritePlugin: true; pluginId: string; type: "ready" | "error"; message?: string };
+type PluginMessage = RpcRequest | {
+  nephritePlugin: true;
+  pluginId: string;
+  type: "ready" | "error" | "processor-registered";
+  message?: string;
+  kind?: "post" | "code";
+  language?: string;
+};
 
 export function permissionForPluginMethod(method: string): PluginPermission | null {
   return permissionForAppMethod(method);
@@ -102,8 +114,20 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       create: (path, content = "") => send("vault.create", [path, content]),
       rename: (from, to) => send("vault.rename", [from, to]),
       delete: (path) => send("vault.delete", [path]),
+      exists: (path) => send("vault.exists", [path]),
+      on: eventApi.on,
+      off: eventApi.offref,
+      offref: eventApi.offref,
     }),
     index: Object.freeze({ query: (sql) => send("index.query", [sql]) }),
+    metadata: Object.freeze({
+      page: (path) => send("metadata.page", [path]),
+      resolveLink: (link, sourcePath) => send("metadata.resolveLink", [link, sourcePath]),
+      get resolvedLinks() { return send("metadata.resolvedLinks", []); },
+      on: eventApi.on,
+      off: eventApi.offref,
+      offref: eventApi.offref,
+    }),
     editor: Object.freeze({ getState: () => send("editor.getState", []), replaceSelection: (content) => send("editor.replaceSelection", [content]) }),
     workspace: Object.freeze({
       open: (path) => send("workspace.open", [path]),
@@ -111,14 +135,26 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       executeCommand: (id) => send("workspace.executeCommand", [id]),
       registerCommand,
       registerView,
+      on: eventApi.on,
+      off: eventApi.offref,
+      offref: eventApi.offref,
     }),
+    plugins: Object.freeze({
+      getPlugin: (id) => send("plugins.get", [id]),
+      getPlugins: () => send("plugins.get", []),
+      getService: (id) => send("plugins.getService", [id]),
+      loadData: () => send("plugins.loadData", []),
+      saveData: (value) => send("plugins.saveData", [value]),
+    }),
+    commands: Object.freeze({ executeCommandById: (id) => send("workspace.executeCommand", [id]) }),
+    events: Object.freeze({ on: eventApi.on, off: eventApi.offref, offref: eventApi.offref }),
     shell: Object.freeze({ execute: (command, args = []) => send("shell.execute", [command, args]) }),
   });
   window.nephrite = nephrite;
   const pathOf = (file) => typeof file === "object" && file ? file.path : file;
   const app = window.app = Object.freeze({
     vault: Object.freeze({
-      configDir: ".obsidian",
+      configDir: nephrite.vault.configDir,
       getName: () => "Nephrite vault",
       getMarkdownFiles: () => fileSnapshot.filter((file) => file.file_kind === "markdown" || /\\.md$/i.test(file.path)),
       getFiles: () => fileSnapshot.slice(),
@@ -129,12 +165,14 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       create: nephrite.vault.create,
       delete: (file) => nephrite.vault.delete(pathOf(file)),
       rename: (file, to) => nephrite.vault.rename(pathOf(file), to),
+      exists: (path) => nephrite.vault.exists(path),
       on: eventApi.on,
+      off: eventApi.offref,
       offref: eventApi.offref,
       adapter: Object.freeze({
-        read: nephrite.vault.read,
-        write: nephrite.vault.write,
-        exists: (path) => fileSnapshot.some((file) => file.path === path),
+        read: (path) => nephrite.vault.read(path),
+        write: (path, content) => nephrite.vault.write(path, content),
+        exists: (path) => nephrite.vault.exists(path),
         list: (folder) => ({
           files: fileSnapshot.filter((file) => file.path.startsWith(String(folder).replace(/\\/$/, "") + "/")).map((file) => file.path),
           folders: [],
@@ -154,6 +192,7 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       get resolvedLinks() { return resolvedLinksSnapshot; },
       fileToLinktext: (file) => String(pathOf(file)).replace(/\.md$/i, ""),
       on: eventApi.on,
+      off: eventApi.offref,
       offref: eventApi.offref,
     }),
     workspace: Object.freeze({
@@ -164,6 +203,7 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       getActiveViewOfType: () => null,
       onLayoutReady: (callback) => queueMicrotask(callback),
       on: eventApi.on,
+      off: eventApi.offref,
       offref: eventApi.offref,
     }),
     fileManager: Object.freeze({
@@ -173,10 +213,13 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
         return "[[" + target + (alias ? "|" + alias : "") + "]]";
       },
     }),
-    commands: Object.freeze({ executeCommandById: nephrite.workspace.executeCommand }),
+    commands: Object.freeze({ executeCommandById: (id) => nephrite.workspace.executeCommand(id) }),
     plugins: Object.freeze({
       getPlugin: (id) => send("plugins.get", [id]),
       getPlugins: () => send("plugins.get", []),
+      getService: (id) => send("plugins.getService", [id]),
+      loadData: () => send("plugins.loadData", []),
+      saveData: (value) => send("plugins.saveData", [value]),
     }),
   });
   const disposers = [];
@@ -245,8 +288,17 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
     addRibbonIcon(_icon, _title, callback) { const el = document.createElement("button"); el.addEventListener("click", callback); return el; }
     addStatusBarItem() { return document.createElement("span"); }
     addSettingTab(tab) { return tab; }
-    registerMarkdownPostProcessor(processor) { this._postProcessor = processor; return processor; }
-    registerMarkdownCodeBlockProcessor(language, processor) { this._codeProcessors ||= new Map(); this._codeProcessors.set(language, processor); return processor; }
+    registerMarkdownPostProcessor(processor) {
+      this._postProcessor = processor;
+      parent.postMessage({ nephritePlugin: true, pluginId, type: "processor-registered", kind: "post" }, "*");
+      return processor;
+    }
+    registerMarkdownCodeBlockProcessor(language, processor) {
+      this._codeProcessors ||= new Map();
+      this._codeProcessors.set(language, processor);
+      parent.postMessage({ nephritePlugin: true, pluginId, type: "processor-registered", kind: "code", language }, "*");
+      return processor;
+    }
     async loadData() { return (await send("plugins.loadData", [])) ?? {}; }
     async saveData(value) { return send("plugins.saveData", [value ?? {}]); }
   }
@@ -310,6 +362,25 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       else if (message.type === "unload") for (const handler of unloadHandlers) result = await handler();
       else if (message.type === "command") result = await callbacks.get(message.id)?.();
       else if (message.type === "view") result = await views.get(message.id)?.();
+      else if (message.type === "process-post") {
+        const host = document.createElement("div");
+        host.innerHTML = String(message.html || "");
+        const processor = window.__obsidianPluginInstance?._postProcessor;
+        if (typeof processor === "function") {
+          const ctx = Object.freeze({ sourcePath: message.path || null, containerEl: host, el: host });
+          await processor(host, ctx);
+        }
+        result = host.innerHTML;
+      }
+      else if (message.type === "process-code") {
+        const host = document.createElement("div");
+        const processor = window.__obsidianPluginInstance?._codeProcessors?.get(String(message.language || ""));
+        if (typeof processor === "function") {
+          const ctx = Object.freeze({ sourcePath: message.path || null, containerEl: host, el: host });
+          await processor(String(message.source || ""), host, ctx);
+          result = host.innerHTML;
+        }
+      }
       parent.postMessage({ nephritePlugin: true, pluginId, type: "callback", requestId: message.requestId, result }, "*");
     } catch (error) {
       parent.postMessage({ nephritePlugin: true, pluginId, type: "callback", requestId: message.requestId, error: String(error) }, "*");
@@ -408,6 +479,28 @@ class IsolatedPlugin {
     message.error ? callback.reject(new Error(message.error)) : callback.resolve(message.result);
   }
 
+  /**
+   * Ask the sandbox to run a registered markdown processor over provided HTML.
+   * Post-processors receive (el, ctx) and mutate el; code-block processors
+   * receive (source, el, ctx). The sandbox returns the modified element's HTML.
+   */
+  process(kind: "post" | "code", payload: { html?: string; source?: string; language?: string; path?: string | null }): Promise<string | null> {
+    const requestId = ++this.callbackSequence;
+    return new Promise((resolve, reject) => {
+      this.callbacks.set(requestId, {
+        resolve: (value) => resolve(typeof value === "string" ? value : null),
+        reject,
+      });
+      this.iframe.contentWindow?.postMessage({
+        nephriteHost: true,
+        pluginId: this.descriptor.id,
+        type: kind === "post" ? "process-post" : "process-code",
+        requestId,
+        ...payload,
+      }, "*");
+    });
+  }
+
   async dispose() {
     if (this.ready) await Promise.race([this.invoke("unload"), new Promise((resolve) => setTimeout(resolve, 750))]).catch(() => {});
     this.iframe.remove();
@@ -426,6 +519,8 @@ export class PluginManager {
   private vaultKey = "";
   private listener = (event: MessageEvent) => this.onMessage(event);
   private metadataSnapshot: readonly unknown[] | Promise<readonly unknown[]> | null = null;
+  private postProcessors = new Set<string>();
+  private codeBlockProcessors = new Map<string, string>();
 
   constructor(private services: PluginHostServices, private changed: () => void = () => {}) {
     window.addEventListener("message", this.listener);
@@ -439,32 +534,46 @@ export class PluginManager {
     for (const descriptor of descriptors) {
       const validation = validatePluginDescriptor(descriptor);
       if (validation) continue;
-      if (localStorage.getItem(this.enabledKey(descriptor.id)) === "0") continue;
-      if (!this.permissionsGranted(descriptor)) continue;
+      if (descriptor.compatibility === "obsidian" && descriptor.enabled === false) continue;
+      if (descriptor.compatibility !== "obsidian" && localStorage.getItem(this.enabledKey(descriptor.id)) === "0") continue;
+      if (!(await this.permissionsGranted(descriptor))) continue;
       this.plugins.set(descriptor.id, new IsolatedPlugin(descriptor, this.pluginServices(descriptor), this.changed));
     }
     this.changed();
   }
 
-  private permissionsGranted(descriptor: PluginDescriptor): boolean {
+  private async permissionsGranted(descriptor: PluginDescriptor): Promise<boolean> {
     const signature = [...descriptor.permissions].sort().join(",");
     if (localStorage.getItem(this.grantKey(descriptor.id)) === signature) return true;
     const permissions = descriptor.permissions.length ? descriptor.permissions.join("\n• ") : "No host permissions";
-    const granted = confirm(`Enable plugin “${descriptor.name}” (${descriptor.version})?\n\nRequested permissions:\n• ${permissions}`);
+    const granted = await uiConfirm(
+      `Enable plugin “${descriptor.name}” (${descriptor.version})?\n\nRequested permissions:\n• ${permissions}`,
+      { title: "Plugin permissions" },
+    );
     if (granted) localStorage.setItem(this.grantKey(descriptor.id), signature);
-    else localStorage.setItem(this.enabledKey(descriptor.id), "0");
+    else {
+      localStorage.setItem(this.enabledKey(descriptor.id), "0");
+      await this.services.persistPluginEnabled?.(descriptor.id, false);
+    }
     return granted;
   }
 
   async setEnabled(id: string, enabled: boolean) {
     localStorage.setItem(this.enabledKey(id), enabled ? "1" : "0");
+    const descriptor = this.descriptors.find((item) => item.id === id);
+    if (descriptor) descriptor.enabled = enabled;
+    await this.services.persistPluginEnabled?.(id, enabled);
     if (!enabled) {
       const plugin = this.plugins.get(id);
       if (plugin) await plugin.dispose();
       this.plugins.delete(id);
+      this.postProcessors.delete(id);
+      for (const [language, pluginId] of [...this.codeBlockProcessors]) {
+        if (pluginId === id) this.codeBlockProcessors.delete(language);
+      }
     } else {
       const descriptor = this.descriptors.find((item) => item.id === id);
-      if (descriptor && this.permissionsGranted(descriptor)) {
+      if (descriptor && (await this.permissionsGranted(descriptor))) {
         this.plugins.set(id, new IsolatedPlugin(descriptor, this.pluginServices(descriptor), this.changed));
       }
     }
@@ -476,7 +585,9 @@ export class PluginManager {
       const plugin = this.plugins.get(descriptor.id);
       return {
         ...descriptor,
-        enabled: localStorage.getItem(this.enabledKey(descriptor.id)) !== "0",
+        enabled: descriptor.compatibility === "obsidian"
+          ? descriptor.enabled !== false && localStorage.getItem(this.enabledKey(descriptor.id)) !== "0"
+          : localStorage.getItem(this.enabledKey(descriptor.id)) !== "0",
         loaded: plugin?.ready ?? false,
         error: plugin?.error ?? validatePluginDescriptor(descriptor),
       };
@@ -495,6 +606,49 @@ export class PluginManager {
     })));
   }
 
+  hasPostProcessors(): boolean {
+    return this.postProcessors.size > 0;
+  }
+
+  hasCodeBlockProcessors(): boolean {
+    return this.codeBlockProcessors.size > 0;
+  }
+
+  hasCodeBlockProcessor(language: string): boolean {
+    return this.codeBlockProcessors.has(language);
+  }
+
+  /** Run every registered post-processor over a rendered block, in registration order. */
+  async runPostProcessors(html: string, path: string): Promise<string> {
+    let current = html;
+    for (const pluginId of this.postProcessors) {
+      const plugin = this.plugins.get(pluginId);
+      if (!plugin?.ready) continue;
+      try {
+        const result = await plugin.process("post", { html: current, path });
+        if (typeof result === "string") current = result;
+      } catch (error) {
+        console.warn(`[plugin ${pluginId}] markdown post-processor failed`, error);
+      }
+    }
+    return current;
+  }
+
+  /** Render a code block through the plugin that registered its language. */
+  async runCodeBlockProcessor(language: string, source: string, path: string): Promise<string | null> {
+    const pluginId = this.codeBlockProcessors.get(language);
+    if (!pluginId) return null;
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin?.ready) return null;
+    try {
+      const result = await plugin.process("code", { language, source, path });
+      return typeof result === "string" ? result : null;
+    } catch (error) {
+      console.warn(`[plugin ${pluginId}] code-block processor failed`, error);
+      return null;
+    }
+  }
+
   private async onMessage(event: MessageEvent) {
     const message = event.data as {
       nephritePlugin?: boolean;
@@ -506,6 +660,8 @@ export class PluginManager {
       message?: string;
       method?: string;
       args?: unknown[];
+      kind?: "post" | "code";
+      language?: string;
     };
     if (!message?.nephritePlugin || !message.pluginId) return;
     const plugin = this.plugins.get(message.pluginId);
@@ -519,11 +675,22 @@ export class PluginManager {
       plugin.error = message.message || "Plugin failed to load";
       this.changed();
     } else if (message.type === "callback" && message.requestId != null) plugin.resolveCallback({ requestId: message.requestId, result: message.result, error: message.error });
+    else if (message.type === "processor-registered") {
+      if (message.kind === "post") this.postProcessors.add(message.pluginId);
+      else if (message.kind === "code" && message.language) {
+        const language = message.language.toLowerCase();
+        // Native preview owns mermaid fences; ignore Obsidian mermaid processors.
+        if (language === "mermaid" || language === "mmd") return;
+        this.codeBlockProcessors.set(language, message.pluginId);
+      }
+    }
   }
 
   async unload() {
     await Promise.all([...this.plugins.values()].map((plugin) => plugin.dispose()));
     this.plugins.clear();
+    this.postProcessors.clear();
+    this.codeBlockProcessors.clear();
     this.changed();
   }
 
@@ -537,11 +704,18 @@ export class PluginManager {
     return {
       ...this.services,
       metadataSnapshot: () => this.metadataSnapshot ?? [],
-      loadPluginData: () => {
+      loadPluginData: async () => {
+        if (this.services.readPluginData) return this.services.readPluginData(descriptor.id);
         try { return JSON.parse(localStorage.getItem(dataKey) ?? "null"); }
         catch { return null; }
       },
-      savePluginData: (value) => localStorage.setItem(dataKey, JSON.stringify(value ?? null)),
+      savePluginData: async (value) => {
+        if (this.services.writePluginData) {
+          await this.services.writePluginData(descriptor.id, value);
+          return;
+        }
+        localStorage.setItem(dataKey, JSON.stringify(value ?? null));
+      },
     };
   }
 

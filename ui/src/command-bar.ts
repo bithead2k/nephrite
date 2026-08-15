@@ -1,3 +1,5 @@
+import { uiAlert } from "./dialogs";
+
 export type AppCommand = {
   id: string;
   title: string;
@@ -52,7 +54,7 @@ export function renderCommandBar(
 
   const run = (command: AppCommand) => {
     close();
-    void Promise.resolve(command.run()).catch((error) => window.alert(String(error)));
+    void Promise.resolve(command.run()).catch((error) => void uiAlert(String(error)));
   };
   const draw = () => {
     matches = filterCommands(commands, input.value).slice(0, 80);

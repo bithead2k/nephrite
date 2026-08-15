@@ -14,7 +14,8 @@ import {
   type DvPage,
 } from "../ui/src/dv-engine";
 import { rowToDvPage } from "../ui/src/dv-context";
-import { renderPropertiesHtml, splitFrontmatter } from "../ui/src/frontmatter";
+import { findScalarPropertyEdit, renderPropertiesHtml, splitFrontmatter } from "../ui/src/frontmatter";
+import { splitWikilinkTarget } from "../ui/src/wikilinks";
 import { formatQueryUri } from "../ui/src/query-uri";
 import { renderPreview } from "../ui/src/preview";
 import { extractBlock, extractHeadingSection } from "../ui/src/note-embed";
@@ -65,6 +66,7 @@ import {
   type PluginDescriptor,
 } from "../ui/src/plugin-host";
 import { NephriteApp, ObsidianApp, normalizeAppVaultPath } from "../ui/src/app-api";
+import { mergeTexts, mergeTwoWay } from "../ui/src/file-merge";
 import { findInKanbanLane, kanbanCardSearchText } from "../ui/src/kanban-find";
 import {
   bindScrollSync,
@@ -119,6 +121,20 @@ test("vimrc compatibility evaluates conditionals, variables, execute, and comman
   assert.equal(parsed.settings.relativeLineNumbers, true);
   assert.equal(parsed.settings.shiftWidth, 4);
   assert.deepEqual(parsed.userCommands, [{ name: "SaveNow", command: "write" }]);
+  assert.equal(parsed.skipped.length, 0);
+});
+
+test("vimrc treats common plugin boilerplate as no-ops instead of errors", () => {
+  const parsed = parseVimrc([
+    "syntax on",
+    "filetype plugin indent on",
+    "colorscheme desert",
+    "set nocompatible",
+    "set encoding=utf-8",
+    "autocmd BufWritePost * echom 'saved'",
+    "set number",
+  ].join("\n"));
+  assert.equal(parsed.settings.lineNumbers, true);
   assert.equal(parsed.skipped.length, 0);
 });
 
@@ -734,12 +750,12 @@ test("native SQL fences allow legal Markdown indentation", () => {
   const blocks = extractScriptBlocks([
     " SQL Text Test",
     "",
-    " ```sql",
+    " ```pgsql",
     " SELECT name FROM pages;",
     " ```",
   ].join("\n"));
   assert.equal(blocks.length, 1);
-  assert.equal(blocks[0].lang, "sql");
+  assert.equal(blocks[0].lang, "pgsql");
   assert.match(blocks[0].code, /SELECT name FROM pages/);
 });
 
@@ -764,7 +780,7 @@ test("Dataview default() lowers to nullish coalesce()", () => {
 
   assert.equal(
     lowerDqlFunctionAliases("default(phone, company_phone)"),
-    "coalesce(phone, company_phone)",
+    "helpers.coalesce(phone, company_phone)",
   );
   assert.equal(
     evaluateDql("default(phone, company_phone)", row, current),
@@ -775,14 +791,14 @@ test("Dataview default() lowers to nullish coalesce()", () => {
   assert.equal(evaluateDql("default('', 'fallback')", row, current), "");
   assert.equal(
     lowerDqlFunctionAliases("contains(notes, 'default(phone)')"),
-    "contains(notes, 'default(phone)')",
+    "helpers.contains(notes, 'default(phone)')",
     "function-like text inside a string must remain literal",
   );
 });
 
 test("executable fences render as code elements the executor can discover", () => {
   const markdown = [
-    "```sql",
+    "```pgsql",
     "SELECT title FROM pages;",
     "```",
     "",
@@ -791,10 +807,31 @@ test("executable fences render as code elements the executor can discover", () =
     "```",
   ].join("\n");
   const html = renderPreview(markdown);
-  assert.match(html, /<code class="language-sql">/);
+  assert.match(html, /<code class="language-pgsql">/);
   assert.match(html, /<code class="language-dataviewjs">/);
   assert.match(html, /SELECT title FROM pages/);
   assert.equal(extractScriptBlocks(markdown).length, 2);
+});
+
+test("sql and sqlpostgresql fences are highlighter tags, not query blocks", () => {
+  const markdown = [
+    "```sqlpostgresql",
+    "SELECT name FROM pages;",
+    "```",
+    "",
+    "```sql",
+    "SELECT name FROM pages;",
+    "```",
+    "",
+    "```pgsql",
+    "SELECT name FROM pages;",
+    "```",
+  ].join("\n");
+  const blocks = extractScriptBlocks(markdown);
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].lang, "pgsql");
+  assert.match(renderPreview(markdown), /language-sqlpostgresql/);
+  assert.match(renderPreview(markdown), /language-sql/);
 });
 
 test("Obsidian note embeds render as hydration targets", () => {
@@ -910,6 +947,15 @@ test("task views filter, sort, group, and edit metadata without rewriting task t
   }, new Date(2026, 7, 12, 12));
   assert.deepEqual(selected.map((task) => task.text), ["Today"]);
   assert.deepEqual([...groupTasks(tasks, "path").keys()], ["Work", "Home"]);
+  assert.deepEqual([...groupTasks(tasks, "project").keys()], ["Work", "Home"]);
+  assert.deepEqual(
+    [...groupTasks([
+      { ...tasks[0], recurrence: "every week" },
+      { ...tasks[1], recurrence: "every week" },
+      tasks[2],
+    ], "recurrence").keys()],
+    ["every week", "Not recurring"],
+  );
   assert.deepEqual(
     [...groupTasks(tasks, "agenda", new Date(2026, 7, 12, 12)).keys()],
     ["5 · Later", "2 · Today", "6 · No due date"],
@@ -925,6 +971,59 @@ test("task views filter, sort, group, and edit metadata without rewriting task t
     }),
     "- [ ] Today #work 🔁 every week 🔺 ⏳ 2026-08-14 📅 2026-08-15 ^keep",
   );
+  assert.equal(
+    updateTaskMetadataLine("- [ ] Today #work 📅 2026-08-12 ^keep", {
+      due: "2026-08-15", scheduled: "2026-08-14", priority: "highest", recurrence: "every 3 days",
+    }),
+    "- [ ] Today #work 🔺 🔁 every 3 days ⏳ 2026-08-14 📅 2026-08-15 ^keep",
+  );
+  assert.equal(
+    updateTaskMetadataLine("- [ ] Today #work 🔁 every week 📅 2026-08-12 ^keep", {
+      due: "2026-08-15", scheduled: null, priority: null, recurrence: null,
+    }),
+    "- [ ] Today #work 📅 2026-08-15 ^keep",
+  );
+});
+
+test("surgical YAML scalar property edits replace only the value token", () => {
+  const source = "---\ntitle: My Note\ndone: true\nrating: 4.5\nwhen: 2026-08-14\nlink: [[People/Ada]]\ntags: [a, b, c]\nquoted: \"hello # world\"\n# keep\n---\nBody";
+  const string = findScalarPropertyEdit(source, "title", "Renamed", "string");
+  assert.deepEqual(string, { from: 11, to: 18, insert: "Renamed" });
+  const boolean = findScalarPropertyEdit(source, "done", "false", "boolean");
+  assert.equal(boolean?.insert, "false");
+  assert.ok(boolean && source.slice(boolean.from, boolean.to) === "true");
+  const number = findScalarPropertyEdit(source, "rating", "5", "number");
+  assert.equal(number?.insert, "5");
+  const date = findScalarPropertyEdit(source, "when", "2026-08-20", "date");
+  assert.equal(date?.insert, "2026-08-20");
+  const link = findScalarPropertyEdit(source, "link", "People/Bob", "link");
+  assert.equal(link?.insert, "[[People/Bob]]");
+  const array = findScalarPropertyEdit(source, "tags", "[x, y]", "array");
+  assert.equal(array?.insert, "[x, y]");
+  const quoted = findScalarPropertyEdit(source, "quoted", "plain", "string");
+  assert.equal(quoted?.insert, "plain");
+});
+
+test("surgical YAML scalar edits preserve comments, quoting, and reject block values", () => {
+  const source = "---\ntitle: Note # trailing\ndone: true\nlist:\n  - a\n  - b\n---\nBody";
+  const edit = findScalarPropertyEdit(source, "title", "New", "string");
+  assert.ok(edit);
+  const replaced = source.slice(0, edit.from) + edit.insert + source.slice(edit.to);
+  assert.equal(replaced, "---\ntitle: New # trailing\ndone: true\nlist:\n  - a\n  - b\n---\nBody");
+  const quoted = findScalarPropertyEdit(source, "done", "false", "boolean");
+  assert.equal(quoted?.insert, "false");
+  assert.equal(findScalarPropertyEdit(source, "missing", "x", "string"), null);
+  assert.equal(findScalarPropertyEdit(source, "list", "x", "string"), null);
+});
+
+test("wikilink target splits heading and trailing block refs", () => {
+  assert.deepEqual(splitWikilinkTarget("Projects"), { note: "Projects", heading: null, block: null });
+  assert.deepEqual(splitWikilinkTarget("Projects/Active#Summary"), { note: "Projects/Active", heading: "Summary", block: null });
+  assert.deepEqual(splitWikilinkTarget("Projects#^abc123"), { note: "Projects", heading: null, block: "abc123" });
+  assert.deepEqual(splitWikilinkTarget("Projects#Summary#^abc123"), { note: "Projects", heading: "Summary", block: "abc123" });
+  assert.deepEqual(splitWikilinkTarget("Note#C#section#^b42"), { note: "Note", heading: "C#section", block: "b42" });
+  assert.deepEqual(splitWikilinkTarget("Note#C#section"), { note: "Note", heading: "C#section", block: null });
+  assert.deepEqual(splitWikilinkTarget(" Note # spaced "), { note: "Note", heading: " spaced ", block: null });
 });
 
 test("task scope normalizes folders, tags, and opt-in frontmatter property", () => {
@@ -1023,10 +1122,10 @@ test("Obsidian app aliases inherit Nephrite capability and path security", async
   assert.deepEqual(await app.metadataCache.getFileCache({ path: "People/Ada.md" }), {
     path: "People/Ada.md", frontmatter: { role: "engineer" },
   });
-  assert.equal(app.metadataCache.fileToLinktext({ path: "People/Ada.md" }), "People/Ada");
+  assert.equal(app.metadataCache.fileToLinktext({ path: "People/Ada.md" }), "Ada");
   assert.equal(
     app.fileManager.generateMarkdownLink({ path: "People/Ada.md" }, "Daily.md", "#Work", "Ada"),
-    "[[People/Ada#Work|Ada]]",
+    "[[Ada#Work|Ada]]",
   );
   assert.throws(() => app.vault.read("../outside.md"), /cannot escape/);
   assert.throws(() => app.vault.read(".nephrite/index.db"), /not plugin data/);
@@ -1037,6 +1136,98 @@ test("Obsidian app aliases inherit Nephrite capability and path security", async
     editorState: () => ({ path: null, content: "", selection: "" }), openPath: async () => {},
   }, ["vault.read"]);
   assert.throws(() => readOnly.vault.modify("Note.md", "bad"), /Permission denied: vault.write/);
+});
+
+test("NephriteApp surfaces share one permissioned host and event emitter", async () => {
+  const writes: unknown[][] = [];
+  const events: string[] = [];
+  const app = new NephriteApp({
+    listFiles: () => [
+      { path: "People/Ada.md", name: "Ada.md", parent_path: "People", file_kind: "markdown" },
+      { path: "People/Bob.md", name: "Bob.md", parent_path: "People", file_kind: "markdown" },
+    ],
+    readFile: async (path) => `read:${path}`,
+    writeFile: async (...args) => { writes.push(args); },
+    queryIndex: async () => ({ rows: [] }),
+    pageMetadata: async (path) => ({ path, links: ["People/Bob.md"] }),
+    resolveLink: async () => null,
+    editorState: () => ({ path: "People/Ada.md", content: "", selection: "" }),
+    openPath: async () => {},
+    pluginInfo: (id) => id === "demo" ? { id: "demo" } : null,
+    loadPluginData: () => ({ cached: true }),
+    savePluginData: (value) => { events.push(`save:${JSON.stringify(value)}`); },
+  }, ["vault.read", "vault.write"]);
+  assert.equal(app.vault.configDir, ".obsidian");
+  assert.equal(await app.vault.exists("People/Ada.md"), true);
+  assert.equal(await app.vault.exists("People/Missing.md"), false);
+  assert.deepEqual(await app.plugins.loadData(), { cached: true });
+  await app.plugins.saveData({ key: "v" });
+  assert.deepEqual(events, ['save:{"key":"v"}']);
+  assert.equal(app.plugins.getPlugin("demo")?.id, "demo");
+  assert.equal(app.plugins.getService("demo")?.id, "demo");
+
+  const seen: string[] = [];
+  const ref = app.vault.on("create", (file: { path: string }) => seen.push(file.path));
+  app.events.trigger("create", { path: "People/New.md" });
+  app.events.offref(ref);
+  app.events.trigger("create", { path: "People/Other.md" });
+  assert.deepEqual(seen, ["People/New.md"]);
+});
+
+test("ObsidianApp aliases project the full Obsidian facade over the permission gate", async () => {
+  const opened: string[] = [];
+  const app = new ObsidianApp({
+    listFiles: () => [
+      { path: "People/Ada.md", name: "Ada.md", parent_path: "People", file_kind: "markdown" },
+      { path: "People/Bob.md", name: "Bob.md", parent_path: "People", file_kind: "markdown" },
+      { path: "assets/photo.png", name: "photo.png", parent_path: "assets", file_kind: "attachment" },
+    ],
+    readFile: async (path) => `read:${path}`,
+    queryIndex: async () => ({ rows: [] }),
+    pageMetadata: async (path) => ({ path, links: path === "People/Ada.md" ? ["People/Bob.md"] : [] }),
+    resolveLink: async (link) => link.includes("Bob") ? { path: "People/Bob.md", name: "Bob.md" } : null,
+    editorState: () => ({ path: "People/Ada.md", content: "", selection: "" }),
+    openPath: async (path) => { opened.push(path); },
+    executeCommand: async (id) => { opened.push(`cmd:${id}`); },
+  }, ["vault.read", "editor.read", "workspace.commands"]);
+
+  assert.equal(app.vault.configDir, ".obsidian");
+  assert.equal(app.vault.getName(), "Nephrite vault");
+  assert.equal(await app.vault.exists("People/Bob.md"), true);
+  assert.deepEqual((await app.vault.adapter.list("People") as { files: string[] }).files, ["People/Ada.md", "People/Bob.md"]);
+
+  const resolved = await app.metadataCache.resolvedLinks as Record<string, Record<string, number>>;
+  assert.deepEqual(resolved["People/Ada.md"], { "People/Bob.md": 1 });
+
+  const openedLeaf = await app.workspace.getLeaf().openFile({ path: "People/Bob.md" });
+  assert.deepEqual(opened, ["People/Bob.md"]);
+
+  app.workspace.onLayoutReady(() => opened.push("ready"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(opened.includes("ready"));
+
+  await app.workspace.openLinkText("Bob", "People/Ada.md");
+  assert.deepEqual(opened.slice(-1), ["People/Bob.md"]);
+
+  await app.commands.executeCommandById("nephrite:noop");
+  assert.deepEqual(opened.slice(-1), ["cmd:nephrite:noop"]);
+
+  assert.equal(app.workspace.getLeavesOfType("markdown").length, 0);
+  assert.equal(app.workspace.getActiveViewOfType("markdown"), null);
+});
+
+test("file merge keeps shared prefix/suffix and inserts conflict markers", () => {
+  assert.equal(mergeTexts("same\n", "same\n"), "same\n");
+  assert.equal(mergeTexts("keep\n", "keep\n", "old\n"), "keep\n");
+  assert.equal(mergeTexts("new\n", "old\n", "old\n"), "new\n");
+  assert.equal(mergeTexts("old\n", "incoming\n", "old\n"), "incoming\n");
+  const conflicted = mergeTwoWay("alpha\nours\nomega\n", "alpha\ntheirs\nomega\n");
+  assert.match(conflicted, /<<<<<<< ours/);
+  assert.match(conflicted, /ours/);
+  assert.match(conflicted, /theirs/);
+  assert.match(conflicted, />>>>>>> theirs/);
+  assert.match(conflicted, /^alpha\n/);
+  assert.match(conflicted, /omega\n$/);
 });
 
 test("YAML and query results share field-aware URI and MIME detection", () => {

@@ -9,6 +9,8 @@ import { executeBlocksInPreview } from "./dv-engine";
 import { splitFrontmatter } from "./frontmatter";
 import { hydrateTableOfContents, renderPreview } from "./preview";
 import { hydrateMarkdownImages } from "./image-embed";
+import { hydrateMermaid } from "./mermaid";
+import { hydrateCsvFences } from "./csv-view";
 import type { OpenFile } from "./types";
 
 type BindOptions = {
@@ -131,6 +133,8 @@ async function showPreview(
       makeEngineContext(file.path, file.content, () => {}),
     );
     await hydrateMarkdownImages(page, file.path);
+    hydrateCsvFences(page);
+    await hydrateMermaid(page);
     if (id !== requestId || activeLink !== link) return;
     hydrateTableOfContents(page);
     el.replaceChildren(head, page);

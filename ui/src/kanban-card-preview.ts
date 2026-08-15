@@ -9,6 +9,8 @@ import { splitFrontmatter } from "./frontmatter";
 import { makeEngineContext } from "./dv-context";
 import { executeBlocksInPreview } from "./dv-engine";
 import { hydrateMarkdownImages } from "./image-embed";
+import { hydrateMermaid } from "./mermaid";
+import { hydrateCsvFences } from "./csv-view";
 import type { KanbanCard } from "./kanban";
 
 type OpenFile = { path: string; content: string };
@@ -130,6 +132,8 @@ async function showCardPreview(
     page.innerHTML = body
       ? renderPreview(body.startsWith("---") ? body : body)
       : `<p class="preview-empty">(empty card)</p>`;
+    hydrateCsvFences(page);
+    await hydrateMermaid(page);
     el.replaceChildren(head, page);
     positionPopup(anchorRect, el);
   } catch (error) {
@@ -164,6 +168,8 @@ async function renderNotePreview(
     makeEngineContext(file.path, file.content, openLink),
   );
   await hydrateMarkdownImages(page, file.path);
+  hydrateCsvFences(page);
+  await hydrateMermaid(page);
   hydrateTableOfContents(page);
   el.replaceChildren(head, page);
 

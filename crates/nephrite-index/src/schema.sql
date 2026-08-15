@@ -9,6 +9,16 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
+-- Resumable per-file checkpoints for named feature backfills. Rows exist only
+-- while the owning migration is still pending; completion clears them.
+CREATE TABLE IF NOT EXISTS migration_state (
+    migration_id TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    PRIMARY KEY (migration_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_state_id ON migration_state(migration_id);
+
 CREATE TABLE IF NOT EXISTS files (
     path          TEXT PRIMARY KEY NOT NULL,
     parent_path   TEXT NOT NULL DEFAULT '',

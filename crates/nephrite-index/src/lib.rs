@@ -9,13 +9,22 @@
 
 mod error;
 mod file_kind;
+mod migration;
 mod parse;
 mod pathutil;
+mod resolve;
 mod version;
 
 pub use error::{IndexError, Result};
 pub use file_kind::FileKind;
+use migration::has_migration_state_table;
+pub use migration::{
+    format_count, format_open_action, pending_migrations, plan_open, remaining_for, Migration,
+    OpenPlan, PlannedMigration, MIGRATIONS, MIGRATION_DATAVIEW_INLINE_FIELDS,
+    MIGRATION_LEGACY_02_CANVAS,
+};
 pub use parse::MarkdownFacts;
+pub use resolve::{wikilink_key, IndexedFile, LinkResolver};
 pub use version::{Version, PROJECT_VERSION};
 
 use std::collections::{HashMap, HashSet};
@@ -35,7 +44,6 @@ use pathutil::{
 };
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
-const DATAVIEW_INLINE_FIELDS_VERSION: &str = "1";
 
 pub struct VaultIndex {
     vault_root: PathBuf,
@@ -202,11 +210,6 @@ impl VaultIndex {
         progress: &mut impl FnMut(ProgressPhase, usize, usize, Option<&str>),
     ) -> Result<ReconcileStats> {
         let stored_version = self.stored_project_version()?;
-        let legacy_02_renumbering = stored_version
-            .map(|stored| PROJECT_VERSION.is_legacy_02_renumbering(stored))
-            .unwrap_or(false);
-        let dataview_inline_backfill = self.get_meta("dataview_inline_fields_version")?.as_deref()
-            != Some(DATAVIEW_INLINE_FIELDS_VERSION);
         let needs_rebuild = match stored_version {
             None => true, // empty or brand-new db content
             Some(stored) => PROJECT_VERSION.requires_rebuild(stored),
@@ -221,6 +224,25 @@ impl VaultIndex {
 
         if needs_rebuild {
             return self.full_rebuild_with_progress(progress);
+        }
+
+        // Feature backfills that still need to run, in registry order.
+        let pending = pending_migrations(&self.conn)?;
+        let has_state = has_migration_state_table(&self.conn)?;
+        // Per-migration set of paths already backfilled (resumable checkpoints).
+        let mut migration_done: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        if has_state {
+            for migration in &pending {
+                let mut done = HashSet::new();
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT path FROM migration_state WHERE migration_id = ?1")?;
+                let rows = stmt.query_map(params![migration.id], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    done.insert(row?);
+                }
+                migration_done.insert(migration.id, done);
+            }
         }
 
         progress(ProgressPhase::Scan, 0, 0, Some("listing vault files"));
@@ -256,32 +278,33 @@ impl VaultIndex {
 
         let total = disk.len();
         let mut disk_paths: HashSet<String> = HashSet::new();
+        // Re-index in batches so a backfill over a large vault commits in a
+        // single transaction per chunk instead of one per file.
+        let mut batch: Vec<String> = Vec::new();
         for (rel, mtime_ms, size_bytes) in &disk {
             stats.scanned += 1;
             disk_paths.insert(rel.clone());
-            let canvas_backfill = legacy_02_renumbering
-                && Path::new(rel)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("canvas"));
-            let inline_field_backfill = dataview_inline_backfill
-                && Path::new(rel)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
-            match index_meta.get(rel) {
-                Some((im, is))
-                    if *im == *mtime_ms
-                        && *is == *size_bytes
-                        && !canvas_backfill
-                        && !inline_field_backfill =>
-                {
-                    stats.unchanged += 1;
-                }
-                _ => {
-                    self.index_path(rel)?;
-                    stats.updated += 1;
-                }
+            // Any pending migration needs this file re-parsed and it hasn't
+            // been checkpointed yet?
+            let backfill_needed = pending.iter().any(|migration| {
+                (migration.targets)(Path::new(rel))
+                    && !migration_done
+                        .get(migration.id)
+                        .is_some_and(|done| done.contains(rel))
+            });
+            let reindex = match index_meta.get(rel) {
+                Some((im, is)) if *im == *mtime_ms && *is == *size_bytes => backfill_needed,
+                _ => true,
+            };
+            if reindex {
+                batch.push(rel.clone());
+                stats.updated += 1;
+            } else {
+                stats.unchanged += 1;
+            }
+            if batch.len() >= 500 {
+                self.reindex_and_checkpoint(&batch, &pending, &mut migration_done, has_state)?;
+                batch.clear();
             }
             if stats.scanned.is_multiple_of(50) || stats.scanned == total {
                 progress(
@@ -291,6 +314,10 @@ impl VaultIndex {
                     Some(rel.as_str()),
                 );
             }
+        }
+        if !batch.is_empty() {
+            self.reindex_and_checkpoint(&batch, &pending, &mut migration_done, has_state)?;
+            batch.clear();
         }
 
         for path in index_meta.keys() {
@@ -306,13 +333,28 @@ impl VaultIndex {
             progress(ProgressPhase::Resolve, 1, 1, None);
         }
 
+        // Complete migrations whose targeted files are all checkpointed.
+        for migration in &pending {
+            let all_done = disk.iter().all(|(rel, _, _)| {
+                !(migration.targets)(Path::new(rel))
+                    || migration_done
+                        .get(migration.id)
+                        .is_some_and(|done| done.contains(rel))
+            });
+            if all_done {
+                (migration.complete)(&self.conn)?;
+                if has_state {
+                    self.conn.execute(
+                        "DELETE FROM migration_state WHERE migration_id = ?1",
+                        params![migration.id],
+                    )?;
+                }
+            }
+        }
+
         let now = now_ms();
         self.set_meta("last_open_reconcile_ms", &now.to_string())?;
         self.write_project_version_meta()?;
-        self.set_meta(
-            "dataview_inline_fields_version",
-            DATAVIEW_INLINE_FIELDS_VERSION,
-        )?;
         Ok(stats)
     }
 
@@ -344,6 +386,7 @@ impl VaultIndex {
             DELETE FROM aliases;
             DELETE FROM files;
             DELETE FROM files_fts;
+            DELETE FROM migration_state;
             ",
         )?;
 
@@ -359,11 +402,16 @@ impl VaultIndex {
             removed: 0,
             full_rebuild: true,
         };
+        let mut batch: Vec<String> = Vec::new();
         for (i, (rel, _, _)) in disk.iter().enumerate() {
-            self.index_path(rel)?;
+            batch.push(rel.clone());
             stats.updated += 1;
             let done = i + 1;
-            if done % 25 == 0 || done == total {
+            if batch.len() >= 500 || done == total {
+                self.reindex_batch(&batch)?;
+                batch.clear();
+            }
+            if done.is_multiple_of(25) || done == total {
                 progress(ProgressPhase::Index, done, total, Some(rel.as_str()));
             }
         }
@@ -371,10 +419,10 @@ impl VaultIndex {
         self.resolve_all_links()?;
         progress(ProgressPhase::Resolve, 1, 1, None);
         self.write_project_version_meta()?;
-        self.set_meta(
-            "dataview_inline_fields_version",
-            DATAVIEW_INLINE_FIELDS_VERSION,
-        )?;
+        // A full rebuild re-parses every file, so every named migration is done.
+        for migration in MIGRATIONS {
+            (migration.complete)(&self.conn)?;
+        }
         self.set_meta("last_open_reconcile_ms", &now_ms().to_string())?;
         Ok(stats)
     }
@@ -400,320 +448,63 @@ impl VaultIndex {
         if !abs.is_file() {
             return self.remove_path(&rel);
         }
-
-        let meta = fs::metadata(&abs)?;
-        let mtime_ms = mtime_to_ms(meta.modified().ok());
-        let size_bytes = meta.len() as i64;
-        let name = name_of(&rel).to_string();
-        let (stem, extension) = stem_ext(&name);
-        let kind = FK::from_extension(&extension);
-        let parent = parent_of(&rel);
-        let indexed_at = now_ms();
-
-        let text_attachment = is_text_attachment(&extension) && size_bytes <= 8 * 1024 * 1024;
-        let content = if matches!(kind, FK::Markdown | FK::Canvas) || text_attachment {
-            markdown_content
-                .map(str::to_owned)
-                .unwrap_or_else(|| fs::read_to_string(&abs).unwrap_or_default())
-        } else {
-            String::new()
-        };
-        let content_hash = if matches!(kind, FK::Markdown | FK::Canvas) || text_attachment {
-            Some(hash_str(&content))
-        } else {
-            None
-        };
-
+        let prepared = prepare_file(&self.vault_root, &rel, markdown_content)?;
         let tx = self.conn.unchecked_transaction()?;
-        // CASCADE clears dependents
-        tx.execute("DELETE FROM files WHERE path = ?1", params![rel])?;
-        // FTS row
-        tx.execute("DELETE FROM files_fts WHERE path = ?1", params![rel])?;
+        write_file_index(&tx, &prepared)?;
+        tx.commit()?;
+        Ok(())
+    }
 
-        // Search text only. File/page identity is always the vault-relative
-        // path; filename stem is indexed here solely for discoverability.
-        let search_title = if kind == FK::Markdown {
-            stem.clone()
-        } else {
-            name.clone()
-        };
+    /// Re-index many vault-relative paths inside one transaction. Used by
+    /// reconcile so a migration backfill over a large vault commits in
+    /// batches instead of once per file.
+    fn reindex_batch(&mut self, rels: &[String]) -> Result<()> {
+        let mut empty = HashMap::new();
+        self.reindex_and_checkpoint(rels, &[], &mut empty, false)
+    }
 
-        tx.execute(
-            "INSERT INTO files(
-                path, parent_path, name, stem, extension, file_kind,
-                mtime_ms, size_bytes, content_hash, parse_version, frontmatter_raw, indexed_at_ms
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
-                rel,
-                parent,
-                name,
-                stem,
-                extension,
-                kind.as_str(),
-                mtime_ms,
-                size_bytes,
-                content_hash,
-                PROJECT_VERSION.major as i64,
-                Option::<String>::None,
-                indexed_at,
-            ],
-        )?;
-
-        if !matches!(kind, FK::Markdown | FK::Canvas | FK::Excalidraw) {
-            let (mime_type, width, height) = attachment_metadata(&abs, &extension);
-            tx.execute(
-                "INSERT INTO attachment_metadata(path, mime_type, width, height, text_indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    rel,
-                    mime_type,
-                    width,
-                    height,
-                    if text_attachment { 1 } else { 0 }
-                ],
-            )?;
+    /// Re-index a batch and record resumable backfill checkpoints in the same
+    /// committed transaction. An interruption then resumes after the last
+    /// finished chunk instead of restarting the whole job or losing a
+    /// completed parse.
+    fn reindex_and_checkpoint(
+        &mut self,
+        rels: &[String],
+        pending: &[&'static Migration],
+        done: &mut HashMap<&'static str, HashSet<String>>,
+        has_state: bool,
+    ) -> Result<()> {
+        let mut prepared: Vec<PreparedFile> = Vec::with_capacity(rels.len());
+        for rel in rels {
+            let rel = normalize_rel(rel)?;
+            if should_skip_rel(&rel) {
+                continue;
+            }
+            match prepare_file(&self.vault_root, &rel, None) {
+                Ok(file) => prepared.push(file),
+                Err(_) => continue, // file vanished between scan and write
+            }
         }
-
-        if kind == FK::Markdown {
-            let facts = parse_markdown(&content);
-            if let Some(ref fm) = facts.frontmatter_raw {
-                tx.execute(
-                    "UPDATE files SET frontmatter_raw = ?1 WHERE path = ?2",
-                    params![fm, rel],
-                )?;
-            }
-            if let Some(ref json) = facts.frontmatter_json {
-                tx.execute(
-                    "INSERT INTO file_frontmatter(path, json) VALUES (?1, ?2)",
-                    params![rel, json],
-                )?;
-            }
-            // Dedupe prop_path (YAML parser may emit the same path twice).
-            let mut seen_props = HashSet::new();
-            for p in &facts.properties {
-                if !seen_props.insert(p.prop_path.as_str()) {
-                    continue;
-                }
-                tx.execute(
-                    "INSERT OR REPLACE INTO properties(
-                        path, prop_path, prop_key, value_type, value_text, value_num, value_bool, value_json, is_leaf
-                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                    params![
-                        rel,
-                        p.prop_path,
-                        p.prop_key,
-                        p.value_type,
-                        p.value_text,
-                        p.value_num,
-                        p.value_bool.map(|b| if b { 1 } else { 0 }),
-                        p.value_json,
-                        if p.is_leaf { 1 } else { 0 },
-                    ],
-                )?;
-            }
-            for h in &facts.headings {
-                tx.execute(
-                    "INSERT INTO headings(
-                        path, heading_id, level, text, slug, start_offset, end_offset, start_line
-                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![
-                        rel,
-                        h.heading_id,
-                        h.level,
-                        h.text,
-                        h.slug,
-                        h.start_offset,
-                        h.end_offset,
-                        h.start_line,
-                    ],
-                )?;
-            }
-            for l in &facts.links {
-                tx.execute(
-                    "INSERT INTO links(
-                        path, link_id, target_raw, target_path, target_heading, target_block,
-                        display_text, link_kind, is_embed, start_offset, end_offset
-                    ) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10)",
-                    params![
-                        rel,
-                        l.link_id,
-                        l.target_raw,
-                        l.target_heading,
-                        l.target_block,
-                        l.display_text,
-                        l.link_kind,
-                        if l.is_embed { 1 } else { 0 },
-                        l.start_offset,
-                        l.end_offset,
-                    ],
-                )?;
-            }
-            for t in &facts.tags {
-                tx.execute(
-                    "INSERT OR IGNORE INTO tags(path, tag, tag_head, source, start_offset, line)
-                     VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![
-                        rel,
-                        t.tag,
-                        t.tag_head,
-                        t.source,
-                        t.start_offset.unwrap_or(-1),
-                        t.line.unwrap_or(0),
-                    ],
-                )?;
-            }
-            for t in &facts.tasks {
-                tx.execute(
-                    "INSERT INTO tasks(
-                        path, task_id, status, status_char, text, raw_line, line,
-                        start_offset, end_offset, completed, list_indent, is_recurring,
-                        due, scheduled, start_date, done_date, created_date, priority,
-                        recurrence, tags_json
-                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-                    params![
-                        rel,
-                        t.task_id,
-                        t.status,
-                        t.status_char,
-                        t.text,
-                        t.raw_line,
-                        t.line,
-                        t.start_offset,
-                        t.end_offset,
-                        if t.completed { 1 } else { 0 },
-                        t.list_indent,
-                        if t.recurrence.is_some() { 1 } else { 0 },
-                        t.due,
-                        t.scheduled,
-                        t.start_date,
-                        t.done_date,
-                        t.created_date,
-                        t.priority,
-                        t.recurrence,
-                        t.tags_json,
-                    ],
-                )?;
-            }
-            for field in &facts.inline_fields {
-                tx.execute(
-                    "INSERT INTO inline_fields(
-                        path, field_id, key, value_text, value_type, value_json, line, start_offset
-                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![
-                        rel,
-                        field.field_id,
-                        field.key,
-                        field.value_text,
-                        field.value_type,
-                        field.value_json,
-                        field.line,
-                        field.start_offset,
-                    ],
-                )?;
-            }
-
-            let tag_str: String = facts
-                .tags
-                .iter()
-                .map(|t| t.tag.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            tx.execute(
-                "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    rel,
-                    search_title,
-                    facts.heading_texts_for_fts,
-                    facts.body_for_fts,
-                    tag_str
-                ],
-            )?;
-        } else if kind == FK::Canvas {
-            let value: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
-            let mut canvas_text = Vec::new();
-            for node in value
-                .get("nodes")
-                .and_then(|nodes| nodes.as_array())
-                .into_iter()
-                .flatten()
-            {
-                let node_id = node
-                    .get("id")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default();
-                if node_id.is_empty() {
-                    continue;
-                }
-                let node_type = node
-                    .get("type")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or("text");
-                let file_path = node.get("file").and_then(|item| item.as_str());
-                let text = node
-                    .get("text")
-                    .or_else(|| node.get("label"))
-                    .or_else(|| node.get("url"))
-                    .and_then(|item| item.as_str());
-                if let Some(value) = text {
-                    canvas_text.push(value);
-                }
-                if let Some(value) = file_path {
-                    canvas_text.push(value);
-                }
-                tx.execute(
-                    "INSERT INTO canvas_nodes(path, node_id, node_type, file_path, text, x, y, width, height)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                    params![
-                        rel, node_id, node_type, file_path, text,
-                        node.get("x").and_then(|item| item.as_f64()),
-                        node.get("y").and_then(|item| item.as_f64()),
-                        node.get("width").and_then(|item| item.as_f64()),
-                        node.get("height").and_then(|item| item.as_f64()),
-                    ],
-                )?;
-            }
-            for edge in value
-                .get("edges")
-                .and_then(|edges| edges.as_array())
-                .into_iter()
-                .flatten()
-            {
-                let edge_id = edge
-                    .get("id")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default();
-                let from_node = edge
-                    .get("fromNode")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default();
-                let to_node = edge
-                    .get("toNode")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or_default();
-                if edge_id.is_empty() || from_node.is_empty() || to_node.is_empty() {
-                    continue;
-                }
-                let label = edge.get("label").and_then(|item| item.as_str());
-                if let Some(value) = label {
-                    canvas_text.push(value);
-                }
-                tx.execute(
-                    "INSERT INTO canvas_edges(path, edge_id, from_node, to_node, label)
-                     VALUES (?1,?2,?3,?4,?5)",
-                    params![rel, edge_id, from_node, to_node, label],
-                )?;
-            }
-            tx.execute(
-                "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,'',?3, '')",
-                params![rel, search_title, canvas_text.join(" ")],
-            )?;
-        } else if !matches!(kind, FK::Excalidraw) {
-            tx.execute(
-                "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,'',?3,'')",
-                params![rel, search_title, content],
-            )?;
+        if prepared.is_empty() && (!has_state || pending.is_empty()) {
+            return Ok(());
         }
-
+        let tx = self.conn.unchecked_transaction()?;
+        for file in &prepared {
+            write_file_index(&tx, file)?;
+        }
+        if has_state && !pending.is_empty() {
+            for rel in rels {
+                for migration in pending {
+                    if (migration.targets)(Path::new(rel)) {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO migration_state(migration_id, path) VALUES (?1, ?2)",
+                            params![migration.id, rel],
+                        )?;
+                        done.entry(migration.id).or_default().insert(rel.clone());
+                    }
+                }
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -778,29 +569,9 @@ impl VaultIndex {
         Ok(out)
     }
 
-    /// Resolve `links.target_path` by stem / path / alias match.
+    /// Resolve `links.target_path` with Obsidian's vault-global search path.
     pub fn resolve_all_links(&self) -> Result<()> {
-        // Build stem → paths map
-        let mut by_stem: HashMap<String, Vec<String>> = HashMap::new();
-        {
-            let mut stmt = self.conn.prepare("SELECT path, stem FROM files")?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            for row in rows {
-                let (path, stem) = row?;
-                by_stem.entry(stem).or_default().push(path.clone());
-                by_stem.entry(path.clone()).or_default().push(path.clone());
-                if let Some(name) = path.rsplit('/').next() {
-                    by_stem
-                        .entry(name.to_string())
-                        .or_default()
-                        .push(path.clone());
-                }
-                if let Some(no_ext) = path.strip_suffix(".md") {
-                    by_stem.entry(no_ext.to_string()).or_default().push(path);
-                }
-            }
-        }
+        let resolver = self.link_resolver()?;
 
         let mut stmt = self
             .conn
@@ -816,13 +587,33 @@ impl VaultIndex {
             let mut upd =
                 tx.prepare("UPDATE links SET target_path = ?1 WHERE path = ?2 AND link_id = ?3")?;
             for (src, link_id, target_raw) in rows {
-                let key = target_raw.trim().trim_end_matches(".md").replace('\\', "/");
-                let resolved = resolve_target(&key, &src, &by_stem);
+                let resolved = resolver.resolve(&target_raw, Some(&src));
                 upd.execute(params![resolved, src, link_id])?;
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Build the Obsidian-order link resolver from the current index.
+    pub fn link_resolver(&self) -> Result<LinkResolver> {
+        let mut files_stmt = self.conn.prepare("SELECT path, name, stem FROM files")?;
+        let files = files_stmt
+            .query_map([], |r| {
+                Ok(IndexedFile::new(
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(files_stmt);
+
+        let mut alias_stmt = self.conn.prepare("SELECT alias, path FROM aliases")?;
+        let aliases = alias_stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(LinkResolver::new(files, aliases))
     }
 
     /// Count rows helper for tests / CLI.
@@ -857,39 +648,374 @@ impl VaultIndex {
     }
 }
 
-fn resolve_target(
-    key: &str,
-    from_path: &str,
-    by_stem: &std::collections::HashMap<String, Vec<String>>,
-) -> Option<String> {
-    if key.is_empty() {
-        return None;
+/// Everything `write_file_index` needs: filesystem metadata plus the parsed
+/// content bytes, prepared before a transaction is opened.
+struct PreparedFile {
+    rel: String,
+    abs: PathBuf,
+    mtime_ms: i64,
+    size_bytes: i64,
+    name: String,
+    stem: String,
+    extension: String,
+    kind: FK,
+    parent: String,
+    indexed_at: i64,
+    text_attachment: bool,
+    content_hash: Option<String>,
+    content: String,
+    search_title: String,
+}
+
+/// Read filesystem metadata and content for a single path. Callers that can
+/// provide the Markdown bytes (saves) pass them to avoid a redundant disk read.
+fn prepare_file(
+    vault_root: &Path,
+    rel: &str,
+    markdown_content: Option<&str>,
+) -> Result<PreparedFile> {
+    let abs = abs_from_rel(vault_root, rel)?;
+    let meta = fs::metadata(&abs)?;
+    let mtime_ms = mtime_to_ms(meta.modified().ok());
+    let size_bytes = meta.len() as i64;
+    let name = name_of(rel).to_string();
+    let (stem, extension) = stem_ext(&name);
+    let kind = FK::from_extension(&extension);
+    let parent = parent_of(rel);
+    let indexed_at = now_ms();
+
+    let text_attachment = is_text_attachment(&extension) && size_bytes <= 8 * 1024 * 1024;
+    let content = if matches!(kind, FK::Markdown | FK::Canvas) || text_attachment {
+        markdown_content
+            .map(str::to_owned)
+            .unwrap_or_else(|| fs::read_to_string(&abs).unwrap_or_default())
+    } else {
+        String::new()
+    };
+    let content_hash = if matches!(kind, FK::Markdown | FK::Canvas) || text_attachment {
+        Some(hash_str(&content))
+    } else {
+        None
+    };
+
+    let search_title = if kind == FK::Markdown {
+        stem.clone()
+    } else {
+        name.clone()
+    };
+
+    Ok(PreparedFile {
+        rel: rel.to_string(),
+        abs,
+        mtime_ms,
+        size_bytes,
+        name,
+        stem,
+        extension,
+        kind,
+        parent,
+        indexed_at,
+        text_attachment,
+        content_hash,
+        content,
+        search_title,
+    })
+}
+
+/// Write a fully-prepared file into the index inside the caller's transaction.
+fn write_file_index(tx: &rusqlite::Transaction, file: &PreparedFile) -> Result<()> {
+    let rel = &file.rel;
+    // CASCADE clears dependents
+    tx.execute("DELETE FROM files WHERE path = ?1", params![rel])?;
+    // FTS row
+    tx.execute("DELETE FROM files_fts WHERE path = ?1", params![rel])?;
+
+    tx.execute(
+        "INSERT INTO files(
+            path, parent_path, name, stem, extension, file_kind,
+            mtime_ms, size_bytes, content_hash, parse_version, frontmatter_raw, indexed_at_ms
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![
+            rel,
+            file.parent,
+            file.name,
+            file.stem,
+            file.extension,
+            file.kind.as_str(),
+            file.mtime_ms,
+            file.size_bytes,
+            file.content_hash,
+            PROJECT_VERSION.major as i64,
+            Option::<String>::None,
+            file.indexed_at,
+        ],
+    )?;
+
+    if !matches!(file.kind, FK::Markdown | FK::Canvas | FK::Excalidraw) {
+        let (mime_type, width, height) = attachment_metadata(&file.abs, &file.extension);
+        tx.execute(
+            "INSERT INTO attachment_metadata(path, mime_type, width, height, text_indexed)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                rel,
+                mime_type,
+                width,
+                height,
+                if file.text_attachment { 1 } else { 0 }
+            ],
+        )?;
     }
-    // exact path
-    if let Some(paths) = by_stem.get(key) {
-        if paths.len() == 1 {
-            return Some(paths[0].clone());
+
+    if file.kind == FK::Markdown {
+        let facts = parse_markdown(&file.content);
+        if let Some(ref fm) = facts.frontmatter_raw {
+            tx.execute(
+                "UPDATE files SET frontmatter_raw = ?1 WHERE path = ?2",
+                params![fm, rel],
+            )?;
         }
-        // prefer same folder
-        let parent = parent_of(from_path);
-        if let Some(p) = paths.iter().find(|p| parent_of(p) == parent) {
-            return Some(p.clone());
+        if let Some(ref json) = facts.frontmatter_json {
+            tx.execute(
+                "INSERT INTO file_frontmatter(path, json) VALUES (?1, ?2)",
+                params![rel, json],
+            )?;
         }
-        return Some(paths[0].clone());
+        // Dedupe prop_path (YAML parser may emit the same path twice).
+        let mut seen_props = HashSet::new();
+        for p in &facts.properties {
+            if !seen_props.insert(p.prop_path.as_str()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO properties(
+                    path, prop_path, prop_key, value_type, value_text, value_num, value_bool, value_json, is_leaf
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    rel,
+                    p.prop_path,
+                    p.prop_key,
+                    p.value_type,
+                    p.value_text,
+                    p.value_num,
+                    p.value_bool.map(|b| if b { 1 } else { 0 }),
+                    p.value_json,
+                    if p.is_leaf { 1 } else { 0 },
+                ],
+            )?;
+        }
+        for h in &facts.headings {
+            tx.execute(
+                "INSERT INTO headings(
+                    path, heading_id, level, text, slug, start_offset, end_offset, start_line
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    rel,
+                    h.heading_id,
+                    h.level,
+                    h.text,
+                    h.slug,
+                    h.start_offset,
+                    h.end_offset,
+                    h.start_line,
+                ],
+            )?;
+        }
+        for l in &facts.links {
+            tx.execute(
+                "INSERT INTO links(
+                    path, link_id, target_raw, target_path, target_heading, target_block,
+                    display_text, link_kind, is_embed, start_offset, end_offset
+                ) VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    rel,
+                    l.link_id,
+                    l.target_raw,
+                    l.target_heading,
+                    l.target_block,
+                    l.display_text,
+                    l.link_kind,
+                    if l.is_embed { 1 } else { 0 },
+                    l.start_offset,
+                    l.end_offset,
+                ],
+            )?;
+        }
+        for t in &facts.tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO tags(path, tag, tag_head, source, start_offset, line)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    rel,
+                    t.tag,
+                    t.tag_head,
+                    t.source,
+                    t.start_offset.unwrap_or(-1),
+                    t.line.unwrap_or(0),
+                ],
+            )?;
+        }
+        for t in &facts.tasks {
+            tx.execute(
+                "INSERT INTO tasks(
+                    path, task_id, status, status_char, text, raw_line, line,
+                    start_offset, end_offset, completed, list_indent, is_recurring,
+                    due, scheduled, start_date, done_date, created_date, priority,
+                    recurrence, tags_json
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                params![
+                    rel,
+                    t.task_id,
+                    t.status,
+                    t.status_char,
+                    t.text,
+                    t.raw_line,
+                    t.line,
+                    t.start_offset,
+                    t.end_offset,
+                    if t.completed { 1 } else { 0 },
+                    t.list_indent,
+                    if t.recurrence.is_some() { 1 } else { 0 },
+                    t.due,
+                    t.scheduled,
+                    t.start_date,
+                    t.done_date,
+                    t.created_date,
+                    t.priority,
+                    t.recurrence,
+                    t.tags_json,
+                ],
+            )?;
+        }
+        for field in &facts.inline_fields {
+            tx.execute(
+                "INSERT INTO inline_fields(
+                    path, field_id, key, value_text, value_type, value_json, line, start_offset
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    rel,
+                    field.field_id,
+                    field.key,
+                    field.value_text,
+                    field.value_type,
+                    field.value_json,
+                    field.line,
+                    field.start_offset,
+                ],
+            )?;
+        }
+
+        let tag_str: String = facts
+            .tags
+            .iter()
+            .map(|t| t.tag.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        tx.execute(
+            "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                rel,
+                file.search_title,
+                facts.heading_texts_for_fts,
+                facts.body_for_fts,
+                tag_str
+            ],
+        )?;
+    } else if file.kind == FK::Canvas {
+        let value: serde_json::Value = serde_json::from_str(&file.content).unwrap_or_default();
+        let mut canvas_text = Vec::new();
+        let mut canvas_link_id = 0i64;
+        for node in value
+            .get("nodes")
+            .and_then(|nodes| nodes.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let node_id = node
+                .get("id")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default();
+            if node_id.is_empty() {
+                continue;
+            }
+            let node_type = node
+                .get("type")
+                .and_then(|item| item.as_str())
+                .unwrap_or("text");
+            let file_path = node.get("file").and_then(|item| item.as_str());
+            let text = node
+                .get("text")
+                .or_else(|| node.get("label"))
+                .or_else(|| node.get("url"))
+                .and_then(|item| item.as_str());
+            if let Some(value) = text {
+                canvas_text.push(value);
+            }
+            if let Some(value) = file_path {
+                canvas_text.push(value);
+                canvas_link_id += 1;
+                tx.execute(
+                    "INSERT INTO links(
+                        path, link_id, target_raw, target_path, target_heading, target_block,
+                        display_text, link_kind, is_embed, start_offset, end_offset
+                    ) VALUES (?1,?2,?3,NULL,NULL,NULL,?4,'canvas',1,0,0)",
+                    params![rel, canvas_link_id, value, node_id],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO canvas_nodes(path, node_id, node_type, file_path, text, x, y, width, height)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    rel, node_id, node_type, file_path, text,
+                    node.get("x").and_then(|item| item.as_f64()),
+                    node.get("y").and_then(|item| item.as_f64()),
+                    node.get("width").and_then(|item| item.as_f64()),
+                    node.get("height").and_then(|item| item.as_f64()),
+                ],
+            )?;
+        }
+        for edge in value
+            .get("edges")
+            .and_then(|edges| edges.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let edge_id = edge
+                .get("id")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default();
+            let from_node = edge
+                .get("fromNode")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default();
+            let to_node = edge
+                .get("toNode")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default();
+            if edge_id.is_empty() || from_node.is_empty() || to_node.is_empty() {
+                continue;
+            }
+            let label = edge.get("label").and_then(|item| item.as_str());
+            if let Some(value) = label {
+                canvas_text.push(value);
+            }
+            tx.execute(
+                "INSERT INTO canvas_edges(path, edge_id, from_node, to_node, label)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![rel, edge_id, from_node, to_node, label],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,'',?3, '')",
+            params![rel, file.search_title, canvas_text.join(" ")],
+        )?;
+    } else if !matches!(file.kind, FK::Excalidraw) {
+        tx.execute(
+            "INSERT INTO files_fts(path, title, headings, body, tags) VALUES (?1,?2,'',?3,'')",
+            params![rel, file.search_title, file.content],
+        )?;
     }
-    // basename
-    let base = key.rsplit('/').next().unwrap_or(key);
-    if let Some(paths) = by_stem.get(base) {
-        if paths.len() == 1 {
-            return Some(paths[0].clone());
-        }
-        let parent = parent_of(from_path);
-        if let Some(p) = paths.iter().find(|p| parent_of(p) == parent) {
-            return Some(p.clone());
-        }
-        return paths.first().cloned();
-    }
-    None
+
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -1168,6 +1294,40 @@ Rating:: 5
     }
 
     #[test]
+    fn resolve_all_links_uses_obsidian_vault_global_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        fs::create_dir_all(vault.join("Folder")).unwrap();
+        fs::write(vault.join("A.md"), "root A\n").unwrap();
+        fs::write(vault.join("Folder/A.md"), "folder A\n").unwrap();
+        fs::write(
+            vault.join("Folder/B.md"),
+            "[[A]]\n[[./A]]\n[[/A]]\n[[Missing]]\n",
+        )
+        .unwrap();
+
+        let (idx, _) = VaultIndex::open(vault).unwrap();
+        let targets: Vec<(String, Option<String>)> = idx
+            .connection()
+            .prepare("SELECT target_raw, target_path FROM links WHERE path = 'Folder/B.md' ORDER BY link_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![
+                ("A".into(), Some("A.md".into())),
+                ("./A".into(), Some("Folder/A.md".into())),
+                ("/A".into(), Some("A.md".into())),
+                ("Missing".into(), None),
+            ]
+        );
+    }
+
+    #[test]
     fn minor_meta_update_does_not_force_logic_error() {
         // Documented contract: same major ⇒ requires_rebuild is false.
         assert!(!PROJECT_VERSION.requires_rebuild(Version::new(PROJECT_VERSION.major, 0)));
@@ -1202,6 +1362,69 @@ Rating:: 5
     }
 
     #[test]
+    fn migration_backfill_is_resumable_and_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path();
+        fs::write(vault.join("A.md"), "a:: 1\n").unwrap();
+        fs::write(vault.join("B.md"), "b:: 2\n").unwrap();
+
+        // First open runs the dataview-inline-fields backfill and completes it.
+        let (idx, stats) = VaultIndex::open(vault).unwrap();
+        assert!(stats.full_rebuild || stats.updated >= 2);
+        assert_eq!(idx.count("inline_fields").unwrap(), 2);
+        assert!(pending_migrations(idx.connection()).unwrap().is_empty());
+        let remaining = remaining_for(
+            idx.connection(),
+            MIGRATIONS
+                .iter()
+                .find(|m| m.id == MIGRATION_DATAVIEW_INLINE_FIELDS)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(remaining, 0);
+
+        // Simulate an interrupted run: mark the migration pending again and
+        // checkpoint only one file, as a crashed previous open would have left.
+        idx.connection()
+            .execute(
+                "UPDATE schema_meta SET value = '0' WHERE key = 'dataview_inline_fields_version'",
+                [],
+            )
+            .unwrap();
+        let state_exists: i64 = idx
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='migration_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_exists, 1);
+        idx.connection()
+            .execute(
+                "INSERT OR IGNORE INTO migration_state(migration_id, path) VALUES (?1, ?2)",
+                params![MIGRATION_DATAVIEW_INLINE_FIELDS, "A.md"],
+            )
+            .unwrap();
+
+        // Reopening should only re-run the backfill for B.md (resumable), then
+        // clear the checkpoint table and re-mark the migration complete.
+        let (idx2, stats2) = VaultIndex::open(vault).unwrap();
+        assert!(!stats2.full_rebuild);
+        assert_eq!(stats2.updated, 1);
+        let state_count: i64 = idx2
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM migration_state WHERE migration_id = ?1",
+                params![MIGRATION_DATAVIEW_INLINE_FIELDS],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_count, 0);
+        assert!(pending_migrations(idx2.connection()).unwrap().is_empty());
+    }
+
+    #[test]
     fn save_indexing_reuses_editor_content_without_rereading_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
@@ -1222,6 +1445,7 @@ Rating:: 5
     fn indexes_canvas_nodes_edges_and_searchable_text() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
+        fs::write(vault.join("Roadmap.md"), "# Roadmap\n").unwrap();
         fs::write(
             vault.join("Planning.canvas"),
             r#"{"nodes":[{"id":"one","type":"text","text":"Release checklist","x":10,"y":20,"width":220,"height":90},{"id":"two","type":"file","file":"Roadmap.md","x":300,"y":20,"width":220,"height":90}],"edges":[{"id":"edge","fromNode":"one","toNode":"two","label":"feeds"}]}"#,
@@ -1255,6 +1479,16 @@ Rating:: 5
         assert_eq!(nodes, 2);
         assert_eq!(edges, 1);
         assert_eq!(matches, 1);
+        let card_link: (String, Option<String>) = index
+            .connection()
+            .query_row(
+                "SELECT target_raw, target_path FROM links WHERE path = 'Planning.canvas'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(card_link.0, "Roadmap.md");
+        assert_eq!(card_link.1.as_deref(), Some("Roadmap.md"));
     }
 
     #[test]

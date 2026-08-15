@@ -185,12 +185,21 @@ function classifyYamlValue(value: string): Omit<PropRow, "key"> {
   return { value: scalar, type: "string" };
 }
 
+const EDITABLE_SINGLE_LINE: ReadonlySet<PropertyType> = new Set([
+  "string", "number", "boolean", "date", "datetime", "link", "array",
+]);
+
 function renderPropertyRow(row: PropRow): string {
   let value: string;
   if (row.type === "boolean") {
     value = `<label class="prop-bool-label" aria-label="${escape(row.key)}">` +
       `<input class="prop-bool" type="checkbox" data-property-key="${escape(row.key)}"` +
       `${row.booleanValue ? " checked" : ""} disabled></label>`;
+  } else if (EDITABLE_SINGLE_LINE.has(row.type) && !row.items && !formatQueryUri(row.value, row.key)) {
+    const display = editableDisplayValue(row);
+    value = `<input class="prop-value" type="text" data-property-key="${escape(row.key)}"` +
+      ` data-property-type="${row.type}" value="${escape(display)}" disabled>` +
+      (row.type === "link" ? `<span class="prop-type-hint">link</span>` : "");
   } else if (row.type === "date" || row.type === "datetime") {
     value = `<time datetime="${escape(row.value)}">${escape(row.value)}</time>`;
   } else if (row.type === "number") {
@@ -205,6 +214,15 @@ function renderPropertyRow(row: PropRow): string {
   return `<div class="prop-row" data-property-type="${row.type}">` +
     `<span class="prop-key">${escape(row.key)}</span>` +
     `<span class="prop-val" title="${row.type}">${value}</span></div>`;
+}
+
+/** User-facing text for an editable scalar property input. */
+function editableDisplayValue(row: PropRow): string {
+  if (row.type === "link") return row.value.replace(/^\[\[/, "").replace(/\]\]$/, "");
+  if (row.type === "array") {
+    return row.value.replace(/^\[/, "").replace(/\]$/, "");
+  }
+  return row.value;
 }
 
 /** Locate only a plain, top-level YAML boolean scalar for surgical editing. */
@@ -225,6 +243,132 @@ export type BooleanPropertyRange = {
   from: number;
   to: number;
 };
+
+export type ScalarPropertyEdit = {
+  from: number;
+  to: number;
+  insert: string;
+};
+
+/**
+ * Locate the value token of a top-level scalar property for a surgical edit.
+ * Only plain single-line scalars (string, number, boolean, date, datetime,
+ * link, flow array) are editable; block lists / nested objects are rejected so
+ * every other byte in the frontmatter is preserved verbatim.
+ */
+export function findScalarPropertyEdit(
+  source: string,
+  key: string,
+  value: string,
+  type: PropertyType,
+): ScalarPropertyEdit | null {
+  const bomOffset = source.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const firstNewline = source.indexOf("\n", bomOffset);
+  if (firstNewline < 0 || source.slice(bomOffset, firstNewline).replace(/\r$/, "") !== "---") {
+    return null;
+  }
+  let offset = firstNewline + 1;
+  while (offset < source.length) {
+    const newline = source.indexOf("\n", offset);
+    const lineEnd = newline < 0 ? source.length : newline;
+    const line = source.slice(offset, lineEnd).replace(/\r$/, "");
+    if (line === "---" || line === "...") return null;
+    const match = line.match(/^([A-Za-z0-9_.-]+)(\s*:\s*)(.*)$/);
+    if (match && match[1] === key) {
+      if (!match[3].trim()) return null;
+      const from = offset + match[1].length + match[2].length;
+      const rawToken = match[3];
+      const tokenLength = scalarTokenLength(rawToken);
+      const insert = formatScalarValue(value, type, rawToken.slice(0, tokenLength));
+      if (insert == null) return null;
+      return { from, to: from + tokenLength, insert };
+    }
+    if (newline < 0) return null;
+    offset = newline + 1;
+  }
+  return null;
+}
+
+/** Length of the value token (trailing whitespace and ` # comment` excluded). */
+function scalarTokenLength(raw: string): number {
+  let quoted: "'" | '"' | null = null;
+  let end = raw.length;
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw[i];
+    if (quoted) {
+      if (char === quoted && raw[i - 1] !== "\\") quoted = null;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quoted = char;
+      continue;
+    }
+    if (char === "#" && (i === 0 || /\s/.test(raw[i - 1]))) {
+      end = i;
+      break;
+    }
+  }
+  while (end > 0 && /\s/.test(raw[end - 1])) end--;
+  return end;
+}
+
+/** Serialize a new scalar value, preserving quoting style where possible. */
+function formatScalarValue(
+  value: string,
+  type: PropertyType,
+  originalToken: string,
+): string | null {
+  const trimmed = String(value ?? "").trim();
+  switch (type) {
+    case "boolean":
+      return trimmed.toLowerCase() === "true" ? "true" : "false";
+    case "number":
+      return trimmed || "null";
+    case "date":
+    case "datetime":
+      return trimmed;
+    case "link": {
+      const bare = trimmed.replace(/^\[\[/, "").replace(/\]\]$/, "");
+      return `[[${bare}]]`;
+    }
+    case "array": {
+      const items = trimmed
+        .replace(/^\[/, "")
+        .replace(/\]$/, "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+      return `[${items.join(", ")}]`;
+    }
+    case "null":
+      return "null";
+    case "string":
+    default: {
+      if (trimmed === "") return originalToken.startsWith('"') || originalToken.startsWith("'") ? '""' : "null";
+      if (needsPlainQuoting(trimmed)) {
+        const quote = originalToken.startsWith("'") ? "'" : '"';
+        return quote === "'" ? `'${trimmed.replace(/'/g, "''")}'` : `"${escapeDoubleQuoted(trimmed)}"`;
+      }
+      return trimmed;
+    }
+  }
+}
+
+function needsPlainQuoting(value: string): boolean {
+  return (
+    /^(true|false|null|~|yes|no|on|off)$/i.test(value) ||
+    /^[\s]|[\s]$/.test(value) ||
+    value.includes("#") ||
+    value.includes(": ") ||
+    value.startsWith("- ") ||
+    value.includes('"') ||
+    value.includes("'")
+  );
+}
+
+function escapeDoubleQuoted(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
 
 /** Plain top-level booleans only; quoted booleans deliberately do not match. */
 export function findBooleanProperties(source: string): BooleanPropertyRange[] {

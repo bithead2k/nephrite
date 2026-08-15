@@ -98,13 +98,19 @@ export function rowToDvPage(row: PageRow): DvPage {
   for (const key of Object.keys(props)) {
     const value = props[key];
     if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value)) {
-      const date = new Date(value);
-      if (!Number.isNaN(date.getTime())) {
-        props[key] = Object.assign(date, {
-          month: date.getMonth() + 1,
-          day: date.getDate(),
-          year: date.getFullYear(),
-        });
+      // Parse date-only values as local midnight (matching Obsidian Dataview).
+      // `new Date("2026-08-14")` would be UTC midnight, which reads as the
+      // previous evening in western timezones and corrupts calendar math.
+      const parts = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (parts) {
+        const date = new Date(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3]));
+        if (!Number.isNaN(date.getTime())) {
+          props[key] = Object.assign(date, {
+            month: date.getMonth() + 1,
+            day: date.getDate(),
+            year: date.getFullYear(),
+          });
+        }
       }
     }
   }

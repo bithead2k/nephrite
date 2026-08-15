@@ -7,6 +7,7 @@ export const DEFAULT_SHORTCUTS: ShortcutMap = {
   search: "Mod+Shift+F",
   find: "Mod+F",
   templates: "Mod+Y",
+  "reopen-tab": "Mod+Shift+T",
 };
 
 const MODIFIER_ORDER = ["Mod", "Ctrl", "Alt", "Shift", "Meta"];

@@ -9,7 +9,7 @@ export type TaskView = {
   path: string;
   query: string;
   sort: "due" | "scheduled" | "priority" | "path";
-  group: "none" | "agenda" | "due" | "priority" | "path";
+  group: "none" | "agenda" | "due" | "priority" | "path" | "project" | "recurrence";
   scope: "global" | "all";
 };
 
@@ -109,6 +109,8 @@ export function groupTasks(
       : group === "due" ? task.due || "No due date"
       : group === "priority" ? task.priority || "No priority"
       : group === "path" ? task.path.split("/").slice(0, -1).join("/") || "Vault root"
+      : group === "project" ? task.path.split("/")[0] || "Vault root"
+      : group === "recurrence" ? (task.recurrence?.trim() || "Not recurring")
       : "Tasks";
     const rows = groups.get(key) ?? [];
     rows.push(task);
@@ -132,10 +134,13 @@ const PRIORITY_MARKERS: Record<string, string> = {
 
 export function updateTaskMetadataLine(
   rawLine: string,
-  metadata: { due: string | null; scheduled: string | null; priority: string | null },
+  metadata: { due: string | null; scheduled: string | null; priority: string | null; recurrence?: string | null },
 ): string {
   const block = rawLine.match(/(\s+\^[A-Za-z0-9-]+\s*)$/)?.[1] ?? "";
   let line = block ? rawLine.slice(0, -block.length) : rawLine;
+  if (metadata.recurrence !== undefined) {
+    line = line.replace(/\s*🔁\s*(?:.*?)(?=\s*(?:📅|⏳|🛫|✅|➕|🔺|⏫|🔼|🔽|⏬)|$)/gu, "");
+  }
   line = line
     .replace(/\s*📅\s*\d{4}-\d{2}-\d{2}/gu, "")
     .replace(/\s*⏳\s*\d{4}-\d{2}-\d{2}/gu, "")
@@ -143,6 +148,7 @@ export function updateTaskMetadataLine(
     .trimEnd();
   const markers = [
     metadata.priority ? PRIORITY_MARKERS[metadata.priority] : "",
+    metadata.recurrence && metadata.recurrence.trim() ? `🔁 ${metadata.recurrence.trim()}` : "",
     metadata.scheduled ? `⏳ ${metadata.scheduled}` : "",
     metadata.due ? `📅 ${metadata.due}` : "",
   ].filter(Boolean);

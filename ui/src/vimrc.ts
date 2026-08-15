@@ -95,6 +95,11 @@ export function parseVimrc(content: string): ParsedVimrc {
     if (!isActive()) continue;
     if (/^finish\s*$/i.test(command)) { finished = true; continue; }
 
+    if (isHarmlessNoop(command)) {
+      appliedSettings++;
+      continue;
+    }
+
     command = command.replace(/^(?:silent!?|keepjumps|keepalt|keeppatterns)\s+/i, "");
     const execute = command.match(/^execute\s+(.+)$/i);
     if (execute) {
@@ -283,6 +288,10 @@ function splitVimList(value: string): string[] {
   if (escaped) entry += "\\";
   if (entry) entries.push(entry);
   return entries;
+}
+
+function isHarmlessNoop(command: string): boolean {
+  return /^(?:syntax\s+on|filetype(?:\s+plugin)?(?:\s+indent)?\s+on|colorscheme\s+\S+|highlight\b|hi\s+|autocmd\b|au\s+|augroup\b|runtime\b|source\s+|so\s+|packadd\b|set(?:local|global)?\s+(?:nocompatible|compatible|encoding=.+|fileencoding=.+|termguicolors|hidden|mouse=.+|ttimeout(?:len=.+)?|updatetime=.+|laststatus=.+|showmode|noshowmode|wildmenu|nowrap|wrap|linebreak|splitbelow|splitright|ignorecase|smartcase|incsearch|hlsearch|nohlsearch|backup|nobackup|writebackup|swapfile|noswapfile|undofile)|let\s+g:loaded_)/i.test(command);
 }
 
 function isVimCoreOption(raw: string): boolean {

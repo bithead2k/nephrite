@@ -7,16 +7,26 @@ import { hydrateTableOfContents, renderBlockHtml, renderPreview } from "./previe
 import { planPreviewUpdate } from "./preview-blocks";
 import { PreviewWorkerClient } from "./preview-worker-client";
 import { patchPreviewHtml } from "./preview-patch";
-import { findBooleanPropertyEdit, renderPropertiesHtml, splitFrontmatter } from "./frontmatter";
+import { findBooleanPropertyEdit, findScalarPropertyEdit, renderPropertiesHtml, splitFrontmatter, type PropertyType } from "./frontmatter";
 import { splitWikilinkTarget } from "./wikilinks";
 import {
   buildTree,
-  defaultTodayJournalPath,
   filterTree,
-  findTodayJournal,
   visibleFiles,
   type TreeNode,
 } from "./tree";
+import {
+  DEFAULT_DAILY_NOTES,
+  dateFromDailyPath,
+  dailyPathForDate,
+  existingDailyKeysForMonth,
+  parseDailyNotesSettings,
+  periodNotePath,
+  renderDailyCalendar,
+  shiftDate,
+  type DailyNotesSettings,
+  type PeriodKind,
+} from "./daily-notes";
 import {
   isKanbanSource,
   moveCard,
@@ -40,6 +50,8 @@ import {
   resolveBoardHooks,
 } from "./kanban-hooks-config";
 import { installZoomKeys, getZoom } from "./zoom";
+import { uiAlert, uiConfirm, uiPickFile, uiPrompt } from "./dialogs";
+import { mergeTexts, showMergeEditor } from "./file-merge";
 import {
   clearQueryDiagnostics,
   queryDiagnostic,
@@ -65,7 +77,8 @@ import {
 } from "./scroll-sync";
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
 import { bindKanbanCardPreview, dismissKanbanCardPreview } from "./kanban-card-preview";
-import { findTaskCheckboxEdit } from "./tasks";
+import { findTaskCheckboxEdit, findTaskStatusEdit, hydratePreviewTaskMarkers } from "./tasks";
+import { nextTaskStatusChar } from "./task-status";
 import { VimPowerlineClient } from "./vim-powerline";
 import {
   emptyExcalidrawFile,
@@ -78,6 +91,14 @@ import { planTemplateApplication } from "./template-application";
 import { hydrateExcalidrawEmbeds } from "./excalidraw-embed";
 import { hydrateNoteEmbeds } from "./note-embed";
 import { hydrateMarkdownImages } from "./image-embed";
+import { isAudioPath, isCodePath, isCsvPath, isPdfPath, isStructuredPath, isVideoPath } from "./file-kinds";
+import { highlightPreviewCode } from "./syntax-highlight";
+import { hydrateMermaid } from "./mermaid";
+import { clearCodeView, renderCodeView } from "./code-view";
+import { clearPdfView, renderPdfView } from "./pdf-view";
+import { clearMediaView, renderAudioView, renderVideoView } from "./media-view";
+import { clearCsvView, hydrateCsvFences, renderCsvView } from "./csv-view";
+import { clearStructuredView, renderStructuredView } from "./structured-view";
 import { DeferredDocumentWork } from "./edit-scheduler";
 import { RefreshGate } from "./refresh-gate";
 import { resizedKanbanLaneWidth } from "./kanban-resize";
@@ -86,12 +107,15 @@ import { bindQueryUriLinks } from "./query-uri";
 import { vaultChangeTouchesFileTree } from "./vault-change";
 import { CanvasView, serializeCanvas } from "./canvas-view";
 import { renderGraph } from "./graph-view";
+import { renderLinkHealth } from "./link-health";
+import { renderNoteContext, renderTagBrowser } from "./note-context";
 import { renderCommandBar, type AppCommand } from "./command-bar";
 import {
   PluginManager,
   type PluginDescriptor,
   type PluginViewResult,
 } from "./plugin-host";
+import { renderPluginManager } from "./plugin-manager";
 import {
   DEFAULT_TASK_VIEW,
   DEFAULT_TASK_SCOPE,
@@ -126,9 +150,14 @@ import type {
   GitStatus,
   GitSyncStatus,
   GitCommitDetails,
+  GitConflictSides,
   SearchResult,
   GraphData,
+  LinkHealth,
+  NoteContext,
   OpenFile,
+  TagPage,
+  VaultTag,
   TaskRow,
   UserVimrc,
   VaultInfo,
@@ -139,6 +168,7 @@ import type {
   TaskScope,
 } from "./types";
 import "./styles.css";
+import "katex/dist/katex.min.css";
 
 const BOOKMARKS_KEY = "nephrite.bookmarks";
 const PANE_SPLIT_KEY = "nephrite.paneSplit";
@@ -168,7 +198,12 @@ type SessionState = {
   tabs: string[];
   active: string | null;
   right: string | null;
+  pinned: string[];
+  closed: string[];
+  cursors: Record<string, number>;
 };
+
+const MAX_CLOSED_TABS = 20;
 
 let editor: NephriteEditor | null = null;
 let excalidrawView: import("./excalidraw-view").ExcalidrawView | null = null;
@@ -189,6 +224,7 @@ let dirty = false;
 let mdFilesAll: FileEntry[] = [];
 /** What the tree shows after dotfile + search filters. */
 let mdFiles: FileEntry[] = [];
+let dailyNotesSettings: DailyNotesSettings = { ...DEFAULT_DAILY_NOTES };
 let filterQuery = "";
 let sidebarCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
 let showDotfiles = localStorage.getItem(DOTFILES_KEY) === "1";
@@ -208,6 +244,7 @@ let autosaveTimer: number | null = null;
 let saveQueue: Promise<void> = Promise.resolve();
 let vaultOpen = false;
 let refreshInProgress = false;
+let activeOpenPlan: VaultOpenPlan | null = null;
 let vaultChangeQueue: Promise<void> = Promise.resolve();
 let statusLine = 1;
 let statusColumn = 1;
@@ -218,6 +255,9 @@ let treeRoot: TreeNode = { name: "", path: "", kind: "dir", children: [] };
 let kanbanBoard: KanbanBoard | null = null;
 /** Open file tabs for this vault (restored on open). */
 let openTabs: string[] = [];
+let pinnedTabs = new Set<string>();
+let closedTabs: string[] = [];
+let tabCursors: Record<string, number> = {};
 /** Secondary pane path for "Open to the right". */
 let rightPath: string | null = null;
 /** Editor share of split width (0.15–0.85). */
@@ -384,6 +424,9 @@ function saveSession() {
     tabs,
     active: currentPath,
     right: rightPath,
+    pinned: [...pinnedTabs],
+    closed: closedTabs,
+    cursors: rememberOpenCursors(),
   };
   try {
     localStorage.setItem(sessionStorageKey(vault), JSON.stringify(session));
@@ -402,6 +445,9 @@ function loadSession(vaultRoot: string): SessionState | null {
       tabs: s.tabs.filter((t) => typeof t === "string"),
       active: typeof s.active === "string" ? s.active : null,
       right: typeof s.right === "string" ? s.right : null,
+      pinned: Array.isArray(s.pinned) ? s.pinned.filter((t) => typeof t === "string") : [],
+      closed: Array.isArray(s.closed) ? s.closed.filter((t) => typeof t === "string") : [],
+      cursors: parseCursorMap(s.cursors),
     };
   } catch {
     return null;
@@ -412,6 +458,24 @@ function pathExistsInIndex(path: string): boolean {
   return mdFilesAll.some((f) => f.path === path);
 }
 
+function parseCursorMap(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, number> = {};
+  for (const [path, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) out[path] = value;
+  }
+  return out;
+}
+
+function rememberOpenCursors(): Record<string, number> {
+  if (currentPath && editor) tabCursors[currentPath] = editor.getCursor();
+  const kept: Record<string, number> = {};
+  for (const path of openTabs) {
+    if (tabCursors[path] != null) kept[path] = tabCursors[path];
+  }
+  return kept;
+}
+
 /** Re-open tabs / active note / right pane after vault index is ready. */
 async function restoreSession(vaultRoot: string) {
   const session = loadSession(vaultRoot);
@@ -420,7 +484,16 @@ async function restoreSession(vaultRoot: string) {
   restoringSession = true;
   try {
     const tabs = session.tabs.filter(pathExistsInIndex);
-    openTabs = tabs;
+    const pinned = session.pinned.filter(pathExistsInIndex);
+    pinnedTabs = new Set(pinned);
+    openTabs = [
+      ...pinned.filter((path) => tabs.includes(path)),
+      ...tabs.filter((path) => !pinnedTabs.has(path)),
+    ];
+    closedTabs = session.closed.filter(pathExistsInIndex).slice(0, MAX_CLOSED_TABS);
+    tabCursors = Object.fromEntries(
+      Object.entries(session.cursors).filter(([path]) => pathExistsInIndex(path)),
+    );
     rightPath = session.right && pathExistsInIndex(session.right) ? session.right : null;
 
     const active =
@@ -485,13 +558,15 @@ function $(id: string): HTMLElement {
   return document.getElementById(id)!;
 }
 
-type ActivityId = "files" | "search" | "graph" | "tasks" | "bookmarks" | "git" | "query-log";
+type ActivityId = "files" | "search" | "graph" | "links" | "tags" | "tasks" | "bookmarks" | "git" | "query-log";
 
 function activityIcon(name: ActivityId | "settings" | "file-search" | "panel-close" | "folder-open" | "refresh"): string {
   const paths: Record<string, string> = {
     files: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8"/>',
     search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>',
     graph: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"/>',
+    links: '<path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2"/>',
+    tags: '<path d="M12 2 2 12l8 8 10-10V2Z"/><circle cx="8.5" cy="7.5" r="1"/>',
     tasks: '<circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/>',
     bookmarks: '<path d="M6 3h12v18l-6-4-6 4Z"/>',
     git: '<circle cx="6" cy="4" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="6" cy="20" r="2"/><path d="M6 6v12M8 6h6a4 4 0 0 1 4 4v0"/>',
@@ -534,6 +609,8 @@ async function renderShell() {
           <button type="button" id="activity-files" class="activity-button" title="Files" aria-label="Files" aria-pressed="true">${activityIcon("files")}</button>
           <button type="button" id="activity-search" class="activity-button" title="Search" aria-label="Search" aria-pressed="false" disabled>${activityIcon("search")}</button>
           <button type="button" id="activity-graph" class="activity-button" title="Graph" aria-label="Graph" aria-pressed="false" disabled>${activityIcon("graph")}</button>
+          <button type="button" id="activity-links" class="activity-button" title="Links and outline" aria-label="Links and outline" aria-pressed="false" disabled>${activityIcon("links")}</button>
+          <button type="button" id="activity-tags" class="activity-button" title="Tags" aria-label="Tags" aria-pressed="false" disabled>${activityIcon("tags")}</button>
           <button type="button" id="activity-tasks" class="activity-button" title="Tasks" aria-label="Tasks" aria-pressed="false" disabled>${activityIcon("tasks")}</button>
           <button type="button" id="activity-bookmarks" class="activity-button" title="Bookmarks" aria-label="Bookmarks" aria-pressed="false" disabled>${activityIcon("bookmarks")}</button>
           <button type="button" id="activity-git" class="activity-button" title="Git" aria-label="Git" aria-pressed="false" disabled>${activityIcon("git")}</button>
@@ -593,7 +670,10 @@ async function renderShell() {
             <section class="preferences-section">
               <strong>Plugins</strong>
               <div id="preferences-plugins" class="preferences-plugins"></div>
-              <button type="button" id="preferences-plugin-reload">Reload plugins</button>
+              <div class="preferences-font-actions">
+                <button type="button" id="preferences-plugin-browse">Browse plugins…</button>
+                <button type="button" id="preferences-plugin-reload">Reload plugins</button>
+              </div>
             </section>
             <section class="preferences-section">
               <strong>Automation</strong>
@@ -621,7 +701,7 @@ async function renderShell() {
             <input type="search" id="file-filter" class="file-filter"
               placeholder="Filter files…" title="Filter files (Ctrl-O)"
               autocomplete="off" spellcheck="false" />
-            <button type="button" id="btn-today-side" class="btn-today-side" disabled title="Today's journal">📅</button>
+            <button type="button" id="btn-today-side" class="btn-today-side" disabled title="Daily notes calendar">📅</button>
           </div>
         </div>
         <div id="file-tree" class="file-tree" role="tree"></div>
@@ -670,6 +750,12 @@ async function renderShell() {
             </div>
             <div id="canvas-host" tabindex="0"></div>
           </div>
+          <div id="media-workspace" class="media-workspace hidden">
+            <div id="pdf-host" class="pdf-host hidden" tabindex="-1"></div>
+            <div id="code-host" class="code-host hidden" tabindex="-1"></div>
+            <div id="av-host" class="av-host hidden" tabindex="-1"></div>
+            <div id="data-host" class="data-host hidden" tabindex="-1"></div>
+          </div>
         </div>
         <footer class="statusbar" id="statusbar">
           <span id="status-powerline" hidden></span>
@@ -708,29 +794,36 @@ async function renderShell() {
   $("btn-refresh").addEventListener("click", () => void forceVaultRefresh());
   $("btn-save").addEventListener("click", () => void saveFile());
   $("btn-today").addEventListener("click", () => void openToday());
-  $("btn-today-side").addEventListener("click", () => void openToday());
+  $("btn-today-side").addEventListener("click", () => void showDailyCalendar());
   $("btn-drawing").addEventListener("click", () => void createDrawing());
   $("btn-canvas").addEventListener("click", () => void createCanvas());
   $("activity-search").addEventListener("click", () => void showSearchPanel());
   $("activity-graph").addEventListener("click", () => void showGraphPanel());
+  $("activity-links").addEventListener("click", () => void showNoteContextPanel());
+  $("activity-tags").addEventListener("click", () => void showTagBrowserPanel());
   $("canvas-add-text").addEventListener("click", () => canvasView?.addText());
   $("canvas-add-file").addEventListener("click", () => {
-    const path = window.prompt("Vault-relative note path", currentPath?.replace(/\.canvas$/i, ".md") ?? "");
-    if (path?.trim()) canvasView?.addFile(path.trim());
+    void uiPrompt("Vault-relative note path", { defaultValue: currentPath?.replace(/\.canvas$/i, ".md") ?? "" }).then((path) => {
+      if (path?.trim()) canvasView?.addFile(path.trim());
+    });
   });
   $("canvas-add-link").addEventListener("click", () => {
-    const url = window.prompt("Link URL", "https://");
-    if (!url?.trim()) return;
-    const label = window.prompt("Card label", url.trim()) || url.trim();
-    canvasView?.addLink(url.trim(), label);
+    void uiPrompt("Link URL", { defaultValue: "https://" }).then(async (url) => {
+      if (!url?.trim()) return;
+      const label = await uiPrompt("Card label", { defaultValue: url.trim() });
+      canvasView?.addLink(url.trim(), label?.trim() || url.trim());
+    });
   });
   $("canvas-add-group").addEventListener("click", () => {
-    const label = window.prompt("Group label", "Group")?.trim();
-    if (label) canvasView?.addGroup(label);
+    void uiPrompt("Group label", { defaultValue: "Group" }).then((label) => {
+      if (label?.trim()) canvasView?.addGroup(label.trim());
+    });
   });
   $("canvas-delete").addEventListener("click", () => canvasView?.deleteSelected());
   $("canvas-edit-edge").addEventListener("click", () => {
-    if (!canvasView?.editSelectedEdge()) setTransientStatus("Select a canvas edge first", "#e9ad55");
+    void (async () => {
+      if (!(await canvasView?.editSelectedEdge())) setTransientStatus("Select a canvas edge first", "#e9ad55");
+    })();
   });
   $("canvas-copy").addEventListener("click", () => canvasView?.copySelection());
   $("canvas-paste").addEventListener("click", () => canvasView?.pasteCopied());
@@ -755,9 +848,11 @@ async function renderShell() {
     if (!command) return;
     event.preventDefault();
     event.stopPropagation();
-    void Promise.resolve(command.run()).catch((error) => alert(String(error)));
+    void Promise.resolve(command.run()).catch((error) => void uiAlert(String(error)));
   }, true);
   document.addEventListener("keydown", recordEditorInputTiming, true);
+  $("activity-links").addEventListener("click", () => void showNoteContextPanel());
+  $("activity-tags").addEventListener("click", () => void showTagBrowserPanel());
   $("activity-tasks").addEventListener("click", () => void showTasksPanel());
   $("activity-bookmarks").addEventListener("click", showBookmarksPanel);
   $("activity-git").addEventListener("click", () => void showGitPanel());
@@ -770,6 +865,10 @@ async function renderShell() {
   $("appearance-font-save").addEventListener("click", saveAppearanceFontPreferences);
   $("appearance-font-reset").addEventListener("click", resetAppearanceFontPreferences);
   $("preferences-plugin-reload").addEventListener("click", () => void reloadPlugins().then(renderPreferencesPlugins));
+  $("preferences-plugin-browse").addEventListener("click", () => {
+    closePreferences();
+    void showPluginManager();
+  });
   $("preferences-automation-reload").addEventListener("click", () => void reloadAutomations(true));
   $("preferences-automation-create").addEventListener("click", () => void createExampleAutomationConfig());
   $("preferences-hotkeys").addEventListener("click", showHotkeysPanel);
@@ -798,7 +897,7 @@ async function renderShell() {
   $("external-close").addEventListener("click", closeExternalView);
   $("external-default").addEventListener("click", () => {
     const uri = ($("external-frame") as HTMLIFrameElement).dataset.uri;
-    if (uri) void openUrl(uri).catch((error) => alert(String(error)));
+    if (uri) void openUrl(uri).catch((error) => void uiAlert(String(error)));
   });
   document.addEventListener("nephrite-open-external", (event) => {
     const detail = (event as CustomEvent<{ uri?: string }>).detail;
@@ -915,6 +1014,26 @@ async function renderShell() {
       return id == null ? statuses : statuses.find((plugin) => plugin.id === id) ?? null;
     },
     showView: showPluginView,
+    readPluginData: async (id) => {
+      try {
+        const file = await invoke<OpenFile>("read_file", { path: `.obsidian/plugins/${id}/data.json` });
+        return JSON.parse(file.content);
+      } catch {
+        return null;
+      }
+    },
+    writePluginData: async (id, value) => {
+      await invoke("write_file", {
+        path: `.obsidian/plugins/${id}/data.json`,
+        content: `${JSON.stringify(value ?? {}, null, 2)}\n`,
+      });
+    },
+    persistPluginEnabled: async (id, enabled) => {
+      const compatibility = pluginManager?.statuses().find((plugin) => plugin.id === id)?.compatibility
+        ?? "obsidian";
+      if (compatibility !== "obsidian") return;
+      await invoke("set_community_plugin_enabled", { id, enabled });
+    },
     executeShell: (command, args) => invoke("shell_command", {
       command: [command, ...args].map(shellArgument).join(" "), cwd: null, timeoutMs: 60_000,
     }),
@@ -988,6 +1107,11 @@ async function initEditor() {
         scheduleAutosave();
       },
       onFoldsChanged: () => rememberEditorFolds(),
+      onSaveAttachments: async (files) => {
+        if (!currentPath) return [];
+        const { saveDroppedFiles } = await import("./attachments");
+        return saveDroppedFiles(files, currentPath);
+      },
     },
     vimOn,
     userVimrc,
@@ -1339,7 +1463,7 @@ async function renderRightPane(text: string, revision: number) {
       previewEl.querySelectorAll(".dv-block, .dv-inline").forEach((el) => el.remove());
       for (let index = 0; index < plan.blocks.length; index++) {
         const block = plan.blocks[index];
-        if (!/```(?:sql|dataview|dataviewjs|js|javascript)/i.test(block)) continue;
+        if (!/```(?:pgsql\b|dataview|dataviewjs|js|javascript)/i.test(block)) continue;
         const node = previewEl.querySelector(
           `:scope > .md-block[data-block-index="${index}"]`,
         ) as HTMLElement | null;
@@ -1348,7 +1472,14 @@ async function renderRightPane(text: string, revision: number) {
         tpl.innerHTML = renderBlockHtml(block, index).trim();
         const fresh = tpl.content.firstElementChild as HTMLElement | null;
         if (!fresh) continue;
-        node.replaceWith(fresh);
+        if (pluginManager?.hasPostProcessors() || pluginManager?.hasCodeBlockProcessors()) {
+          const processed = await applyPluginPreviewProcessors(fresh.outerHTML, path);
+          const reprocessed = document.createElement("template");
+          reprocessed.innerHTML = processed;
+          node.replaceWith(reprocessed.content.firstElementChild ?? fresh);
+        } else {
+          node.replaceWith(fresh);
+        }
         const dynCtx = makeEngineContext(path, text, (target) => void openWikilink(target));
         void executeBlocksInSubtree(block, fresh, dynCtx, () =>
           isPreviewRevisionCurrent(path, revision),
@@ -1387,7 +1518,14 @@ async function renderRightPane(text: string, revision: number) {
           replaced = -1;
           break;
         }
-        existing.replaceWith(node);
+        if (pluginManager?.hasPostProcessors() || pluginManager?.hasCodeBlockProcessors()) {
+          const processed = await applyPluginPreviewProcessors(node.outerHTML, path);
+          const reprocessed = document.createElement("template");
+          reprocessed.innerHTML = processed;
+          existing.replaceWith(reprocessed.content.firstElementChild ?? node);
+        } else {
+          existing.replaceWith(node);
+        }
         replaced++;
       }
       if (replaced >= 0) {
@@ -1444,7 +1582,21 @@ async function renderRightPane(text: string, revision: number) {
   const host = document.getElementById("preview-host");
   const scrollTop = host?.scrollTop ?? 0;
   const scrollLeft = host?.scrollLeft ?? 0;
-  const patch = patchPreviewHtml(previewEl, markup.html, forceFull);
+  let commitHtml = markup.html;
+  try {
+    commitHtml = await applyPluginPreviewProcessors(markup.html, path);
+  } catch (error) {
+    queryDiagnostic("preview.plugin-processor.error", {
+      path,
+      revision,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (!path || !isPreviewRevisionCurrent(path, revision)) {
+    queryDiagnostic("preview.worker.discard", { path, revision, previewRevision });
+    return;
+  }
+  const patch = patchPreviewHtml(previewEl, commitHtml, forceFull);
   previewEl.dataset.previewPath = path ?? "";
   lastPreviewBody = text;
   lastPreviewPath = path;
@@ -1519,11 +1671,11 @@ function openExternalView(uri: string) {
     return;
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    void openUrl(uri).catch((error) => alert(String(error)));
+    void openUrl(uri).catch((error) => void uiAlert(String(error)));
     return;
   }
   if (externalLinksInBrowser) {
-    void openUrl(parsed.href).catch((error) => alert(String(error)));
+    void openUrl(parsed.href).catch((error) => void uiAlert(String(error)));
     return;
   }
   const view = $("external-view");
@@ -1565,10 +1717,12 @@ function bindPreviewContent(root: HTMLElement, path: string) {
   bindPropertiesFoldState(root, path);
   bindQueryUriLinks(root);
   bindExternalLinks(root);
+  hydratePreviewTaskMarkers(root);
   root.querySelectorAll<HTMLInputElement>("li > input[type=checkbox]:not(.prop-bool)").forEach(
-    (checkbox, taskIndex) => {
+    (checkbox) => {
       if (checkbox.dataset.taskBound === "1") return;
       checkbox.dataset.taskBound = "1";
+      const taskIndex = Number(checkbox.dataset.taskIndex);
       checkbox.disabled = path !== currentPath || !editor;
       checkbox.title = checkbox.disabled
         ? "Open this note to change the task"
@@ -1585,6 +1739,22 @@ function bindPreviewContent(root: HTMLElement, path: string) {
       });
     },
   );
+  root.querySelectorAll<HTMLButtonElement>("button.task-status-marker").forEach((button) => {
+    if (button.dataset.taskBound === "1") return;
+    button.dataset.taskBound = "1";
+    const taskIndex = Number(button.dataset.taskIndex);
+    button.disabled = path !== currentPath || !editor;
+    button.addEventListener("click", () => {
+      if (!editor || path !== currentPath) return;
+      const next = nextTaskStatusChar(button.dataset.taskStatus || " ");
+      const edit = findTaskStatusEdit(editor.getDoc(), taskIndex, next);
+      if (!edit) {
+        setTransientStatus("Could not safely locate this task in Markdown", "#e9ad55");
+        return;
+      }
+      editor.replaceRange(edit.from, edit.to, edit.insert);
+    });
+  });
   root.querySelectorAll<HTMLInputElement>("input.prop-bool[data-property-key]").forEach(
     (checkbox) => {
       if (checkbox.dataset.propertyBound === "1") return;
@@ -1598,6 +1768,26 @@ function bindPreviewContent(root: HTMLElement, path: string) {
           : null;
         if (!edit) {
           checkbox.checked = !checkbox.checked;
+          setTransientStatus(`Could not safely update YAML property ${key || ""}`, "#e9ad55");
+          return;
+        }
+        editor.replaceRange(edit.from, edit.to, edit.insert);
+      });
+    },
+  );
+  root.querySelectorAll<HTMLInputElement>("input.prop-value[data-property-key]").forEach(
+    (input) => {
+      if (input.dataset.propertyBound === "1") return;
+      input.dataset.propertyBound = "1";
+      input.disabled = path !== currentPath || !editor;
+      input.addEventListener("change", () => {
+        if (!editor || path !== currentPath) return;
+        const key = input.dataset.propertyKey;
+        const type = input.dataset.propertyType as PropertyType | undefined;
+        const edit = key && type
+          ? findScalarPropertyEdit(editor.getDoc(), key, input.value, type)
+          : null;
+        if (!edit) {
           setTransientStatus(`Could not safely update YAML property ${key || ""}`, "#e9ad55");
           return;
         }
@@ -1622,6 +1812,9 @@ function bindPreviewContent(root: HTMLElement, path: string) {
   void hydrateNoteEmbeds(root, path, {
     openLink: (target) => void openWikilink(target),
   }).catch((error) => console.warn("[note embed]", error));
+  highlightPreviewCode(root);
+  hydrateCsvFences(root);
+  void hydrateMermaid(root).catch((error) => console.warn("[mermaid]", error));
   bindLinkPreviews(root, {
     fromPath: path,
     openLink: (target) => void openWikilink(target),
@@ -1671,7 +1864,7 @@ async function renderDynamicPreview(
     path,
     revision,
     resultBlocks: target.querySelectorAll(".dv-block").length,
-    sourceBlocks: target.querySelectorAll("pre > code.language-sql, pre > code.language-dataview, pre > code.language-dataviewjs").length,
+    sourceBlocks: target.querySelectorAll("pre > code.language-pgsql, pre > code.language-dataview, pre > code.language-dataviewjs").length,
   });
   bindPreviewContent(target, path);
   requestAnimationFrame(() => setupScrollSync());
@@ -1680,6 +1873,48 @@ async function renderDynamicPreview(
 function isPreviewRevisionCurrent(path: string, revision: number): boolean {
   return revision === previewRevision && currentPath === path &&
     (viewMode === "split" || viewMode === "preview");
+}
+
+/**
+ * Run plugin markdown post-processors and code-block processors over rendered
+ * preview HTML before it is committed. Transforming the HTML string (rather
+ * than mutating the live DOM after commit) keeps patchPreviewHtml's block keys
+ * stable across re-renders. Returns the input unchanged when no plugin has
+ * registered a processor.
+ */
+async function applyPluginPreviewProcessors(html: string, path: string): Promise<string> {
+  if (!pluginManager) return html;
+  if (!pluginManager.hasPostProcessors() && !pluginManager.hasCodeBlockProcessors()) return html;
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const root = template.content;
+
+  // Code-block processors: replace matching fences with plugin output.
+  for (const codeEl of Array.from(root.querySelectorAll<HTMLElement>("pre > code"))) {
+    const cls = codeEl.className || "";
+    const lang = ((cls.match(/language-(\S+)/) || [])[1] || "").toLowerCase();
+    if (!lang || lang === "mermaid" || lang === "mmd") continue;
+    if (!pluginManager.hasCodeBlockProcessor(lang)) continue;
+    const pre = codeEl.closest("pre");
+    if (!pre) continue;
+    const output = await pluginManager.runCodeBlockProcessor(lang, codeEl.textContent || "", path);
+    if (output == null) continue;
+    const wrapper = document.createElement("div");
+    wrapper.className = `plugin-code-block plugin-code-block-${lang}`;
+    wrapper.dataset.pluginLanguage = lang;
+    wrapper.innerHTML = output;
+    pre.replaceWith(wrapper);
+  }
+
+  // Post-processors: run over each top-level markdown block in order.
+  if (pluginManager.hasPostProcessors()) {
+    for (const block of Array.from(root.querySelectorAll<HTMLElement>(":scope > .md-block"))) {
+      const processed = await pluginManager.runPostProcessors(block.innerHTML, path);
+      if (processed !== block.innerHTML) block.innerHTML = processed;
+    }
+  }
+
+  return template.innerHTML;
 }
 
 function renderKanbanBoard(board: KanbanBoard) {
@@ -2250,6 +2485,8 @@ function updateChrome() {
   ($("btn-canvas") as HTMLButtonElement).disabled = !hasVault;
   ($("activity-search") as HTMLButtonElement).disabled = !hasVault;
   ($("activity-graph") as HTMLButtonElement).disabled = !hasVault;
+  ($("activity-links") as HTMLButtonElement).disabled = !hasVault;
+  ($("activity-tags") as HTMLButtonElement).disabled = !hasVault;
   ($("btn-template") as HTMLButtonElement).disabled = !hasVault || currentFileKind !== "markdown" || !currentPath;
   ($("activity-tasks") as HTMLButtonElement).disabled = !hasVault;
   ($("activity-bookmarks") as HTMLButtonElement).disabled = !hasVault;
@@ -2281,7 +2518,7 @@ async function openVaultPath(path: string) {
   if (dirty && currentPath) {
     await saveFile(true);
     if (dirty) {
-      const proceed = confirm(`Automatic save of ${currentPath} failed. Open another vault anyway?`);
+      const proceed = await uiConfirm(`Automatic save of ${currentPath} failed. Open another vault anyway?`, { danger: true });
       if (!proceed) return;
     }
   }
@@ -2293,14 +2530,28 @@ async function openVaultPath(path: string) {
   propertiesFoldStorageKey = null;
   delete $("preview").dataset.propertiesPath;
   if (previousRightBody) delete previousRightBody.dataset.propertiesPath;
-  let plan: VaultOpenPlan = { rebuild: false, action: "Checking the vault index…" };
+  let plan: VaultOpenPlan = {
+    rebuild: false,
+    action: "Checking the vault index…",
+    migrations: [],
+  };
   try {
     plan = await invoke<VaultOpenPlan>("vault_open_plan", { path });
   } catch {
     /* open_vault will provide the authoritative path error. */
   }
-  $("vault-label").textContent = plan.rebuild ? "Rebuilding index…" : "Indexing…";
-  $("index-stats").textContent = "Large vaults can take a minute on first open";
+  activeOpenPlan = plan;
+  const isBackfill = plan.migrations.length > 0;
+  $("vault-label").textContent = plan.rebuild
+    ? "Rebuilding index…"
+    : isBackfill
+      ? "Backfilling index…"
+      : "Indexing…";
+  $("index-stats").textContent = plan.rebuild
+    ? "Large vaults can take a minute on first open"
+    : isBackfill
+      ? "One-time re-parse; your files are unchanged"
+      : "Checking the vault for changed files";
   showIndexProgress(plan.action);
   // Let WebKit paint the progress UI before the synchronous index command starts.
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -2308,6 +2559,7 @@ async function openVaultPath(path: string) {
   try {
     info = await invoke<VaultInfo>("open_vault", { path });
   } finally {
+    activeOpenPlan = null;
     hideIndexProgress();
   }
   loadPropertiesFoldState(info.root);
@@ -2326,6 +2578,9 @@ async function openVaultPath(path: string) {
   canvasContent = "";
   dirty = false;
   openTabs = [];
+  pinnedTabs = new Set();
+  closedTabs = [];
+  tabCursors = {};
   rightPath = null;
   editor?.setDoc("");
   excalidrawView?.clear();
@@ -2335,6 +2590,7 @@ async function openVaultPath(path: string) {
   updateChrome();
   renderTabBar();
   await refreshTree();
+  await loadDailyNotesSettings();
   await reloadPlugins(info.root);
   await reloadAutomations();
   // Restore tabs + active note + right pane from last session for this vault.
@@ -2424,7 +2680,13 @@ async function openVaultEntry(path: string) {
 }
 
 function isDocumentEntry(entry: FileEntry): boolean {
-  return ["markdown", "excalidraw", "canvas"].includes(entry.file_kind);
+  return ["markdown", "excalidraw", "canvas"].includes(entry.file_kind)
+    || isPdfPath(entry.path)
+    || isAudioPath(entry.path)
+    || isVideoPath(entry.path)
+    || isCsvPath(entry.path)
+    || isStructuredPath(entry.path)
+    || isCodePath(entry.path);
 }
 
 function focusActiveDocumentPane() {
@@ -2432,6 +2694,14 @@ function focusActiveDocumentPane() {
     document.getElementById("excalidraw-host")?.focus();
   } else if (currentFileKind === "canvas") {
     document.getElementById("canvas-host")?.focus();
+  } else if (currentFileKind === "pdf") {
+    document.getElementById("pdf-host")?.focus();
+  } else if (currentFileKind === "audio" || currentFileKind === "video") {
+    document.getElementById("av-host")?.focus();
+  } else if (currentFileKind === "csv" || currentFileKind === "data") {
+    document.getElementById("data-host")?.focus();
+  } else if (currentFileKind === "code") {
+    document.getElementById("code-host")?.focus();
   } else if (viewMode === "preview") {
     document.getElementById("preview-host")?.focus();
   } else {
@@ -2454,13 +2724,21 @@ async function installVaultChangeListener() {
 
 function updateIndexProgress(progress: VaultOpenProgress) {
   const bar = $("index-progress").querySelector("progress") as HTMLProgressElement | null;
-  const phase = progress.phase === "scan"
-    ? "Scanning vault"
-    : progress.phase === "index"
-      ? "Indexing vault"
-      : "Resolving links";
   const count = progress.total > 0 ? ` ${progress.done}/${progress.total}` : "";
   const path = progress.path ? ` · ${progress.path}` : "";
+  // While a one-time feature backfill is running, keep the truthful migration
+  // action text instead of the generic "Indexing vault" label.
+  const pendingBackfill =
+    activeOpenPlan && !activeOpenPlan.rebuild && activeOpenPlan.migrations.length
+      ? activeOpenPlan
+      : null;
+  const phase = pendingBackfill
+    ? pendingBackfill.migrations[0].action
+    : progress.phase === "scan"
+      ? "Scanning vault"
+      : progress.phase === "index"
+        ? "Indexing vault"
+        : "Resolving links";
   const message = `${phase}${count}${path}`;
   $("index-action").textContent = message;
   $("status-hint").textContent = message;
@@ -2511,6 +2789,7 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
       } else {
         const removedPath = currentPath;
         openTabs = openTabs.filter((path) => path !== removedPath);
+        pinnedTabs.delete(removedPath);
         currentPath = null;
         editor?.setDoc("");
         renderTabBar();
@@ -2570,6 +2849,17 @@ function renderTree() {
   const host = $("file-tree");
   host.innerHTML = "";
 
+  host.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  });
+  host.addEventListener("drop", (event) => {
+    if (event.target !== host) return;
+    event.preventDefault();
+    const from = event.dataTransfer?.getData("application/x-nephrite-path")
+      || event.dataTransfer?.getData("text/plain");
+    if (from) void moveVaultPath(from, baseName(from));
+  });
   host.oncontextmenu = (e) => {
     // Empty area of tree → vault-root context
     if (e.target === host) {
@@ -2606,6 +2896,54 @@ function bindCtx(el: HTMLElement, target: CtxTarget) {
   });
 }
 
+function bindTreeDrag(el: HTMLElement, path: string, kind: "file" | "folder") {
+  el.draggable = true;
+  el.addEventListener("dragstart", (event) => {
+    event.dataTransfer?.setData("text/plain", path);
+    event.dataTransfer?.setData("application/x-nephrite-path", path);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  });
+  if (kind !== "folder") return;
+  el.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    el.classList.add("tree-drop");
+  });
+  el.addEventListener("dragleave", () => el.classList.remove("tree-drop"));
+  el.addEventListener("drop", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    el.classList.remove("tree-drop");
+    const from = event.dataTransfer?.getData("application/x-nephrite-path")
+      || event.dataTransfer?.getData("text/plain");
+    if (from) void moveVaultPath(from, joinPath(path, baseName(from)));
+  });
+}
+
+async function moveVaultPath(from: string, to: string) {
+  if (!from || from === to) return;
+  if (to === from || to.startsWith(`${from}/`)) {
+    setTransientStatus("Cannot move a folder into itself", "#e9ad55");
+    return;
+  }
+  try {
+    const rewritten = await invoke<string[]>("rename_path", { from, to });
+    remapOpenPaths(from, to);
+    await refreshTree();
+    renderTabBar();
+    updateRightPane();
+    const count = rewritten?.length ?? 0;
+    setTransientStatus(
+      count
+        ? `Moved ${from} → ${to} · updated ${count} note${count === 1 ? "" : "s"}`
+        : `Moved ${from} → ${to}`,
+      "#5ecf9a",
+    );
+  } catch (error) {
+    void uiAlert(String(error));
+  }
+}
+
 function renderNode(node: TreeNode, depth: number, revealForFilter: boolean): HTMLElement {
   if (node.kind === "file") {
     const btn = document.createElement("button");
@@ -2617,6 +2955,7 @@ function renderNode(node: TreeNode, depth: number, revealForFilter: boolean): HT
     btn.dataset.path = node.path;
     btn.addEventListener("click", () => void openVaultEntry(node.path));
     bindCtx(btn, { kind: "file", path: node.path });
+    bindTreeDrag(btn, node.path, "file");
     return btn;
   }
 
@@ -2640,6 +2979,7 @@ function renderNode(node: TreeNode, depth: number, revealForFilter: boolean): HT
     renderTree();
   });
   bindCtx(row, { kind: "folder", path: node.path });
+  bindTreeDrag(row, node.path, "folder");
   wrap.appendChild(row);
 
   if (isOpen) {
@@ -2687,18 +3027,29 @@ async function openNoteSerialized(
     const savingPath = currentPath;
     await saveFile(true);
     if (dirty && currentPath === savingPath) {
-      const discard = confirm(`Automatic save of ${savingPath} failed. Discard changes?`);
+      const discard = await uiConfirm(`Automatic save of ${savingPath} failed. Discard changes?`, { danger: true });
       if (!discard) return;
       dirty = false;
     }
   }
   rememberEditorFolds();
   const generation = ++openNoteGeneration;
-  const file = await invoke<OpenFile>("read_file", { path });
+  const file = isPdfPath(path) || isAudioPath(path) || isVideoPath(path)
+    ? { path, content: "" }
+    : await invoke<OpenFile>("read_file", { path });
   // A newer openNote won the race — do not clobber editor/path.
   if (generation !== openNoteGeneration) return;
+  if (currentPath && editor && currentPath !== file.path) {
+    tabCursors[currentPath] = editor.getCursor();
+  }
   currentPath = file.path;
-  currentFileKind = mdFilesAll.find((entry) => entry.path === file.path)?.file_kind ??
+  currentFileKind = isPdfPath(file.path) ? "pdf"
+    : isAudioPath(file.path) ? "audio"
+    : isVideoPath(file.path) ? "video"
+    : isCsvPath(file.path) ? "csv"
+    : isStructuredPath(file.path) ? "data"
+    : isCodePath(file.path) ? "code"
+    : mdFilesAll.find((entry) => entry.path === file.path)?.file_kind ??
     (file.path.toLowerCase().endsWith(".excalidraw") ? "excalidraw" :
       file.path.toLowerCase().endsWith(".canvas") ? "canvas" : "markdown");
   if (currentFileKind === "markdown" && isObsidianExcalidrawMarkdown(file.content)) {
@@ -2714,9 +3065,11 @@ async function openNoteSerialized(
   if (!openTabs.includes(file.path)) {
     openTabs.push(file.path);
   }
+  closedTabs = closedTabs.filter((path) => path !== file.path);
   if (currentFileKind === "excalidraw") {
     canvasContent = "";
     canvasView?.clear();
+    showMediaWorkspace(null);
     showCanvasWorkspace(false);
     drawingContent = file.content;
     showDrawingWorkspace(true);
@@ -2735,12 +3088,13 @@ async function openNoteSerialized(
       showDrawingWorkspace(false);
       currentFileKind = "markdown";
       editor?.setDoc(file.content);
-      alert(`Could not open Excalidraw drawing: ${String(error)}`);
+      void uiAlert(`Could not open Excalidraw drawing: ${String(error)}`);
     }
   } else if (currentFileKind === "canvas") {
     drawingContent = "";
     drawingDocument = null;
     excalidrawView?.clear();
+    showMediaWorkspace(null);
     showDrawingWorkspace(false);
     canvasContent = file.content;
     showCanvasWorkspace(true);
@@ -2749,7 +3103,7 @@ async function openNoteSerialized(
     } catch (error) {
       setTransientStatus(`Invalid canvas: ${String(error)}`, "#e07070");
     }
-  } else {
+  } else if (currentFileKind === "pdf") {
     drawingContent = "";
     drawingDocument = null;
     excalidrawView?.clear();
@@ -2757,9 +3111,64 @@ async function openNoteSerialized(
     showCanvasWorkspace(false);
     canvasContent = "";
     canvasView?.clear();
+    clearCodeView($("code-host"));
+    showMediaWorkspace("pdf");
+    try {
+      await renderPdfView($("pdf-host"), file.path);
+    } catch (error) {
+      setTransientStatus(`Could not open PDF: ${String(error)}`, "#e07070");
+    }
+  } else if (currentFileKind === "audio" || currentFileKind === "video") {
+    drawingContent = "";
+    drawingDocument = null;
+    excalidrawView?.clear();
+    showDrawingWorkspace(false);
+    showCanvasWorkspace(false);
+    canvasContent = "";
+    canvasView?.clear();
+    showMediaWorkspace(currentFileKind);
+    try {
+      if (currentFileKind === "audio") await renderAudioView($("av-host"), file.path);
+      else await renderVideoView($("av-host"), file.path);
+    } catch (error) {
+      setTransientStatus(`Could not open media: ${String(error)}`, "#e07070");
+    }
+  } else if (currentFileKind === "csv" || currentFileKind === "data") {
+    drawingContent = "";
+    drawingDocument = null;
+    excalidrawView?.clear();
+    showDrawingWorkspace(false);
+    showCanvasWorkspace(false);
+    canvasContent = "";
+    canvasView?.clear();
+    showMediaWorkspace(currentFileKind);
+    if (currentFileKind === "csv") renderCsvView($("data-host"), file.path, file.content);
+    else renderStructuredView($("data-host"), file.path, file.content);
+  } else if (currentFileKind === "code") {
+    drawingContent = "";
+    drawingDocument = null;
+    excalidrawView?.clear();
+    showDrawingWorkspace(false);
+    showCanvasWorkspace(false);
+    canvasContent = "";
+    canvasView?.clear();
+    clearPdfView($("pdf-host"));
+    showMediaWorkspace("code");
+    renderCodeView($("code-host"), file.path, file.content);
+  } else {
+    drawingContent = "";
+    drawingDocument = null;
+    excalidrawView?.clear();
+    showDrawingWorkspace(false);
+    showCanvasWorkspace(false);
+    showMediaWorkspace(null);
+    canvasContent = "";
+    canvasView?.clear();
     // Full vault file into the editor — frontmatter, --- fences, Dataview, everything.
     editor?.setDoc(file.content);
     restoreEditorFolds(file.path);
+    const savedCursor = tabCursors[file.path];
+    if (savedCursor != null) editor?.setCursor(savedCursor);
     if (viewMode !== "preview") editor?.focus();
   }
   // Opening a note peels open only its ancestor folders (and remembers that).
@@ -2796,6 +3205,26 @@ function showCanvasWorkspace(active: boolean) {
   if (active) clearScrollSync();
 }
 
+function showMediaWorkspace(kind: "pdf" | "code" | "audio" | "video" | "csv" | "data" | null) {
+  $("panes").classList.toggle("media-active", kind !== null);
+  $("media-workspace").classList.toggle("hidden", kind === null);
+  $("pdf-host").classList.toggle("hidden", kind !== "pdf");
+  $("code-host").classList.toggle("hidden", kind !== "code");
+  $("av-host").classList.toggle("hidden", kind !== "audio" && kind !== "video");
+  $("data-host").classList.toggle("hidden", kind !== "csv" && kind !== "data");
+  document.querySelectorAll<HTMLButtonElement>(".seg-btn").forEach((button) => {
+    button.disabled = kind !== null;
+  });
+  if (kind) clearScrollSync();
+  if (kind !== "pdf") clearPdfView($("pdf-host"));
+  if (kind !== "code") clearCodeView($("code-host"));
+  if (kind !== "audio" && kind !== "video") clearMediaView($("av-host"));
+  if (kind !== "csv" && kind !== "data") {
+    clearCsvView($("data-host"));
+    clearStructuredView($("data-host"));
+  }
+}
+
 async function ensureExcalidrawView() {
   if (excalidrawView) return excalidrawView;
   $("excalidraw-host").innerHTML = `<div class="feature-loading excalidraw-loading">Loading Excalidraw…</div>`;
@@ -2804,30 +3233,169 @@ async function ensureExcalidrawView() {
   return excalidrawView;
 }
 
+async function loadDailyNotesSettings() {
+  dailyNotesSettings = { ...DEFAULT_DAILY_NOTES };
+  try {
+    const file = await invoke<OpenFile>("read_file", { path: ".obsidian/daily-notes.json" });
+    dailyNotesSettings = parseDailyNotesSettings(file.content);
+  } catch {
+    /* Vaults without Daily Notes core settings keep the journal heuristics. */
+  }
+}
+
 async function openToday() {
-  if (mdFiles.length === 0) {
-    alert("Open a vault first.");
+  await openDailyNote(new Date(), { confirmCreate: true });
+}
+
+async function openAdjacentDaily(days: number) {
+  const current = currentPath
+    ? dateFromDailyPath(currentPath, dailyNotesSettings)
+    : null;
+  await openDailyNote(shiftDate(current ?? new Date(), days), { confirmCreate: true });
+}
+
+async function openPeriodNote(kind: PeriodKind, date = new Date()) {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
     return;
   }
-  let path = findTodayJournal(mdFiles);
-  if (!path) {
-    path = defaultTodayJournalPath();
-    const create = confirm(
-      `No journal for today found.\nCreate ${path}?`,
-    );
+  const path = periodNotePath(date, kind);
+  const exists = mdFilesAll.some((file) => file.path === path);
+  if (!exists) {
+    const create = await uiConfirm(`No ${kind} note yet.\nCreate ${path}?`);
     if (!create) return;
-    const y = new Date().toISOString().slice(0, 10);
-    const stub =
-      `---\n` +
-      `title: Personal Journal\n` +
-      `date: ${y}\n` +
-      `tags:\n` +
-      `  - journal\n` +
-      `---\n\n`;
-    await invoke("write_file", { path, content: stub });
+    const title = path.replace(/\.md$/i, "");
+    await invoke("write_file", {
+      path,
+      content: `---\ntitle: ${title}\ntags:\n  - journal\n  - ${kind}\n---\n\n`,
+    });
     await refreshTree();
   }
   await openNote(path);
+}
+
+async function openDailyNote(date: Date, options: { confirmCreate?: boolean } = {}) {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  const found = dailyPathForDate(mdFilesAll, date, dailyNotesSettings);
+  let path = found.path;
+  if (!found.exists) {
+    if (options.confirmCreate) {
+      const create = await uiConfirm(`No daily note for ${date.toDateString()}.\nCreate ${path}?`);
+      if (!create) return;
+    }
+    const content = await dailyNoteStub(path, date);
+    await invoke("write_file", { path, content });
+    await refreshTree();
+  }
+  await openNote(path);
+}
+
+async function dailyNoteStub(path: string, date: Date): Promise<string> {
+  if (dailyNotesSettings.template) {
+    try {
+      const resolved = await invoke<string | null>("resolve_wikilink", {
+        target: dailyNotesSettings.template,
+        fromPath: path,
+      });
+      if (resolved) {
+        const file = await invoke<OpenFile>("read_file", { path: resolved });
+        const rendered = await renderTemplater(file.content, {
+          path,
+          content: "",
+          readFile: async (requested) => {
+            const target = await invoke<string | null>("resolve_wikilink", {
+              target: requested,
+              fromPath: resolved,
+            });
+            if (!target) throw new Error(`Could not resolve template include: ${requested}`);
+            return (await invoke<OpenFile>("read_file", { path: target })).content;
+          },
+          prompt: async (message, defaultValue) =>
+            uiPrompt(message, { defaultValue: defaultValue ?? "" }),
+        });
+        if (rendered.text.trim()) return rendered.text;
+      }
+    } catch (error) {
+      console.warn("[daily notes template]", error);
+    }
+  }
+  const iso = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return `---\ntitle: Personal Journal\ndate: ${iso}\ntags:\n  - journal\n---\n\n`;
+}
+
+function showDailyCalendar() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  const body = openFeaturePanel("Daily notes");
+  const toolbar = document.createElement("div");
+  toolbar.className = "daily-calendar-toolbar";
+  const ere = document.createElement("button");
+  ere.type = "button";
+  ere.textContent = "Ereyesterday";
+  ere.title = "The day before yesterday";
+  const prev = document.createElement("button");
+  prev.type = "button";
+  prev.textContent = "Yesterday";
+  const today = document.createElement("button");
+  today.type = "button";
+  today.textContent = "Today";
+  const next = document.createElement("button");
+  next.type = "button";
+  next.textContent = "Tomorrow";
+  const over = document.createElement("button");
+  over.type = "button";
+  over.textContent = "Overmorrow";
+  over.title = "The day after tomorrow";
+  ere.addEventListener("click", () => void openAdjacentDaily(-2));
+  prev.addEventListener("click", () => void openAdjacentDaily(-1));
+  today.addEventListener("click", () => void openToday());
+  next.addEventListener("click", () => void openAdjacentDaily(1));
+  over.addEventListener("click", () => void openAdjacentDaily(2));
+  const week = document.createElement("button");
+  week.type = "button";
+  week.textContent = "This week";
+  const monthBtn = document.createElement("button");
+  monthBtn.type = "button";
+  monthBtn.textContent = "This month";
+  const quarter = document.createElement("button");
+  quarter.type = "button";
+  quarter.textContent = "This quarter";
+  week.addEventListener("click", () => void openPeriodNote("week"));
+  monthBtn.addEventListener("click", () => void openPeriodNote("month"));
+  quarter.addEventListener("click", () => void openPeriodNote("quarter"));
+  toolbar.append(ere, prev, today, next, over, week, monthBtn, quarter);
+  const mount = document.createElement("div");
+  body.append(toolbar, mount);
+  const now = new Date();
+  let year = now.getFullYear();
+  let month = now.getMonth();
+  const current = currentPath ? dateFromDailyPath(currentPath, dailyNotesSettings) : null;
+  if (current) {
+    year = current.getFullYear();
+    month = current.getMonth();
+  }
+  const draw = () => {
+    renderDailyCalendar(mount, {
+      year,
+      month,
+      existing: existingDailyKeysForMonth(mdFilesAll, dailyNotesSettings, year, month),
+      currentKey: current
+        ? `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, "0")}-${String(current.getDate()).padStart(2, "0")}`
+        : null,
+      onSelect: (date) => void openDailyNote(date),
+      onMonth: (nextYear, nextMonth) => {
+        year = nextYear;
+        month = nextMonth;
+        draw();
+      },
+    });
+  };
+  draw();
 }
 
 async function openWikilink(target: string) {
@@ -2859,7 +3427,7 @@ async function openWikilink(target: string) {
     }
     // Missing target: create the note (wiki click-to-create) and open it.
     if (!note) {
-      alert(`Could not resolve [[${target}]]`);
+      void uiAlert(`Could not resolve [[${target}]]`);
       return;
     }
     const path = pathForNewWikilink(note);
@@ -2883,7 +3451,7 @@ async function openWikilink(target: string) {
     await openNote(path);
     requestAnimationFrame(() => jumpToWikilinkFragment(heading, block));
   } catch (e) {
-    alert(String(e));
+    void uiAlert(String(e));
   }
 }
 
@@ -3063,6 +3631,14 @@ function saveFile(automatic = false): Promise<void> {
   // Snapshot identity + body NOW — never re-read currentPath/editor after await,
   // or a tab switch can write journal text into another note.
   if (!currentPath) return Promise.resolve();
+  if (
+    currentFileKind === "pdf"
+    || currentFileKind === "code"
+    || currentFileKind === "audio"
+    || currentFileKind === "video"
+    || currentFileKind === "csv"
+    || currentFileKind === "data"
+  ) return Promise.resolve();
   if (currentFileKind === "markdown" && !editor) return Promise.resolve();
   const pending: PendingSave = {
     path: currentPath,
@@ -3092,7 +3668,7 @@ async function performSave(pending: PendingSave) {
     const message = error instanceof Error ? error.message : String(error);
     setTransientStatus(`Save failed: ${message}`, "#e07070");
     console.error("[save] failed", error);
-    if (!automatic) window.alert(`Save failed: ${message}`);
+    if (!automatic) void uiAlert(`Save failed: ${message}`);
     return;
   }
   const unchanged =
@@ -3125,6 +3701,8 @@ function openFeaturePanel(title: string): HTMLElement {
     "Query rendering log": "query-log",
     "Search vault contents": "search",
     "Vault graph": "graph",
+    "Links and outline": "links",
+    Tags: "tags",
     Tasks: "tasks",
     Git: "git",
   };
@@ -3297,6 +3875,96 @@ async function showSearchPanel() {
   void search();
 }
 
+async function showNoteContextPanel() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  if (!currentPath) {
+    void uiAlert("Open a note to see its outline and links.");
+    return;
+  }
+  const body = openFeaturePanel("Links and outline");
+  body.innerHTML = `<div class="feature-loading">Reading links…</div>`;
+  try {
+    const context = await invoke<NoteContext>("note_context", { path: currentPath });
+    renderNoteContext(body, context, {
+      onOpen: (path, line) => {
+        closeFeaturePanel();
+        void (pathExistsInIndex(path) ? openNote(path) : openWikilink(path)).then(() => {
+          if (line && currentFileKind === "markdown") editor?.goToLine(line);
+        });
+      },
+      onHeading: (line) => {
+        closeFeaturePanel();
+        editor?.goToLine(line);
+      },
+      onTag: (tag) => {
+        closeFeaturePanel();
+        void showTagNotes(tag);
+      },
+    });
+  } catch (error) {
+    body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function showTagBrowserPanel() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  const body = openFeaturePanel("Tags");
+  body.innerHTML = `<div class="feature-loading">Reading tags…</div>`;
+  try {
+    const tags = await invoke<VaultTag[]>("vault_tags");
+    renderTagBrowser(body, tags, (tag) => {
+      closeFeaturePanel();
+      void showTagNotes(tag);
+    });
+  } catch (error) {
+    body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function showTagNotes(tag: string) {
+  const body = openFeaturePanel(`Tag #${tag.replace(/^#/, "")}`);
+  body.innerHTML = `<div class="feature-loading">Finding notes…</div>`;
+  try {
+    const pages = await invoke<TagPage[]>("pages_for_tag", { tag });
+    body.replaceChildren();
+    const heading = document.createElement("p");
+    heading.className = "feature-help";
+    heading.textContent = `${pages.length} note${pages.length === 1 ? "" : "s"} tagged #${tag.replace(/^#/, "")}.`;
+    body.append(heading);
+    if (!pages.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No notes use this tag.";
+      body.append(empty);
+      return;
+    }
+    const list = document.createElement("div");
+    list.className = "note-context-list";
+    for (const page of pages) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "link-health-row";
+      button.innerHTML = `<strong></strong><code></code>`;
+      button.querySelector("strong")!.textContent = page.title;
+      button.querySelector("code")!.textContent = page.path;
+      button.addEventListener("click", () => {
+        closeFeaturePanel();
+        void openNote(page.path);
+      });
+      list.append(button);
+    }
+    body.append(list);
+  } catch (error) {
+    body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
 async function showGraphPanel() {
   const body = openFeaturePanel("Vault graph");
   body.classList.add("graph-panel-body");
@@ -3309,6 +3977,40 @@ async function showGraphPanel() {
     }, currentFileKind === "markdown" ? currentPath : null);
   } catch (error) {
     body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function showLinkHealthPanel() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  const body = openFeaturePanel("Orphans and placeholders");
+  body.innerHTML = `<div class="feature-loading">Reading the link index…</div>`;
+  try {
+    const health = await invoke<LinkHealth>("link_health");
+    renderLinkHealth(body, health, {
+      onOpen: (path) => {
+        closeFeaturePanel();
+        void openNote(path);
+      },
+      onCreate: (target, source) => {
+        closeFeaturePanel();
+        void openWikilinkFrom(target, source);
+      },
+    });
+  } catch (error) {
+    body.innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function openWikilinkFrom(target: string, source: string) {
+  const previous = currentPath;
+  currentPath = source;
+  try {
+    await openWikilink(target);
+  } finally {
+    if (currentPath === source) currentPath = previous;
   }
 }
 
@@ -3399,7 +4101,7 @@ async function executeAutomation(id: string, lifecycle = false) {
     for (const prompt of command.prompts ?? []) {
       if (lifecycle) throw new Error(`Lifecycle automation ${id} cannot display prompts`);
       const fallback = expandAutomationText(prompt.default ?? "", variables, automationConfig?.functions);
-      const value = window.prompt(prompt.label, fallback);
+      const value = await uiPrompt(prompt.label, { defaultValue: fallback });
       if (value == null) return;
       variables[prompt.name] = value;
     }
@@ -3476,17 +4178,43 @@ function automationTemplateContext(path: string, content: string, variables: Rec
     content,
     selection: variables.selection ?? "",
     readFile: async (requested: string) => (await invoke<OpenFile>("read_file", { path: requested })).content,
-    prompt: async (message: string, defaultValue?: string) => window.prompt(message, defaultValue ?? ""),
+    prompt: async (message: string, defaultValue?: string) => uiPrompt(message, { defaultValue: defaultValue ?? "" }),
   };
 }
 
 function remapOpenPaths(from: string, to: string) {
-  remapBookmarks(from, to, false);
-  if (currentPath === from) currentPath = to;
-  if (rightPath === from) rightPath = to;
-  openTabs = openTabs.map((path) => path === from ? to : path);
+  remapBookmarks(from, to, true);
+  const rewrite = (path: string | null) => {
+    if (!path) return path;
+    if (path === from) return to;
+    if (path.startsWith(`${from}/`)) return `${to}${path.slice(from.length)}`;
+    return path;
+  };
+  currentPath = rewrite(currentPath);
+  rightPath = rewrite(rightPath);
+  openTabs = openTabs.map((path) => rewrite(path) ?? path);
+  pinnedTabs = new Set([...pinnedTabs].map((path) => rewrite(path) ?? path));
+  closedTabs = closedTabs.map((path) => rewrite(path) ?? path);
   renderTabBar();
   saveSession();
+}
+
+async function showPluginManager() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault to manage plugins.");
+    return;
+  }
+  const body = openFeaturePanel("Plugins");
+  renderPluginManager(body, {
+    installed: () => pluginManager?.statuses() ?? [],
+    reload: async () => {
+      await reloadPlugins();
+    },
+    setEnabled: async (id, enabled) => {
+      await pluginManager?.setEnabled(id, enabled);
+      await reloadPlugins();
+    },
+  });
 }
 
 function renderPreferencesPlugins() {
@@ -3505,15 +4233,20 @@ function renderPreferencesPlugins() {
   for (const plugin of statuses) {
     const label = document.createElement("label");
     label.className = "preferences-plugin";
+    const switchLabel = document.createElement("label");
+    switchLabel.className = "preferences-switch";
     const toggle = document.createElement("input");
     toggle.type = "checkbox";
     toggle.checked = plugin.enabled;
+    const track = document.createElement("span");
+    track.className = "preferences-switch-track";
+    switchLabel.append(toggle, track);
+    toggle.addEventListener("change", () => void pluginManager?.setEnabled(plugin.id, toggle.checked).then(renderPreferencesPlugins));
     const name = document.createElement("span");
     name.textContent = `${plugin.name} ${plugin.version}${plugin.compatibility === "obsidian" ? " · Obsidian" : ""}`;
     const state = document.createElement("small");
     state.textContent = plugin.error || (plugin.loaded ? "Loaded" : plugin.enabled ? "Starting" : "Disabled");
-    toggle.addEventListener("change", () => void pluginManager?.setEnabled(plugin.id, toggle.checked).then(renderPreferencesPlugins));
-    label.append(toggle, name, state);
+    label.append(switchLabel, name, state);
     host.appendChild(label);
   }
 }
@@ -3588,7 +4321,13 @@ html, body {
   border-left: 3px solid #999;
   color: #333;
 }
-.preview img { max-width: 100%; height: auto; }
+.preview img, .preview .mermaid-block svg { max-width: 100%; height: auto; }
+.preview .mermaid-block {
+  margin: 0.8em 0;
+  padding: 0.5em;
+  background: #1a2029;
+  border-radius: 6px;
+}
 .props-block {
   border: 1px solid #bbb;
   border-radius: 6px;
@@ -3715,10 +4454,14 @@ async function exportCurrentPagePdf() {
     return;
   }
 
-  const bodyHtml = renderPreview(markdown, {
+  const holder = document.createElement("div");
+  holder.innerHTML = renderPreview(markdown, {
     includeFrontmatter: include,
     openFrontmatter: include,
   });
+  hydrateCsvFences(holder);
+  await hydrateMermaid(holder);
+  const bodyHtml = holder.innerHTML;
   const title =
     currentPath.split("/").pop()?.replace(/\.md$/i, "") || currentPath || "note";
   printHtmlAsPdf(title, bodyHtml, collectExportCss());
@@ -3757,11 +4500,23 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     { id: "mode-preview", title: "View: Preview", keywords: "render", run: () => setViewMode("preview") },
     { id: "search", title: "Search vault", keywords: "find", run: showSearchPanel },
     { id: "graph", title: "Open graph", keywords: "links backlinks local", run: showGraphPanel },
+    { id: "links", title: "Open links and outline", keywords: "backlinks outgoing unlinked mentions headings", run: () => void showNoteContextPanel() },
+    { id: "tags", title: "Open tags", keywords: "tag pane filter", run: () => void showTagBrowserPanel() },
+    { id: "orphans", title: "Open orphans and placeholders", keywords: "unresolved missing links foam", run: () => void showLinkHealthPanel() },
+    { id: "reopen-tab", title: "Reopen closed tab", keywords: "undo close recent", run: () => void reopenClosedTab() },
     { id: "tasks", title: "Open tasks", keywords: "todo agenda", run: showTasksPanel },
     { id: "bookmarks", title: "Open bookmarks", run: showBookmarksPanel },
     { id: "git", title: "Open Git history", keywords: "versions source control", run: showGitPanel },
     { id: "templates", title: "Apply template", keywords: "templater automation", run: showTemplatePanel },
     { id: "today", title: "Open today's journal", keywords: "daily note", run: openToday },
+    { id: "daily-calendar", title: "Daily notes calendar", keywords: "journal month", run: showDailyCalendar },
+    { id: "ereyesterday", title: "Open ereyesterday", keywords: "vorgestern day before yesterday journal", run: () => void openAdjacentDaily(-2) },
+    { id: "daily-prev", title: "Open yesterday", keywords: "previous journal", run: () => void openAdjacentDaily(-1) },
+    { id: "daily-next", title: "Open tomorrow", keywords: "next journal", run: () => void openAdjacentDaily(1) },
+    { id: "overmorrow", title: "Open overmorrow", keywords: "übermorgen day after tomorrow journal", run: () => void openAdjacentDaily(2) },
+    { id: "this-week", title: "Open this week", keywords: "weekly journal 2026-W02", run: () => void openPeriodNote("week") },
+    { id: "this-month", title: "Open this month", keywords: "monthly journal", run: () => void openPeriodNote("month") },
+    { id: "this-quarter", title: "Open this quarter", keywords: "quarterly journal 2026-Q03", run: () => void openPeriodNote("quarter") },
     { id: "canvas", title: "Create canvas", run: createCanvas },
     { id: "drawing", title: "Create Excalidraw drawing", keywords: "draw", run: createDrawing },
     { id: "sidebar", title: sidebarCollapsed ? "Show file sidebar" : "Hide file sidebar", keywords: "files", run: () => setSidebarCollapsed(!sidebarCollapsed) },
@@ -3773,11 +4528,7 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
       updateVimPowerline();
     } },
     { id: "preferences", title: "Open preferences", keywords: "settings", run: togglePreferences },
-    { id: "plugins", title: "Preferences: Plugins", keywords: "extensions permissions reload", run: () => {
-      if ($("preferences-popover").classList.contains("hidden")) togglePreferences();
-      renderPreferencesPlugins();
-      document.getElementById("preferences-plugins")?.scrollIntoView({ block: "center" });
-    } },
+    { id: "plugins", title: "Manage plugins", keywords: "extensions permissions install browse community", run: () => void showPluginManager() },
     { id: "hotkeys", title: "Preferences: Keyboard shortcuts", keywords: "keys bindings", run: showHotkeysPanel },
     ...(automationConfig?.commands.map((automation): AppCommand => ({
       id: `automation:${automation.id}`,
@@ -3786,12 +4537,21 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
       run: () => executeAutomation(automation.id),
     })) ?? []),
     ...(pluginManager?.commands() ?? []),
-    ...(includeFiles ? mdFilesAll
-      .filter((file) => file.file_kind === "markdown")
+    ...(includeFiles ? vaultFilesAll
+      .filter((file) =>
+        file.file_kind === "markdown" || isPdfPath(file.path) || isCodePath(file.path),
+      )
       .map((file): AppCommand => ({
         id: `open:${file.path}`,
         title: `Open: ${file.path}`,
-        keywords: `note file ${file.name}`,
+        keywords: `note file ${file.name} ${
+          isPdfPath(file.path) ? "pdf"
+          : isAudioPath(file.path) ? "audio"
+          : isVideoPath(file.path) ? "video"
+          : isCsvPath(file.path) ? "csv"
+          : isStructuredPath(file.path) ? "json yaml"
+          : isCodePath(file.path) ? "code" : ""
+        }`,
         run: () => openNote(file.path),
       })) : []),
   ];
@@ -3808,9 +4568,11 @@ function showHotkeysPanel() {
   reset.type = "button";
   reset.textContent = "Reset defaults";
   reset.addEventListener("click", () => {
-    if (!confirm("Reset all keyboard shortcuts to their defaults?")) return;
-    shortcuts.reset();
-    showHotkeysPanel();
+    void uiConfirm("Reset all keyboard shortcuts to their defaults?").then((ok) => {
+      if (!ok) return;
+      shortcuts.reset();
+      showHotkeysPanel();
+    });
   });
   const list = document.createElement("div");
   list.className = "hotkey-list";
@@ -3856,7 +4618,7 @@ function showHotkeysPanel() {
 
 async function createDrawing() {
   const initialFolder = currentPath ? parentDir(currentPath) : "";
-  const entered = promptName("New Excalidraw drawing", "Untitled.excalidraw");
+  const entered = await promptName("New Excalidraw drawing", "Untitled.excalidraw");
   if (!entered) return;
   const filename = entered.endsWith(".excalidraw") ? entered : `${entered}.excalidraw`;
   const path = joinPath(initialFolder, filename);
@@ -3865,13 +4627,13 @@ async function createDrawing() {
     await refreshTree();
     await openNote(path);
   } catch (error) {
-    alert(String(error));
+    void uiAlert(String(error));
   }
 }
 
 async function createCanvas() {
   const initialFolder = currentPath ? parentDir(currentPath) : "";
-  const entered = promptName("New canvas", "Untitled.canvas");
+  const entered = await promptName("New canvas", "Untitled.canvas");
   if (!entered) return;
   const filename = entered.endsWith(".canvas") ? entered : `${entered}.canvas`;
   const path = joinPath(initialFolder, filename);
@@ -3883,7 +4645,7 @@ async function createCanvas() {
     await refreshTree();
     await openNote(path);
   } catch (error) {
-    alert(String(error));
+    void uiAlert(String(error));
   }
 }
 
@@ -3931,7 +4693,7 @@ async function showTemplatePanel() {
     editor.applyChanges(application.changes, application.cursor);
     closeFeaturePanel();
     if (result.warnings.length) {
-      alert(`Template applied with ${result.warnings.length} compatibility warning(s):\n\n${result.warnings.join("\n")}`);
+      void uiAlert(`Template applied with ${result.warnings.length} compatibility warning(s):\n\n${result.warnings.join("\n")}`);
     } else {
       setTransientStatus(`Applied ${template.path}`, "#5ecf9a");
     }
@@ -3961,7 +4723,7 @@ async function showTemplatePanel() {
         list.querySelector(".template-choice.active")?.classList.remove("active");
         button.classList.add("active");
       });
-      button.addEventListener("click", () => void applyTemplate(file.path).catch((error) => alert(String(error))));
+      button.addEventListener("click", () => void applyTemplate(file.path).catch((error) => void uiAlert(String(error))));
       list.appendChild(button);
     });
   };
@@ -3986,7 +4748,7 @@ async function showTemplatePanel() {
     }
     if (event.key === "Enter" && matches[activeIndex]) {
       event.preventDefault();
-      void applyTemplate(matches[activeIndex].path).catch((error) => alert(String(error)));
+      void applyTemplate(matches[activeIndex].path).catch((error) => void uiAlert(String(error)));
     }
   });
   body.append(explanation, search, list);
@@ -4008,7 +4770,7 @@ async function renderTemplateForCurrent(source: string, targetPath: string, sele
       if (!resolved) throw new Error(`Could not resolve template include: ${requested}`);
       return (await invoke<OpenFile>("read_file", { path: resolved })).content;
     },
-    prompt: async (message, defaultValue) => window.prompt(message, defaultValue ?? ""),
+    prompt: async (message, defaultValue) => uiPrompt(message, { defaultValue: defaultValue ?? "" }),
   });
 }
 
@@ -4039,7 +4801,7 @@ async function showTasksPanel() {
     const due = taskSelect(["all", "overdue", "today", "week", "none"], view.due, "Due date");
     const priority = taskSelect(["", "highest", "high", "medium", "low", "lowest"], "", "Priority", "All priorities");
     const sort = taskSelect(["due", "scheduled", "priority", "path"], view.sort, "Sort tasks");
-    const group = taskSelect(["none", "agenda", "due", "priority", "path"], view.group, "Group tasks");
+    const group = taskSelect(["none", "agenda", "due", "priority", "path", "project", "recurrence"], view.group, "Group tasks");
     const pathFilter = document.createElement("input");
     pathFilter.type = "search";
     pathFilter.placeholder = "Path…";
@@ -4152,15 +4914,16 @@ async function showTasksPanel() {
     });
     saveView.addEventListener("click", () => {
       readControls();
-      const name = window.prompt("Saved task view name", view.name || "Task view")?.trim();
-      if (!name) return;
-      view.name = name;
-      const existing = savedViews.findIndex((candidate) => candidate.name === name);
-      if (existing >= 0) savedViews[existing] = { ...view };
-      else savedViews.push({ ...view });
-      persistViews();
-      saved.value = name;
-      deleteView.disabled = false;
+      void uiPrompt("Saved task view name", { defaultValue: view.name || "Task view" }).then((name) => {
+        if (!name?.trim()) return;
+        view.name = name.trim();
+        const existing = savedViews.findIndex((candidate) => candidate.name === name.trim());
+        if (existing >= 0) savedViews[existing] = { ...view };
+        else savedViews.push({ ...view });
+        persistViews();
+        saved.value = name.trim();
+        deleteView.disabled = false;
+      });
     });
     deleteView.addEventListener("click", () => {
       if (!saved.value) return;
@@ -4187,7 +4950,7 @@ async function showTasksPanel() {
           await openNote(currentPath, { skipDirtyPrompt: true });
         }
       } catch (error) {
-        alert(String(error));
+        void uiAlert(String(error));
       } finally {
         applyBulk.disabled = false;
       }
@@ -4228,8 +4991,9 @@ function taskStatusSelect(
   extraStatuses: readonly string[] = [],
 ) {
   const options: Array<[string, string]> = [
-    [" ", "Todo [ ]"], ["/", "In progress [/]"], ["-", "Cancelled [-]"],
-    ["?", "Question [?]"], ["!", "Important [!]"], ["x", "Done [x]"],
+    [" ", "Todo [ ]"], ["/", "In progress [/]"], [">", "Forwarded [>]"],
+    ["<", "Scheduled [<]"], ["?", "Question [?]"], ["!", "Important [!]"],
+    ["x", "Done [x]"], ["-", "Cancelled [-]"],
   ];
   const known = new Set(options.map(([value]) => value));
   for (const value of [...extraStatuses, selected]) {
@@ -4283,7 +5047,7 @@ function renderTaskDashboardRow(
     } catch (error) {
       checkbox.checked = !checkbox.checked;
       checkbox.disabled = false;
-      alert(String(error));
+      void uiAlert(String(error));
     }
   })());
   const text = document.createElement("button");
@@ -4306,6 +5070,11 @@ function renderTaskDashboardRow(
   dueDate.value = task.due || "";
   dueDate.title = "Due date";
   const priority = taskSelect(["", "highest", "high", "medium", "low", "lowest"], task.priority || "", "Task priority", "No priority");
+  const recurrence = document.createElement("input");
+  recurrence.type = "text";
+  recurrence.value = task.recurrence || "";
+  recurrence.placeholder = "🔁 recurring";
+  recurrence.title = "Recurrence rule (e.g. every week, every day)";
   const status = taskStatusSelect(task.status_char, "Task status");
   status.addEventListener("change", () => void (async () => {
     status.disabled = true;
@@ -4316,7 +5085,7 @@ function renderTaskDashboardRow(
     } catch (error) {
       status.value = task.status_char;
       status.disabled = false;
-      alert(String(error));
+      void uiAlert(String(error));
     }
   })());
   const update = async () => {
@@ -4324,30 +5093,92 @@ function renderTaskDashboardRow(
       due: dueDate.value || null,
       scheduled: scheduled.value || null,
       priority: priority.value || null,
+      recurrence: recurrence.value || null,
     });
-    for (const control of [scheduled, dueDate, priority]) control.disabled = true;
+    for (const control of [scheduled, dueDate, priority, recurrence]) control.disabled = true;
     try {
       await invoke("replace_task_line", { path: task.path, taskId: task.task_id, replacement });
       task.raw_line = replacement;
       task.due = dueDate.value || null;
       task.scheduled = scheduled.value || null;
       task.priority = priority.value || null;
+      task.recurrence = recurrence.value || null;
       if (currentPath === task.path) await openNote(task.path, { skipDirtyPrompt: true });
       rerender();
     } catch (error) {
-      for (const control of [scheduled, dueDate, priority]) control.disabled = false;
-      alert(String(error));
+      for (const control of [scheduled, dueDate, priority, recurrence]) control.disabled = false;
+      void uiAlert(String(error));
     }
   };
   scheduled.addEventListener("change", () => void update());
   dueDate.addEventListener("change", () => void update());
   priority.addEventListener("change", () => void update());
-  metadata.append(status, scheduled, dueDate, priority);
+  recurrence.addEventListener("change", () => void update());
+  metadata.append(status, scheduled, dueDate, priority, recurrence);
   const source = document.createElement("span");
   source.className = "task-dashboard-source";
   source.textContent = `${task.path}:${task.line}`;
   row.append(selected, checkbox, text, metadata, source);
   return row;
+}
+
+function mergeDialogHost(): HTMLElement {
+  let host = document.querySelector(".nephrite-dialog-host") as HTMLElement | null;
+  if (!host) {
+    host = document.createElement("div");
+    host.className = "nephrite-dialog-host";
+    document.body.appendChild(host);
+  }
+  return host;
+}
+
+async function mergeVaultFileWith(path: string) {
+  if (dirty && currentPath === path) {
+    await saveFile(true);
+    if (dirty) {
+      void uiAlert(`Save ${path} before merging.`);
+      return;
+    }
+  }
+  const other = await uiPickFile(
+    mdFilesAll.map((file) => ({ path: file.path })),
+    { title: `Merge ${path} with…`, exclude: path },
+  );
+  if (!other) return;
+  const [left, right] = await Promise.all([
+    invoke<OpenFile>("read_file", { path }),
+    invoke<OpenFile>("read_file", { path: other }),
+  ]);
+  const result = await showMergeEditor({
+    title: `Merge ${path}`,
+    leftLabel: path,
+    rightLabel: other,
+    left: left.content,
+    right: right.content,
+  }, mergeDialogHost());
+  if (!result) return;
+  await invoke("write_file", { path, content: result.content });
+  if (currentPath === path) await openNote(path, { skipDirtyPrompt: true });
+}
+
+async function openGitConflictMerge(path: string) {
+  const sides = await invoke<GitConflictSides>("git_conflict_sides", { path });
+  const ours = sides.ours ?? sides.working ?? "";
+  const theirs = sides.theirs ?? "";
+  const result = await showMergeEditor({
+    title: `Resolve ${path}`,
+    leftLabel: "Ours",
+    rightLabel: "Theirs",
+    left: ours,
+    right: theirs,
+    base: sides.base,
+    result: mergeTexts(ours, theirs, sides.base),
+  }, mergeDialogHost());
+  if (!result) return;
+  await invoke("write_file", { path, content: result.content });
+  await invoke("git_resolve_conflict", { path, resolution: "resolved" });
+  if (currentPath === path) await openNote(path, { skipDirtyPrompt: true });
+  await showGitPanel();
 }
 
 async function showGitPanel() {
@@ -4367,7 +5198,7 @@ async function showGitPanel() {
       initialize.addEventListener("click", () => void (async () => {
         await invoke("git_init");
         await showGitPanel();
-      })().catch((error) => alert(String(error))));
+      })().catch((error) => void uiAlert(String(error))));
       body.appendChild(initialize);
       return;
     }
@@ -4424,7 +5255,9 @@ function renderGitPanel(
       abort.textContent = "Abort";
       abort.className = "danger";
       abort.addEventListener("click", () => {
-        if (confirm(`Abort the current ${status.operation}?`)) void runGitAction("git_abort");
+        void uiConfirm(`Abort the current ${status.operation}?`, { danger: true }).then((ok) => {
+          if (ok) void runGitAction("git_abort");
+        });
       });
       operation.append(proceed, abort);
     }
@@ -4454,8 +5287,9 @@ function renderGitPanel(
   const newBranch = document.createElement("button");
   newBranch.textContent = "New branch";
   newBranch.addEventListener("click", () => {
-    const name = prompt("New branch name");
-    if (name?.trim()) void runGitAction("git_create_branch", { name, checkout: true });
+    void uiPrompt("New branch name").then((name) => {
+      if (name?.trim()) void runGitAction("git_create_branch", { name: name.trim(), checkout: true });
+    });
   });
   const pull = document.createElement("button");
   pull.textContent = "Pull";
@@ -4508,6 +5342,10 @@ function renderGitPanel(
         closeFeaturePanel();
         await openNote(entry.path);
       })());
+      const mergeEditor = document.createElement("button");
+      mergeEditor.textContent = "Merge editor";
+      mergeEditor.title = "Compare ours, theirs, and edit the resolved file";
+      mergeEditor.addEventListener("click", () => void openGitConflictMerge(entry.path));
       const resolved = document.createElement("button");
       resolved.textContent = "Mark resolved";
       resolved.addEventListener("click", () => void runGitAction("git_resolve_conflict", {
@@ -4518,19 +5356,19 @@ function renderGitPanel(
       ours.textContent = "Use ours";
       ours.title = "Replace the file with the current branch version and stage it";
       ours.addEventListener("click", () => {
-        if (confirm(`Replace ${entry.path} with our side and mark it resolved?`)) {
-          void runGitAction("git_resolve_conflict", { path: entry.path, resolution: "ours" });
-        }
+        void uiConfirm(`Replace ${entry.path} with our side and mark it resolved?`, { danger: true }).then((ok) => {
+          if (ok) void runGitAction("git_resolve_conflict", { path: entry.path, resolution: "ours" });
+        });
       });
       const theirs = document.createElement("button");
       theirs.textContent = "Use theirs";
       theirs.title = "Replace the file with the incoming version and stage it";
       theirs.addEventListener("click", () => {
-        if (confirm(`Replace ${entry.path} with their side and mark it resolved?`)) {
-          void runGitAction("git_resolve_conflict", { path: entry.path, resolution: "theirs" });
-        }
+        void uiConfirm(`Replace ${entry.path} with their side and mark it resolved?`, { danger: true }).then((ok) => {
+          if (ok) void runGitAction("git_resolve_conflict", { path: entry.path, resolution: "theirs" });
+        });
       });
-      actions.append(openConflict, resolved, ours, theirs);
+      actions.append(openConflict, mergeEditor, resolved, ours, theirs);
     }
     if (!entry.conflicted && (worktreeStatus !== " " || isUntracked)) {
       const stage = document.createElement("button");
@@ -4549,9 +5387,9 @@ function renderGitPanel(
       restore.textContent = "Restore";
       restore.title = "Discard working-tree changes to this path";
       restore.addEventListener("click", () => {
-        if (confirm(`Discard unstaged changes to ${entry.path}?`)) {
-          void runGitAction("git_restore", { paths: [entry.path] });
-        }
+        void uiConfirm(`Discard unstaged changes to ${entry.path}?`, { danger: true }).then((ok) => {
+          if (ok) void runGitAction("git_restore", { paths: [entry.path] });
+        });
       });
       actions.appendChild(restore);
     }
@@ -4577,7 +5415,7 @@ function renderGitPanel(
         await showGitPanel();
       } catch (error) {
         commit.disabled = false;
-        alert(String(error));
+        void uiAlert(String(error));
       }
     })());
     commitRow.append(message, commit);
@@ -4623,14 +5461,15 @@ async function showCommitDetails(hash: string, restorePath?: string) {
       const restore = document.createElement("button");
       restore.textContent = "Restore this file version";
       restore.addEventListener("click", () => {
-        if (confirm(`Restore ${restorePath} from ${commit.hash.slice(0, 12)} into the working tree?`)) {
+        void uiConfirm(`Restore ${restorePath} from ${commit.hash.slice(0, 12)} into the working tree?`, { danger: true }).then((ok) => {
+          if (!ok) return;
           void (async () => {
             await invoke("git_restore_from_commit", { hash: commit.hash, path: restorePath });
             await refreshTree();
             if (currentPath === restorePath) await openNote(restorePath, { skipDirtyPrompt: true });
             await showFileHistory(restorePath);
-          })().catch((error) => alert(String(error)));
-        }
+          })().catch((error) => void uiAlert(String(error)));
+        });
       });
       body.appendChild(restore);
     }
@@ -4672,7 +5511,7 @@ async function runGitAction(command: string, args: Record<string, unknown> = {})
     await refreshTree();
     await showGitPanel();
   } catch (error) {
-    alert(String(error));
+    void uiAlert(String(error));
   }
 }
 
@@ -4688,13 +5527,13 @@ function existingPaths(): Set<string> {
   return new Set(vaultFilesAll.map((f) => f.path));
 }
 
-function promptName(title: string, initial: string): string | null {
-  const v = window.prompt(title, initial);
+async function promptName(title: string, initial: string): Promise<string | null> {
+  const v = await uiPrompt(title, { defaultValue: initial });
   if (v == null) return null;
   const t = v.trim();
   if (!t) return null;
   if (t.includes("..") || t.includes("\\")) {
-    alert("Invalid name");
+    void uiAlert("Invalid name");
     return null;
   }
   return t;
@@ -4704,7 +5543,7 @@ async function handleCtxAction(action: CtxAction, target: CtxTarget) {
   try {
     await runCtxAction(action, target);
   } catch (e) {
-    alert(String(e));
+    void uiAlert(String(e));
   }
 }
 
@@ -4714,6 +5553,14 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
   switch (action) {
     case "close-tab": {
       await closeTab(target.path);
+      return;
+    }
+    case "pin-tab": {
+      pinTab(target.path, true);
+      return;
+    }
+    case "unpin-tab": {
+      pinTab(target.path, false);
       return;
     }
     case "open-new-tab": {
@@ -4748,9 +5595,8 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       return;
     }
     case "merge-file": {
-      alert(
-        "Merge entire file with… is not implemented yet (needs a note picker + merge UI).",
-      );
+      if (target.kind !== "file" && target.kind !== "tab") return;
+      await mergeVaultFileWith(target.path);
       return;
     }
     case "version-history": {
@@ -4763,7 +5609,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       return;
     }
     case "new-note": {
-      const name = promptName("New note name", "Untitled.md");
+      const name = await promptName("New note name", "Untitled.md");
       if (!name) return;
       const file = name.endsWith(".md") ? name : `${name}.md`;
       const path = joinPath(dir, file);
@@ -4779,7 +5625,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       return;
     }
     case "new-folder": {
-      const name = promptName("New folder name", "New folder");
+      const name = await promptName("New folder name", "New folder");
       if (!name) return;
       const path = joinPath(dir, name);
       await invoke("create_folder", { path });
@@ -4790,7 +5636,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       return;
     }
     case "new-canvas": {
-      const name = promptName("New canvas name", "Untitled.canvas");
+      const name = await promptName("New canvas name", "Untitled.canvas");
       if (!name) return;
       const file = name.endsWith(".canvas") ? name : `${name}.canvas`;
       const path = joinPath(dir, file);
@@ -4805,7 +5651,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       return;
     }
     case "new-drawing": {
-      const name = promptName("New Excalidraw drawing", "Untitled.excalidraw");
+      const name = await promptName("New Excalidraw drawing", "Untitled.excalidraw");
       if (!name) return;
       const file = name.endsWith(".excalidraw") ? name : `${name}.excalidraw`;
       const path = joinPath(dir, file);
@@ -4817,7 +5663,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
       return;
     }
     case "new-base": {
-      const name = promptName("New base name", "Untitled.base");
+      const name = await promptName("New base name", "Untitled.base");
       if (!name) return;
       const file = name.endsWith(".base") ? name : `${name}.base`;
       const path = joinPath(dir, file);
@@ -4827,11 +5673,11 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
           "filters:\n  and: []\nviews:\n  - type: table\n    name: Table\n",
       });
       await refreshTree();
-      alert(`Created ${path} (Bases UI later).`);
+      void uiAlert(`Created ${path} (Bases UI later).`);
       return;
     }
     case "new-kanban": {
-      const name = promptName("New kanban board name", "Board.md");
+      const name = await promptName("New kanban board name", "Board.md");
       if (!name) return;
       const file = name.endsWith(".md") ? name : `${name}.md`;
       const path = joinPath(dir, file);
@@ -4854,21 +5700,14 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
     }
     case "move-to": {
       if (!target.path) return;
-      const destDir = promptName(
+      const destDir = await promptName(
         target.kind === "folder" ? "Move folder to (vault path)" : "Move file to (folder path)",
         parentDir(target.path) || "",
       );
       if (destDir == null) return;
       const name = baseName(target.path);
       const to = joinPath(destDir.replace(/^\/+|\/+$/g, ""), name);
-      await invoke("rename_path", { from: target.path, to });
-      remapBookmarks(target.path, to, target.kind === "folder");
-      if (currentPath === target.path) currentPath = to;
-      openTabs = openTabs.map((t) => (t === target.path ? to : t));
-      if (rightPath === target.path) rightPath = to;
-      await refreshTree();
-      renderTabBar();
-      updateRightPane();
+      await moveVaultPath(target.path, to);
       return;
     }
     case "search-in-folder": {
@@ -4907,7 +5746,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
     case "rename": {
       if (!target.path) return;
       const cur = baseName(target.path);
-      let name = promptName("Rename to", cur);
+      let name = await promptName("Rename to", cur);
       if (!name || name === cur) return;
       // Keep extension if the user drops it on a file rename
       if (target.kind === "file" || target.kind === "tab") {
@@ -4933,7 +5772,7 @@ async function runCtxAction(action: CtxAction, target: CtxTarget) {
     }
     case "delete": {
       if (!target.path) return;
-      const ok = confirm(`Delete “${target.path}”? This cannot be undone.`);
+      const ok = await uiConfirm(`Delete “${target.path}”? This cannot be undone.`, { danger: true });
       if (!ok) return;
       await invoke("delete_path", { path: target.path });
       removeBookmarksUnder(target.path, target.kind === "folder");
@@ -4983,14 +5822,45 @@ function removeBookmarksUnder(path: string, includeChildren: boolean) {
   ));
 }
 
+function pinTab(path: string, pinned: boolean) {
+  if (pinned) pinnedTabs.add(path);
+  else pinnedTabs.delete(path);
+  if (pinned && !openTabs.includes(path)) openTabs.push(path);
+  openTabs = [
+    ...openTabs.filter((tab) => pinnedTabs.has(tab)),
+    ...openTabs.filter((tab) => !pinnedTabs.has(tab)),
+  ];
+  renderTabBar();
+  saveSession();
+}
+
+async function reopenClosedTab() {
+  while (closedTabs.length) {
+    const path = closedTabs.shift();
+    if (!path) break;
+    if (!pathExistsInIndex(path)) continue;
+    if (!openTabs.includes(path)) openTabs.push(path);
+    await openNote(path);
+    renderTabBar();
+    saveSession();
+    return;
+  }
+  void uiAlert("No recently closed tab.");
+}
+
 async function closeTab(path: string) {
   if (currentPath === path && dirty) {
     await saveFile(true);
     if (dirty) {
-      const discard = confirm(`Automatic save of ${path} failed. Close and discard changes?`);
+      const discard = await uiConfirm(`Automatic save of ${path} failed. Close and discard changes?`, { danger: true });
       if (!discard) return;
     }
   }
+  if (!closedTabs.includes(path)) {
+    closedTabs.unshift(path);
+    closedTabs = closedTabs.slice(0, MAX_CLOSED_TABS);
+  }
+  pinnedTabs.delete(path);
   openTabs = openTabs.filter((tab) => tab !== path);
   if (currentPath === path) {
     const next = openTabs[openTabs.length - 1];
@@ -5013,11 +5883,11 @@ function renderTabBar() {
   bar.innerHTML = "";
   for (const path of openTabs) {
     const chip = document.createElement("div");
-    chip.className = "tab-chip" + (path === currentPath ? " active" : "");
+    chip.className = "tab-chip" + (path === currentPath ? " active" : "") + (pinnedTabs.has(path) ? " pinned" : "");
     chip.addEventListener("contextmenu", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      showContextMenu(event.clientX, event.clientY, { kind: "tab", path }, handleCtxAction);
+      showContextMenu(event.clientX, event.clientY, { kind: "tab", path, pinned: pinnedTabs.has(path) }, handleCtxAction);
     });
     const label = document.createElement("button");
     label.type = "button";

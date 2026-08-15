@@ -1,4 +1,5 @@
 import { marked } from "marked";
+import { DateTime, Duration } from "luxon";
 import { bindQueryUriLinks, formatQueryUri } from "./query-uri";
 import { queryDiagnostic } from "./query-diagnostics";
 import { ObsidianApp, type AppFile } from "./app-api";
@@ -8,7 +9,10 @@ import { ObsidianApp, type AppFile } from "./app-api";
  * and inline backtick commands.
  *
  * Recognized fence languages (see extractScriptBlocks):
- *   dataviewjs | dataview | js | javascript | sql | postgresql | pgsql | (empty)
+ *   dataviewjs | dataview | js | javascript | pgsql | (empty)
+ *
+ * `sql`, `sqlpostgresql`, `postgresql`, `postgres`, and `psql` are highlighter
+ * tags. Only `pgsql` runs the vault query engine.
  *
  * Empty / bare ``` fences run only if the body references `dv` (safe default).
  */
@@ -44,6 +48,9 @@ export type DvApi = {
   pages: (source?: string) => DvPageList;
   page: (path: string) => DvPage | null;
   pagePaths: (source?: string) => DvDataArray<string>;
+  pagesFromTags: (tags: string | string[]) => DvPageList;
+  pagesFromPath: (path: string | string[]) => DvPageList;
+  pagesFromLinks: (link: string | string[]) => DvPageList;
   array: <T>(value: T | Iterable<T> | null | undefined) => DvDataArray<T>;
   compare: (left: unknown, right: unknown) => number;
   equal: (left: unknown, right: unknown) => boolean;
@@ -52,7 +59,7 @@ export type DvApi = {
   sectionLink: (path: string, section: string, embed?: boolean, display?: string) => string;
   blockLink: (path: string, block: string, embed?: boolean, display?: string) => string;
   date: (input?: unknown) => Date | null;
-  duration?: (s: string) => unknown;
+  duration: (s: string) => unknown;
   paragraph: (html: unknown) => void;
   list: (items: unknown) => void;
   table: (headers: string[], rows: unknown[][]) => void;
@@ -91,6 +98,7 @@ export type DvDataArray<T> = Array<T> & {
   groupBy: (key: (value: T) => unknown) => DvDataArray<{ key: unknown; rows: DvDataArray<T> }>;
   first: () => T | undefined;
   last: () => T | undefined;
+  mutate: (mapper: (value: T) => unknown) => DvDataArray<T>;
   values: T[];
   array: () => T[];
 };
@@ -123,7 +131,8 @@ export type ScriptBlock = {
 
 const FENCE_RE = /^[ \t]{0,3}```([^\n`]*)\n([\s\S]*?)^[ \t]{0,3}```/gm;
 
-const SQL_LANGS = new Set(["sql", "postgresql", "pgsql"]);
+/** Only the `pgsql` fence runs the vault query engine. */
+const SQL_LANGS = new Set(["pgsql"]);
 
 /** Languages that always run through the Nephrite JS engine. */
 const ALWAYS_ENGINE = new Set([
@@ -192,6 +201,18 @@ export function wrapDataArray<T>(values: Iterable<T>): DvDataArray<T> {
     }, enumerable: false },
     first: { value: () => target[0], enumerable: false },
     last: { value: () => target.at(-1), enumerable: false },
+    mutate: { value: (mapper: (value: T) => unknown) => {
+      for (let index = 0; index < target.length; index++) {
+        const next = mapper(target[index]);
+        if (next === undefined) continue;
+        if (target[index] && typeof target[index] === "object" && !Array.isArray(target[index])) {
+          Object.assign(target[index] as object, next as object);
+        } else {
+          target[index] = next as T;
+        }
+      }
+      return target;
+    }, enumerable: false },
     values: { get: () => target.slice(), enumerable: false },
     array: { value: () => target.slice(), enumerable: false },
   });
@@ -228,6 +249,22 @@ function wrapList(pages: DvPage[]): DvPageList {
   return wrapDataArray(pages) as DvPageList;
 }
 
+export type DurationParts = {
+  years?: number;
+  months?: number;
+  weeks?: number;
+  days?: number;
+  hours?: number;
+  minutes?: number;
+  seconds?: number;
+  milliseconds?: number;
+};
+
+/** Obsidian Dataview `normalizeDuration`: decompose into calendar units then normalize overflow. */
+function normalizeDuration(duration: Duration): Duration {
+  return duration.shiftToAll().normalize();
+}
+
 class DvDate extends Date {
   get year() { return this.getFullYear(); }
   get month() { return this.getMonth() + 1; }
@@ -237,25 +274,79 @@ class DvDate extends Date {
     return `${this.year}-${String(this.month).padStart(2, "0")}-${String(this.day).padStart(2, "0")}`;
   }
 
-  plus(parts: { days?: number; weeks?: number; months?: number; years?: number } | DvDuration): DvDate {
-    const next = new DvDate(this.getTime());
-    if (parts instanceof DvDuration) {
-      next.setTime(next.getTime() + parts.milliseconds);
-      return next;
-    }
-    if (parts.years) next.setFullYear(next.getFullYear() + parts.years);
-    if (parts.months) next.setMonth(next.getMonth() + parts.months);
-    if (parts.weeks) next.setDate(next.getDate() + parts.weeks * 7);
-    if (parts.days) next.setDate(next.getDate() + parts.days);
-    return next;
+  /** Luxon `DateTime.toFormat` — used by vault scripts such as Tracker - Water. */
+  toFormat(fmt: string): string {
+    return DateTime.fromJSDate(this).toFormat(fmt);
   }
 
+  toISODate(): string {
+    return this.toString();
+  }
+
+  /**
+   * Calendar arithmetic, matching Obsidian Dataview's luxon-backed `date.plus(...)`.
+   * Adding 80 years to 1968-11-14 lands on 2048-11-14 (not a millisecond offset).
+   */
+  plus(parts: DurationParts | DvDuration): DvDate {
+    const duration = parts instanceof DvDuration ? parts.duration : Duration.fromObject(parts);
+    return toDvDate(DateTime.fromJSDate(this).plus(duration).toJSDate()) ?? new DvDate(this.getTime());
+  }
+
+  minus(parts: DurationParts | DvDuration): DvDate {
+    const duration = parts instanceof DvDuration ? parts.duration : Duration.fromObject(parts);
+    return toDvDate(DateTime.fromJSDate(this).minus(duration).toJSDate()) ?? new DvDate(this.getTime());
+  }
+
+  /** Date minus date → decomposed calendar duration (Obsidian `date - date`). */
+  diff(other: Date): DvDuration {
+    const units: (keyof DurationParts)[] = ["years", "months", "days", "hours", "minutes", "seconds", "milliseconds"];
+    const duration = DateTime.fromJSDate(this).diff(DateTime.fromJSDate(other), units);
+    return new DvDuration(normalizeDuration(duration));
+  }
+
+  /** Luxon-compatible surface (DateTimeProxy.plus accepts a Duration or plain object). */
+  toDateTime(): DateTime { return DateTime.fromJSDate(this); }
 }
 
 class DvDuration {
-  constructor(readonly milliseconds: number) {}
-  get days() { return this.milliseconds / 86_400_000; }
-  valueOf() { return this.milliseconds; }
+  constructor(readonly duration: Duration) {}
+
+  static fromMillis(milliseconds: number): DvDuration {
+    return new DvDuration(Duration.fromMillis(milliseconds));
+  }
+
+  static fromParts(parts: DurationParts): DvDuration {
+    return new DvDuration(Duration.fromObject(parts));
+  }
+
+  /** Total of this duration in one unit (Obsidian `duration.day`, `.days`, ... getters). */
+  private total(unit: keyof DurationParts): number {
+    return this.duration.shiftTo(unit).get(unit);
+  }
+
+  get years() { return this.total("years"); }
+  get months() { return this.total("months"); }
+  get weeks() { return this.total("weeks"); }
+  /** Matches Obsidian: `dur(...).days` is the luxon `shiftTo("days").days` total. */
+  get days() { return this.total("days"); }
+  get hours() { return this.total("hours"); }
+  get minutes() { return this.total("minutes"); }
+  get seconds() { return this.total("seconds"); }
+  get milliseconds() { return this.total("milliseconds"); }
+
+  plus(other: DvDuration): DvDuration {
+    return new DvDuration(normalizeDuration(this.duration.plus(other.duration)));
+  }
+  minus(other: DvDuration): DvDuration {
+    return new DvDuration(normalizeDuration(this.duration.minus(other.duration)));
+  }
+  mapUnits(mapper: (value: number) => number): DvDuration {
+    return new DvDuration(normalizeDuration(this.duration.mapUnits(mapper)));
+  }
+
+  toHuman(): string { return this.duration.toHuman(); }
+  toString(): string { return this.duration.toHuman(); }
+  valueOf() { return this.duration.as("milliseconds"); }
 }
 
 function compareValues(a: unknown, b: unknown): number {
@@ -269,11 +360,65 @@ function compareValues(a: unknown, b: unknown): number {
   return 0;
 }
 
+function startOfLocalDay(date = new Date()): DvDate {
+  return new DvDate(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function namedDvDate(raw: string): DvDate | null {
+  const key = raw.trim().toLowerCase();
+  const now = new Date();
+  const shiftDays = (days: number) =>
+    startOfLocalDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() + days));
+  switch (key) {
+    case "today":
+      return startOfLocalDay(now);
+    case "yesterday":
+      return shiftDays(-1);
+    case "tomorrow":
+      return shiftDays(1);
+    case "now":
+      return new DvDate();
+    case "sow":
+    case "start-of-week": {
+      const weekday = now.getDay() || 7;
+      return shiftDays(1 - weekday);
+    }
+    case "eow":
+    case "end-of-week": {
+      const weekday = now.getDay() || 7;
+      return shiftDays(7 - weekday);
+    }
+    case "som":
+    case "start-of-month":
+      return new DvDate(now.getFullYear(), now.getMonth(), 1);
+    case "eom":
+    case "end-of-month":
+      return new DvDate(now.getFullYear(), now.getMonth() + 1, 0);
+    case "soy":
+    case "start-of-year":
+      return new DvDate(now.getFullYear(), 0, 1);
+    case "eoy":
+    case "end-of-year":
+      return new DvDate(now.getFullYear(), 11, 31);
+    default:
+      return null;
+  }
+}
+
 function toDvDate(input: unknown): DvDate | null {
   if (input instanceof DvDate) return input;
   if (input instanceof Date) return new DvDate(input.getTime());
+  if (typeof input === "object" && input && "toJSDate" in input) {
+    try {
+      return toDvDate((input as { toJSDate: () => Date }).toJSDate());
+    } catch {
+      return null;
+    }
+  }
   if (typeof input === "string") {
-    const plain = input.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|T)/);
+    const named = namedDvDate(input);
+    if (named) return named;
+    const plain = input.match(/^(\d{4})[-_/](\d{2})[-_/](\d{2})(?:$|T)/);
     if (plain) {
       return new DvDate(Number(plain[1]), Number(plain[2]) - 1, Number(plain[3]));
     }
@@ -464,6 +609,28 @@ export async function runScriptBlock(
       return pages.find((p) => p.path === path || p.path === path + ".md") ?? null;
     },
     pagePaths: (source?: string) => wrapDataArray(dv.pages(source).map((page) => page.path)),
+    pagesFromTags: (tags) => {
+      const wanted = (Array.isArray(tags) ? tags : String(tags).split(",")).map((tag) => tag.trim().toLocaleLowerCase()).filter(Boolean);
+      const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
+      return wrapList(pages.filter((page) =>
+        wanted.some((tag) => (page.file.tags ?? []).some((candidate) =>
+          candidate.toLocaleLowerCase() === tag || candidate.toLocaleLowerCase().startsWith(`${tag}/`)))));
+    },
+    pagesFromPath: (path) => {
+      const folders = (Array.isArray(path) ? path : [path]).map((folder) =>
+        String(folder).trim().replace(/^\/+|\/+$/g, "").toLocaleLowerCase()).filter(Boolean);
+      const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
+      return wrapList(pages.filter((page) =>
+        folders.some((folder) =>
+          page.file.folder.toLocaleLowerCase() === folder ||
+          page.path.toLocaleLowerCase().startsWith(`${folder}/`))));
+    },
+    pagesFromLinks: (link) => {
+      const wanted = (Array.isArray(link) ? link : [link]).map((value) => String(value).trim());
+      const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
+      return wrapList(pages.filter((page) =>
+        (page.file.outlinks ?? []).some((outlink) => wanted.some((target) => linksEqual(outlink, target)))));
+    },
     array: <T>(value: T | Iterable<T> | null | undefined) => {
       if (value == null) return wrapDataArray<T>([]);
       if (typeof value !== "string" && Symbol.iterator in Object(value)) return wrapDataArray(value as Iterable<T>);
@@ -478,19 +645,10 @@ export async function runScriptBlock(
     sectionLink: (path, section, embed = false, display) => makeWikilink(`${path}#${section}`, embed, display),
     blockLink: (path, block, embed = false, display) => makeWikilink(`${path}^${block}`, embed, display),
     date: (input?: unknown) => {
-      if (input == null || input === "") return new DvDate();
-      if (input instanceof Date || typeof input === "string" || typeof input === "number") {
-        return toDvDate(input);
-      }
-      if (typeof input === "object" && input && "toJSDate" in (input as object)) {
-        try {
-          return toDvDate((input as { toJSDate: () => Date }).toJSDate());
-        } catch {
-          return null;
-        }
-      }
-      return null;
+      if (input == null || input === "") return startOfLocalDay();
+      return toDvDate(input);
     },
+    duration: (s: string) => parseDuration(s),
     paragraph: (html: unknown) => {
       if (typeof html === "string") {
         const withLinks = stringifyInline(html);
@@ -658,101 +816,19 @@ export async function runScriptBlock(
     }
   };
 
-  const dur = (s: unknown) => {
-    if (s instanceof DvDuration) return s;
-    if (typeof s === "number") return new DvDuration(s);
-    const match = String(s).trim().match(
-      /^(-?\d+(?:\.\d+)?)\s*(years?|months?|weeks?|days?|hours?|minutes?)$/i,
-    );
-    if (!match) return new DvDuration(0);
-    const amount = Number(match[1]);
-    const unit = match[2].toLowerCase();
-    const days = unit.startsWith("year")
-      ? amount * 365.2425
-      : unit.startsWith("month")
-        ? amount * 30.436875
-        : unit.startsWith("week")
-          ? amount * 7
-          : unit.startsWith("day")
-            ? amount
-            : unit.startsWith("hour")
-              ? amount / 24
-              : amount / 1_440;
-    return new DvDuration(days * 86_400_000);
-  };
+  const dur = (s: unknown) => parseDuration(s);
 
   const choice = (condition: unknown, whenTrue: unknown, whenFalse: unknown) =>
     condition ? whenTrue : whenFalse;
 
   try {
-    // AsyncFunction so scripts can await if they want
-    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
-      ...args: string[]
-    ) => (...args: unknown[]) => Promise<unknown>;
-    let fn: (...args: unknown[]) => Promise<unknown>;
-    if (inline) {
-      const expression = code
-        .trim()
-        .replace(/^\$?=\s*/, "")
-        .replace(
-          /\bdur\(\s*(-?\d+(?:\.\d+)?)\s+(years?|months?|weeks?|days?|hours?|minutes?)\s*\)/gi,
-          'dur("$1 $2")',
-        )
-        .replace(
-          /(date\([^)]*\)|\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*\+\s*(dur\("[^"]+"\))/g,
-          "$1.plus($2)",
-        );
-      try {
-        fn = new AsyncFunction(
-          "dv",
-          "dateformat",
-          "dur",
-          "date",
-          "choice",
-          "luxonish",
-          "note",
-          "input",
-          "app",
-          `"use strict";\nreturn (${expression});`,
-        );
-      } catch {
-        // Multi-statement inline commands still run; an explicit return renders.
-        fn = new AsyncFunction(
-          "dv",
-          "dateformat",
-          "dur",
-          "date",
-          "choice",
-          "luxonish",
-          "note",
-          "input",
-          "app",
-          `"use strict";\n${expression}`,
-        );
-      }
-    } else {
-      fn = new AsyncFunction(
-        "dv",
-        "dateformat",
-        "dur",
-        "date",
-        "choice",
-        "luxonish",
-        "note",
-        "input",
-        "app",
-        `"use strict";\n${code}`,
-      );
-    }
-    const result = await fn.call(
+    const result = await runDataviewJs(
+      inline ? wrapInlineExpression(code) : code,
       thisNote,
       dv,
       dateformat,
       dur,
-      dv.date,
       choice,
-      luxonish,
-      thisNote,
       scriptInput,
       app,
     );
@@ -1146,9 +1222,15 @@ export function lowerDqlFunctionAliases(expression: string): string {
       const identifier = expression.slice(index, end);
       let next = end;
       while (next < expression.length && /\s/.test(expression[next])) next++;
-      output += identifier.toLowerCase() === "default" && expression[next] === "("
-        ? "coalesce"
-        : identifier;
+      const isCall = expression[next] === "(";
+      const prev = expression.slice(0, index).replace(/\s+$/, "").at(-1);
+      const propertyAccess = prev === "." || prev === "?";
+      const mapped = identifier.toLowerCase() === "default" && isCall ? "coalesce" : identifier;
+      if (isCall && !propertyAccess && DQL_HELPER_NAMES.has(mapped.toLowerCase())) {
+        output += `helpers.${mapped}`;
+      } else {
+        output += mapped;
+      }
       index = end;
       continue;
     }
@@ -1157,6 +1239,17 @@ export function lowerDqlFunctionAliases(expression: string): string {
   }
   return output;
 }
+
+const DQL_HELPER_NAMES: ReadonlySet<string> = new Set([
+  "contains", "icontains", "econtains", "containsword", "startswith", "endswith",
+  "string", "number", "length", "choice", "coalesce", "regexmatch", "regextest",
+  "regexreplace", "replace", "lower", "upper", "split", "substring", "truncate",
+  "padleft", "padright", "typeof", "list", "join", "sum", "min", "max", "average",
+  "product", "round", "floor", "ceil", "trunc", "any", "all", "none", "filter",
+  "map", "reduce", "flat", "slice", "nonnull", "firstvalue", "unique", "distinct",
+  "reverse", "sort", "date", "dur", "dateformat", "object", "extract", "meta",
+  "link", "default",
+]);
 
 /** Apply Dataview's page-source selectors to an already-loaded page collection. */
 export function filterPagesBySource(
@@ -1241,6 +1334,214 @@ function findPage(pages: DvPage[], path: string): DvPage | undefined {
   return pages.find((page) => linksEqual(page.path, path));
 }
 
+/* ------------------------------------------------------------------ */
+/* DQL date/duration arithmetic rewriting                             */
+/*                                                                     */
+/* Obsidian evaluates `date - date`, `date + dur`, `dur - dur`,        */
+/* `dur * n`, … through luxon calendar arithmetic. Plain JavaScript     */
+/* would coerce dates to milliseconds, so rewrite binary `+ - * /`     */
+/* between non-literal operands into a runtime dispatch helper that    */
+/* reproduces Obsidian's semantics.                                    */
+/* ------------------------------------------------------------------ */
+
+type JToken =
+  | { type: "num"; value: string }
+  | { type: "str"; value: string }
+  | { type: "id"; value: string }
+  | { type: "op"; value: string }
+  | { type: "eof"; value: string };
+
+type JNode =
+  | { kind: "lit"; value: string }
+  | { kind: "id"; value: string }
+  | { kind: "group"; expr: JNode }
+  | { kind: "unary"; op: string; operand: JNode }
+  | { kind: "member"; object: JNode; prop: string; computed: JNode | null }
+  | { kind: "call"; callee: JNode; args: JNode[] }
+  | { kind: "binary"; op: string; left: JNode; right: JNode };
+
+const JS_BINARY_PRECEDENCE: Record<string, number> = {
+  "||": 1, "&&": 2,
+  "==": 3, "!=": 3, "<": 3, "<=": 3, ">": 3, ">=": 3,
+  "+": 4, "-": 4,
+  "*": 5, "/": 5, "%": 5,
+};
+
+const DATE_ARITHMETIC_OPS = new Set(["+", "-", "*", "/"]);
+
+function jsTokens(source: string): JToken[] {
+  const tokens: JToken[] = [];
+  let i = 0;
+  while (i < source.length) {
+    const char = source[i];
+    if (/\s/.test(char)) { i++; continue; }
+    if (char === '"' || char === "'") {
+      const quote = char; let j = i + 1;
+      while (j < source.length) {
+        if (source[j] === "\\") j += 2;
+        else if (source[j] === quote) { j++; break; }
+        else j++;
+      }
+      tokens.push({ type: "str", value: source.slice(i, j) });
+      i = j; continue;
+    }
+    if (/[0-9]/.test(char) || (char === "." && /[0-9]/.test(source[i + 1] ?? ""))) {
+      let j = i;
+      while (j < source.length && /[0-9._]/.test(source[j])) j++;
+      tokens.push({ type: "num", value: source.slice(i, j) });
+      i = j; continue;
+    }
+    if (/[A-Za-z_$]/.test(char)) {
+      let j = i;
+      while (j < source.length && /[A-Za-z0-9_$]/.test(source[j])) j++;
+      tokens.push({ type: "id", value: source.slice(i, j) });
+      i = j; continue;
+    }
+    const two = source.slice(i, i + 2);
+    if (["&&", "||", "==", "!=", "<=", ">=", "**", "??"].includes(two)) {
+      tokens.push({ type: "op", value: two }); i += 2; continue;
+    }
+    tokens.push({ type: "op", value: char });
+    i++;
+  }
+  tokens.push({ type: "eof", value: "" });
+  return tokens;
+}
+
+class JsParser {
+  private pos = 0;
+  constructor(private readonly tokens: JToken[]) {}
+
+  peek(): JToken { return this.tokens[this.pos]; }
+  private advance(): JToken { const token = this.tokens[this.pos]; if (token.type !== "eof") this.pos++; return token; }
+
+  parseExpression(minPrec: number): JNode {
+    let left = this.parseUnary();
+    for (;;) {
+      const token = this.peek();
+      const precedence = token.type === "op" ? JS_BINARY_PRECEDENCE[token.value] : undefined;
+      if (precedence === undefined || precedence < minPrec) break;
+      this.advance();
+      const right = this.parseExpression(precedence + 1);
+      left = { kind: "binary", op: token.value, left, right };
+    }
+    return left;
+  }
+
+  private parseUnary(): JNode {
+    const token = this.peek();
+    if (token.type === "op" && (token.value === "-" || token.value === "!")) {
+      this.advance();
+      return { kind: "unary", op: token.value, operand: this.parseUnary() };
+    }
+    return this.parsePostfix(this.parsePrimary());
+  }
+
+  private parsePrimary(): JNode {
+    const token = this.advance();
+    if (token.type === "num" || token.type === "str") return { kind: "lit", value: token.value };
+    if (token.type === "id") return { kind: "id", value: token.value };
+    if (token.type === "op" && token.value === "(") {
+      const expr = this.parseExpression(0);
+      const close = this.advance();
+      if (close.type !== "op" || close.value !== ")") throw new Error("unbalanced paren");
+      return { kind: "group", expr };
+    }
+    throw new Error("unexpected token");
+  }
+
+  private parsePostfix(base: JNode): JNode {
+    let node = base;
+    for (;;) {
+      const token = this.peek();
+      if (token.type === "op" && token.value === ".") {
+        this.advance();
+        const prop = this.advance();
+        if (prop.type !== "id") throw new Error("bad member");
+        node = { kind: "member", object: node, prop: prop.value, computed: null };
+      } else if (token.type === "op" && token.value === "[") {
+        this.advance();
+        const index = this.parseExpression(0);
+        const close = this.advance();
+        if (close.type !== "op" || close.value !== "]") throw new Error("unbalanced bracket");
+        node = { kind: "member", object: node, prop: "", computed: index };
+      } else if (token.type === "op" && token.value === "(") {
+        this.advance();
+        const args: JNode[] = [];
+        if (this.peek().type !== "op" || this.peek().value !== ")") {
+          do { args.push(this.parseExpression(0)); } while (this.peek().type === "op" && this.peek().value === "," && this.advance());
+        }
+        const close = this.advance();
+        if (close.type !== "op" || close.value !== ")") throw new Error("unbalanced call");
+        node = { kind: "call", callee: node, args };
+      } else break;
+    }
+    return node;
+  }
+}
+
+function isLiteralJsNode(node: JNode): boolean {
+  return node.kind === "lit";
+}
+
+function serializeJsNode(node: JNode): string {
+  switch (node.kind) {
+    case "lit": return node.value;
+    case "id": return node.value;
+    case "group": return `(${serializeJsNode(node.expr)})`;
+    case "unary": return `(${node.op}${serializeJsNode(node.operand)})`;
+    case "member":
+      return node.computed
+        ? `${serializeJsNode(node.object)}[${serializeJsNode(node.computed)}]`
+        : `${serializeJsNode(node.object)}.${node.prop}`;
+    case "call":
+      return `${serializeJsNode(node.callee)}(${node.args.map(serializeJsNode).join(", ")})`;
+    case "binary": {
+      if (DATE_ARITHMETIC_OPS.has(node.op) && !(isLiteralJsNode(node.left) && isLiteralJsNode(node.right))) {
+        return `(helpers.dateop("${node.op}", ${serializeJsNode(node.left)}, ${serializeJsNode(node.right)}))`;
+      }
+      return `(${serializeJsNode(node.left)} ${node.op} ${serializeJsNode(node.right)})`;
+    }
+  }
+}
+
+/** Rewrite `+ - * /` between date/duration-capable operands into `helpers.dateop` dispatch. */
+function rewriteDateArithmetic(source: string): string {
+  try {
+    const parser = new JsParser(jsTokens(source));
+    const node = parser.parseExpression(0);
+    if (parser.peek().type !== "eof") return source;
+    return serializeJsNode(node);
+  } catch {
+    return source;
+  }
+}
+
+/** Runtime `+ - * /` dispatcher mirroring Obsidian Dataview's date/duration binary ops. */
+function dateArithmetic(op: string, a: unknown, b: unknown): unknown {
+  switch (op) {
+    case "+":
+      if (a instanceof Date && b instanceof DvDuration) return toDvDate(a)?.plus(b) ?? a;
+      if (a instanceof DvDuration && b instanceof Date) return toDvDate(b)?.plus(a) ?? b;
+      if (a instanceof DvDuration && b instanceof DvDuration) return a.plus(b);
+      return (a as any) + (b as any);
+    case "-":
+      if (a instanceof Date && b instanceof Date) return toDvDate(a)?.diff(b) ?? a;
+      if (a instanceof Date && b instanceof DvDuration) return toDvDate(a)?.minus(b) ?? a;
+      if (a instanceof DvDuration && b instanceof DvDuration) return a.minus(b);
+      return (a as number) - (b as number);
+    case "*":
+      if (a instanceof DvDuration && typeof b === "number") return a.mapUnits((value) => value * b);
+      if (typeof a === "number" && b instanceof DvDuration) return b.mapUnits((value) => value * a);
+      return (a as number) * (b as number);
+    case "/":
+      if (a instanceof DvDuration && typeof b === "number") return a.mapUnits((value) => value / b);
+      return (a as number) / (b as number);
+    default:
+      return Number.NaN;
+  }
+}
+
 /** Evaluate one DQL expression after lowering compatibility aliases to the IR vocabulary. */
 export function evaluateDql(expression: string, row: DqlRow, current: DvPage): unknown {
   const javascript = lowerDqlFunctionAliases(expression)
@@ -1252,6 +1553,7 @@ export function evaluateDql(expression: string, row: DqlRow, current: DvPage): u
     .replace(/\bOR\b/gi, "||")
     .replace(/\bNOT\b/gi, "!")
     .replace(/(?<![<>=!])=(?!=)/g, "==");
+  const javascriptRewritten = rewriteDateArithmetic(javascript);
   const helpers = {
     current,
     contains: (haystack: unknown, needle: unknown) => Array.isArray(haystack)
@@ -1306,9 +1608,10 @@ export function evaluateDql(expression: string, row: DqlRow, current: DvPage): u
     distinct: (values: unknown[]) => [...new Set(values)],
     reverse: (values: unknown[]) => values.slice().reverse(),
     sort: (values: unknown[]) => values.slice().sort(compareValues),
-    date: (value?: unknown) => value == null || value === "today" ? toDvDate(new Date()) : value === "now" ? new DvDate() : toDvDate(value),
+    date: (value?: unknown) => value == null || value === "" ? startOfLocalDay() : toDvDate(value),
     dur: parseDuration,
     dateformat: formatDvDate,
+    dateop: dateArithmetic,
     object: (...pairs: unknown[]) => Object.fromEntries(pairs.filter(Array.isArray).map((pair) => [String(pair[0]), pair[1]])),
     extract: (value: unknown, ...keys: string[]) => Object.fromEntries(keys.map((key) => [key, value && typeof value === "object" ? (value as Record<string, unknown>)[key] : null])),
     meta: (value: unknown) => linkMetadata(value),
@@ -1322,7 +1625,7 @@ export function evaluateDql(expression: string, row: DqlRow, current: DvPage): u
   const evaluator = new Function(
     "row",
     "helpers",
-    `with (helpers) { with (row) { return (${javascript}); } }`,
+    `with (helpers) { with (row) { return (${javascriptRewritten}); } }`,
   ) as (row: DqlRow, helpers: Record<string, unknown>) => unknown;
   return evaluator(row, helpers);
 }
@@ -1331,20 +1634,37 @@ function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|
 function dqlTypeof(value: unknown): string {
   if (value == null) return "null";
   if (value instanceof Date) return "date";
+  if (value instanceof DvDuration) return "duration";
   if (Array.isArray(value)) return "array";
   return typeof value;
 }
 function parseDuration(value: unknown): DvDuration {
+  if (value instanceof DvDuration) return value;
+  if (typeof value === "number") return DvDuration.fromMillis(value);
   const match = String(value ?? "").trim().match(/^(-?\d+(?:\.\d+)?)\s*(years?|months?|weeks?|days?|hours?|minutes?|seconds?)$/i);
-  if (!match) return new DvDuration(0);
+  if (!match) return DvDuration.fromMillis(0);
   const amount = Number(match[1]); const unit = match[2].toLocaleLowerCase();
-  const seconds = unit.startsWith("year") ? amount * 31_556_952 : unit.startsWith("month") ? amount * 2_629_746 : unit.startsWith("week") ? amount * 604_800 : unit.startsWith("day") ? amount * 86_400 : unit.startsWith("hour") ? amount * 3_600 : unit.startsWith("minute") ? amount * 60 : amount;
-  return new DvDuration(seconds * 1000);
+  const parts: DurationParts = unit.startsWith("year") ? { years: amount }
+    : unit.startsWith("month") ? { months: amount }
+    : unit.startsWith("week") ? { weeks: amount }
+    : unit.startsWith("day") ? { days: amount }
+    : unit.startsWith("hour") ? { hours: amount }
+    : unit.startsWith("minute") ? { minutes: amount }
+    : { seconds: amount };
+  return DvDuration.fromParts(parts);
 }
 function formatDvDate(value: unknown, format = "yyyy-MM-dd"): string {
   const date = toDvDate(value); if (!date) return "";
+  if (format === "DDDD") {
+    return date.toLocaleDateString(undefined, {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+  }
   const names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-  return format.replace(/yyyy/g, String(date.year)).replace(/MMMM/g, names[date.month - 1]).replace(/MM/g, String(date.month).padStart(2, "0")).replace(/dd/g, String(date.day).padStart(2, "0"));
+  return format.replace(/yyyy|y/g, String(date.year)).replace(/MMMM/g, names[date.month - 1]).replace(/MM/g, String(date.month).padStart(2, "0")).replace(/dd/g, String(date.day).padStart(2, "0"));
 }
 function linkMetadata(value: unknown): Record<string, unknown> {
   const raw = typeof value === "object" && value && "path" in value
@@ -1470,6 +1790,7 @@ function stringify(v: unknown, fieldHint?: string): string {
     return esc(v);
   }
   if (v instanceof Date) return esc(v.toISOString().slice(0, 10));
+  if (v instanceof DvDuration) return esc(v.toHuman());
   if (Array.isArray(v)) return v.map((value) => stringify(value, fieldHint)).filter(Boolean).join(", ");
   if (typeof v === "object" && v && "file" in (v as object)) {
     const p = v as DvPage;
@@ -1490,6 +1811,55 @@ function stringifyInline(v: unknown): string {
   );
 }
 
+/** Host globals shadowed so DataviewJS cannot reach WebView/Tauri internals. */
+const DATAVIEW_JS_PARAMS = [
+  "dv", "dateformat", "dur", "date", "choice", "luxonish", "note", "input", "app",
+  "window", "document", "globalThis", "self", "parent", "top", "frames",
+  "fetch", "XMLHttpRequest", "WebSocket", "Worker",
+  "localStorage", "sessionStorage", "indexedDB",
+  "Function",
+] as const;
+
+function wrapInlineExpression(code: string): string {
+  return code
+    .trim()
+    .replace(/^\$?=\s*/, "")
+    .replace(
+      /\bdur\(\s*(-?\d+(?:\.\d+)?)\s+(years?|months?|weeks?|days?|hours?|minutes?)\s*\)/gi,
+      'dur("$1 $2")',
+    )
+    .replace(
+      /(date\([^)]*\)|\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\s*\+\s*(dur\("[^"]+"\))/g,
+      "$1.plus($2)",
+    );
+}
+
+function runDataviewJs(
+  source: string,
+  thisNote: DvPage,
+  dv: { date: (value: unknown) => unknown } & Record<string, unknown>,
+  dateformat: (d: unknown, fmt?: string) => string,
+  dur: (s: unknown) => unknown,
+  choice: (condition: unknown, whenTrue: unknown, whenFalse: unknown) => unknown,
+  scriptInput: unknown,
+  app: ObsidianApp,
+): Promise<unknown> {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
+    ...args: string[]
+  ) => (...args: unknown[]) => Promise<unknown>;
+  const blanks = Array<undefined>(DATAVIEW_JS_PARAMS.length - 9).fill(undefined);
+  const args = [
+    dv, dateformat, dur, dv.date, choice, luxonish, thisNote, scriptInput, app, ...blanks,
+  ];
+  let fn: (...args: unknown[]) => Promise<unknown>;
+  try {
+    fn = new AsyncFunction(...DATAVIEW_JS_PARAMS, `"use strict";\nreturn (${source});`);
+  } catch {
+    fn = new AsyncFunction(...DATAVIEW_JS_PARAMS, `"use strict";\n${source}`);
+  }
+  return fn.call(thisNote, ...args);
+}
+
 function makeWikilink(path: string, embed = false, display?: string): string {
   return `${embed ? "!" : ""}[[${path}${display == null ? "" : `|${display}`}]]`;
 }
@@ -1497,6 +1867,7 @@ function makeWikilink(path: string, embed = false, display?: string): string {
 function plainString(value: unknown): string {
   if (value == null) return "";
   if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (value instanceof DvDuration) return value.toHuman();
   if (Array.isArray(value)) return value.map(plainString).join(", ");
   if (typeof value === "object" && "file" in value) return (value as DvPage).file.link;
   if (typeof value === "object") return JSON.stringify(value);
@@ -1595,6 +1966,9 @@ export async function executeBlocksInPreview(
     const pre = codeEl.closest("pre");
     if (!pre) {
       const shouldRun = inlineScriptFlags[ii++] ?? false;
+      const inlineLang = ((codeEl.className.match(/language-(\S+)/) || [])[1] || "").toLowerCase();
+      // Pandoc `{.sqlpostgresql}` (and other language classes) is highlighting, not execution.
+      if (inlineLang) continue;
       if (!shouldRun) continue;
       if (!previewEl.contains(codeEl)) continue;
       const mount = document.createElement("span");

@@ -34,6 +34,34 @@ export function wikilinkPlugin() {
   );
 }
 
+/** Vault-relative path without a note extension — Obsidian's wikilink key. */
+export function wikilinkKey(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\.(?:md|markdown)$/i, "");
+}
+
+/**
+ * Shortest unique wikilink, like Obsidian's "shortest path when possible".
+ * Unique filename → `Note`. Collision → shortest unique suffix (`folder/Note`).
+ * Existing short links are not rewritten when a namesake appears later.
+ */
+export function shortestWikilinkTarget(
+  path: string,
+  files: readonly { path: string }[],
+): string {
+  const key = wikilinkKey(path);
+  const parts = key.split("/").filter(Boolean);
+  if (parts.length === 0) return key;
+  const keys = files.map((file) => wikilinkKey(file.path));
+  for (let length = 1; length <= parts.length; length++) {
+    const suffix = parts.slice(-length).join("/");
+    const hits = keys.filter((candidate) =>
+      candidate === suffix || candidate.endsWith(`/${suffix}`),
+    );
+    if (hits.length <= 1) return suffix;
+  }
+  return key;
+}
+
 /** Extract note path and optional heading from a wikilink target. */
 export function splitWikilinkTarget(target: string): {
   note: string;
@@ -48,6 +76,15 @@ export function splitWikilinkTarget(target: string): {
   const frag = target.slice(hash + 1);
   if (frag.startsWith("^")) {
     return { note, heading: null, block: frag.slice(1) };
+  }
+  // note#heading#^block — split heading (may itself contain #) from a trailing ^block.
+  const blockHash = frag.lastIndexOf("#^");
+  if (blockHash >= 0) {
+    return {
+      note,
+      heading: frag.slice(0, blockHash),
+      block: frag.slice(blockHash + 2),
+    };
   }
   return { note, heading: frag, block: null };
 }

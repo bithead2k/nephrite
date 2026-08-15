@@ -6,6 +6,7 @@ import type {
   CompletionSource,
 } from "@codemirror/autocomplete";
 import type { FileEntry } from "./types";
+import { shortestWikilinkTarget } from "./wikilinks";
 
 export type WikilinkCompletionMatch = {
   embed: boolean;
@@ -37,10 +38,11 @@ export function wikilinkCompletionSource(
     );
     if (!match) return null;
 
-    const options = files().map((file): Completion => {
-      const target = file.path.replace(/\.md$/i, "");
-      const filename = target.split("/").pop() ?? target;
-      const folder = target.includes("/") ? target.slice(0, target.lastIndexOf("/")) : "vault root";
+    const catalog = files();
+    const options = catalog.map((file): Completion => {
+      const target = shortestWikilinkTarget(file.path, catalog);
+      const filename = file.path.replace(/^.*\//, "").replace(/\.md$/i, "");
+      const folder = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "vault root";
       const drawing = file.file_kind === "excalidraw" || /\.excalidraw\.md$/i.test(file.path);
       return {
         label: target,

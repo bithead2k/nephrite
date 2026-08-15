@@ -413,7 +413,12 @@ fn parse_task_line(
     let text = after[1..].trim_start().to_string();
     let (status, completed) = match status_char {
         ' ' => ("todo", false),
-        '/' | '-' => ("half", false),
+        '/' => ("half", false),
+        '-' => ("cancelled", false),
+        '>' => ("forwarded", false),
+        '<' => ("scheduled", false),
+        '?' => ("question", false),
+        '!' => ("important", false),
         'x' | 'X' => ("done", true),
         _ => ("todo", false),
     };
@@ -596,9 +601,11 @@ fn split_heading_block(target: &str) -> (String, Option<String>, Option<String>)
         if let Some(block) = frag.strip_prefix('^') {
             return (note.to_string(), None, Some(block.to_string()));
         }
-        // heading may contain further? keep simple
-        if let Some((h, rest)) = frag.split_once('#') {
-            if let Some(block) = rest.strip_prefix('^') {
+        // A heading may itself contain '#', so only the trailing '#^block' splits it.
+        if let Some(idx) = frag.rfind("#^") {
+            let h = &frag[..idx];
+            let block = &frag[idx + 2..];
+            if !h.is_empty() && !block.is_empty() {
                 return (
                     note.to_string(),
                     Some(h.to_string()),
@@ -1198,6 +1205,37 @@ See ![[Other#Section]] and [[Note|alias]].
     }
 
     #[test]
+    fn classifies_extended_task_status_markers() {
+        let facts = parse_markdown(
+            "- [ ] todo\n- [/] half\n- [-] cancelled\n- [>] later\n- [<] scheduled\n- [?] ask\n- [!] important\n- [x] done\n",
+        );
+        let statuses: Vec<_> = facts
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.status_char.as_str(),
+                    task.status.as_str(),
+                    task.completed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (" ", "todo", false),
+                ("/", "half", false),
+                ("-", "cancelled", false),
+                (">", "forwarded", false),
+                ("<", "scheduled", false),
+                ("?", "question", false),
+                ("!", "important", false),
+                ("x", "done", true),
+            ]
+        );
+    }
+
+    #[test]
     fn extracts_typed_dataview_inline_fields() {
         let facts = parse_markdown(
             "Rating:: 5\nPublished:: true\nSkills:: [sql, rust]\nText [Contact:: [[Ada Lovelace]]] and (Mood:: happy)\n```text\nIgnored:: yes\n```\n",
@@ -1208,5 +1246,38 @@ See ![[Other#Section]] and [[Note|alias]].
         assert_eq!(facts.inline_fields[2].value_json, "[\"sql\",\"rust\"]");
         assert_eq!(facts.inline_fields[3].key, "Contact");
         assert_eq!(facts.inline_fields[4].value_text.as_deref(), Some("happy"));
+    }
+
+    #[test]
+    fn splits_heading_and_block_refs_in_wikilink_targets() {
+        assert_eq!(
+            split_heading_block("Projects"),
+            ("Projects".into(), None, None)
+        );
+        assert_eq!(
+            split_heading_block("Projects/Active#Summary"),
+            ("Projects/Active".into(), Some("Summary".into()), None)
+        );
+        assert_eq!(
+            split_heading_block("Projects#^abc123"),
+            ("Projects".into(), None, Some("abc123".into()))
+        );
+        assert_eq!(
+            split_heading_block("Projects#Summary#^abc123"),
+            (
+                "Projects".into(),
+                Some("Summary".into()),
+                Some("abc123".into())
+            )
+        );
+        // Heading fragment may itself contain '#'; only the trailing '#^block' splits it.
+        assert_eq!(
+            split_heading_block("Note#C#section#^b42"),
+            ("Note".into(), Some("C#section".into()), Some("b42".into()))
+        );
+        assert_eq!(
+            split_heading_block("Note#C#section"),
+            ("Note".into(), Some("C#section".into()), None)
+        );
     }
 }

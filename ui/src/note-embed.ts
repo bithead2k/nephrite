@@ -7,6 +7,10 @@ import { makeEngineContext } from "./dv-context";
 import type { OpenFile } from "./types";
 import { splitWikilinkTarget } from "./wikilinks";
 import { hydrateMarkdownImages, hydrateWikilinkImage } from "./image-embed";
+import { hydrateWikilinkPdf } from "./pdf-view";
+import { hydrateMermaid } from "./mermaid";
+import { hydrateCsvFences } from "./csv-view";
+import { hydrateWikilinkAudio, hydrateWikilinkVideo } from "./media-view";
 
 type EmbedOptions = {
   openLink: (target: string) => void;
@@ -47,6 +51,9 @@ export async function hydrateNoteEmbeds(
     }
 
     if (await hydrateWikilinkImage(link, resolved, target)) return;
+    if (await hydrateWikilinkPdf(link, resolved, target)) return;
+    if (await hydrateWikilinkAudio(link, resolved, target)) return;
+    if (await hydrateWikilinkVideo(link, resolved, target)) return;
 
     const ancestors = new Set(options.ancestors ?? []);
     const signature = `${resolved}#${
@@ -91,6 +98,8 @@ export async function hydrateNoteEmbeds(
       makeEngineContext(resolved, file.content, options.openLink),
     );
     await hydrateMarkdownImages(embed, resolved);
+    hydrateCsvFences(embed);
+    await hydrateMermaid(embed);
     ancestors.add(signature);
     await hydrateNoteEmbeds(embed, resolved, {
       ...options,
@@ -157,7 +166,28 @@ export function extractBlock(markdown: string, requestedId: string): string | nu
 
   let start = index;
   while (start > 0 && lines[start - 1].trim() !== "") start--;
-  return lines.slice(start, index + 1)
+  let end = index + 1;
+  const baseIndent = (lines[start].match(/^\s*/)?.[0].length ?? 0);
+  while (end < lines.length) {
+    const next = lines[end];
+    if (!next.trim()) {
+      let look = end + 1;
+      while (look < lines.length && !lines[look].trim()) look += 1;
+      const indent = lines[look]?.match(/^\s*/)?.[0].length ?? 0;
+      if (look < lines.length && indent > baseIndent) {
+        end = look;
+        continue;
+      }
+      break;
+    }
+    const indent = next.match(/^\s*/)?.[0].length ?? 0;
+    if (indent > baseIndent) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+  return lines.slice(start, end)
     .join("\n")
     .replace(new RegExp(`[ \\t]*\\^${escaped}[ \\t]*$`), "")
     .trim();

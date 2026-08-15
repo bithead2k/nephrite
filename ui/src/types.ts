@@ -18,9 +18,16 @@ export type VaultInfo = {
   link_count: number;
 };
 
+export type VaultMigration = {
+  id: string;
+  action: string;
+  remaining: number;
+};
+
 export type VaultOpenPlan = {
   rebuild: boolean;
   action: string;
+  migrations: VaultMigration[];
 };
 
 export type VaultOpenProgress = {
@@ -139,6 +146,14 @@ export type GitCommitDetails = {
   patch: string;
 };
 
+export type GitConflictSides = {
+  path: string;
+  ours: string | null;
+  theirs: string | null;
+  base: string | null;
+  working: string | null;
+};
+
 export type SearchResult = {
   path: string;
   title: string;
@@ -162,4 +177,66 @@ export type GraphEdge = {
 export type GraphData = {
   nodes: GraphNode[];
   edges: GraphEdge[];
+};
+
+export type LinkHealthNote = {
+  path: string;
+  title: string;
+};
+
+export type LinkPlaceholder = {
+  source: string;
+  target: string;
+  count: number;
+};
+
+export type LinkHealth = {
+  orphans: LinkHealthNote[];
+  placeholders: LinkPlaceholder[];
+};
+
+export type NoteLinkRef = {
+  path: string;
+  title: string;
+  target: string;
+  heading: string | null;
+  block: string | null;
+  display: string | null;
+  embed: boolean;
+  resolved: boolean;
+};
+
+export type NoteHeading = {
+  level: number;
+  text: string;
+  line: number;
+};
+
+export type UnlinkedMention = {
+  path: string;
+  title: string;
+  snippet: string;
+  line: number | null;
+  term: string;
+};
+
+export type NoteContext = {
+  path: string;
+  title: string;
+  aliases: string[];
+  tags: string[];
+  headings: NoteHeading[];
+  backlinks: NoteLinkRef[];
+  outgoing: NoteLinkRef[];
+  unlinked: UnlinkedMention[];
+};
+
+export type VaultTag = {
+  tag: string;
+  count: number;
+};
+
+export type TagPage = {
+  path: string;
+  title: string;
 };

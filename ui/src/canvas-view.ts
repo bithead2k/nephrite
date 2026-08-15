@@ -1,3 +1,5 @@
+import { uiAlert, uiPrompt } from "./dialogs";
+
 export type CanvasNode = {
   id: string;
   type: "text" | "file" | "link" | "group";
@@ -259,18 +261,18 @@ export class CanvasView {
     return true;
   }
 
-  editSelectedEdge(): boolean {
+  async editSelectedEdge(): Promise<boolean> {
     const edge = this.document?.edges.find((candidate) => candidate.id === this.selectedEdge);
     if (!edge) return false;
-    const label = window.prompt("Edge label", edge.label || "");
+    const label = await uiPrompt("Edge label", { defaultValue: edge.label || "" });
     if (label == null) return true;
     const valid = new Set(["auto", "left", "right", "top", "bottom"]);
-    const fromSide = window.prompt("From side: auto, left, right, top, bottom", edge.fromSide || "auto");
+    const fromSide = await uiPrompt("From side: auto, left, right, top, bottom", { defaultValue: edge.fromSide || "auto" });
     if (fromSide == null) return true;
-    const toSide = window.prompt("To side: auto, left, right, top, bottom", edge.toSide || "auto");
+    const toSide = await uiPrompt("To side: auto, left, right, top, bottom", { defaultValue: edge.toSide || "auto" });
     if (toSide == null) return true;
     if (!valid.has(fromSide) || !valid.has(toSide)) {
-      window.alert("Edge sides must be auto, left, right, top, or bottom");
+      void uiAlert("Edge sides must be auto, left, right, top, or bottom");
       return true;
     }
     edge.label = label || undefined;

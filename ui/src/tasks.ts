@@ -1,11 +1,14 @@
 import { EditorSelection, TransactionSpec } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { classifyTaskStatus, nextTaskStatusChar } from "./task-status";
 
 export type TaskCheckboxEdit = {
   from: number;
   to: number;
-  insert: " " | "x";
+  insert: string;
 };
+
+const TASK_LINE = /^(?:\s*>\s*)*\s*[-*+]\s+\[([^\]])\]/;
 
 /**
  * Locate the task represented by a rendered Markdown checkbox.
@@ -19,7 +22,16 @@ export function findTaskCheckboxEdit(
   taskIndex: number,
   checked: boolean,
 ): TaskCheckboxEdit | null {
+  return findTaskStatusEdit(markdown, taskIndex, checked ? "x" : " ");
+}
+
+export function findTaskStatusEdit(
+  markdown: string,
+  taskIndex: number,
+  insert: string,
+): TaskCheckboxEdit | null {
   if (!Number.isInteger(taskIndex) || taskIndex < 0) return null;
+  if (insert.length !== 1) return null;
 
   const lines = markdown.split(/(?<=\n)/);
   let offset = 0;
@@ -53,16 +65,16 @@ export function findTaskCheckboxEdit(
       continue;
     }
 
-    // Supports ordinary and blockquoted GFM task-list items. Marked recognizes
-    // only the space/x states as interactive task checkboxes.
-    const match = text.match(/^(?:\s*>\s*)*\s*[-*+]\s+\[([ xX])\]/);
+    // Ordinary and blockquoted task items, including custom status chars.
+    const match = text.match(TASK_LINE);
     if (match) {
       if (found === taskIndex) {
-        // The status is always the byte immediately before the closing `]`.
-        // Deriving it from the full match avoids confusing a blank status with
-        // indentation or the required space after the list marker.
         const marker = (match.index ?? 0) + match[0].length - 2;
-        return { from: offset + marker, to: offset + marker + 1, insert: checked ? "x" : " " };
+        return {
+          from: offset + marker,
+          to: offset + marker + 1,
+          insert,
+        };
       }
       found++;
     }
@@ -90,8 +102,11 @@ export function cycleTaskLine(view: EditorView): boolean {
 }
 
 /**
- * plain → task todo → half → done → plain
- * Preserves list marker (- * +) and indent when present.
+ * plain → todo → in progress → forwarded → scheduled → question →
+ * important → done → cancelled → todo …
+ * After a full cycle, cancelled wraps to todo. A second Ctrl-Enter on a
+ * cancelled task is still a status change, not a drop to plain text.
+ * Use nextTaskForm's list-without-checkbox path to leave the task list.
  */
 export function nextTaskForm(line: string): string | null {
   const m = line.match(/^(\s*)([-*+])\s+\[([^\]])\]\s?(.*)$/);
@@ -100,19 +115,12 @@ export function nextTaskForm(line: string): string | null {
     const bullet = m[2];
     const status = m[3];
     const body = m[4];
-    const cycle: Record<string, string> = {
-      " ": `${indent}${bullet} [/] ${body}`,
-      "/": `${indent}${bullet} [x] ${body}`,
-      "-": `${indent}${bullet} [x] ${body}`,
-      x: `${indent}${body}`.replace(/\s+$/, "") || indent + body,
-      X: `${indent}${body}`.replace(/\s+$/, "") || indent + body,
-    };
-    if (status === "x" || status === "X") {
-      // done → plain line (drop checkbox, keep indent + body)
+    if (status === "-") {
       const plain = `${indent}${body}`.replace(/\s+$/, "");
       return plain.length ? plain : indent.trimEnd();
     }
-    return cycle[status] ?? `${indent}${bullet} [ ] ${body}`;
+    const next = nextTaskStatusChar(status);
+    return `${indent}${bullet} [${next}] ${body}`;
   }
 
   // Already a list item without checkbox → make task
@@ -128,4 +136,45 @@ export function nextTaskForm(line: string): string | null {
     return `${indent}- [ ] `;
   }
   return `${indent}- [ ] ${body}`;
+}
+
+/** Mark GFM and custom-status tasks so preview clicks share one source index. */
+export function hydratePreviewTaskMarkers(root: ParentNode): void {
+  let index = 0;
+  for (const item of Array.from(root.querySelectorAll("li"))) {
+    const checkbox = item.querySelector<HTMLInputElement>(":scope > input[type=checkbox]:not(.prop-bool)");
+    if (checkbox) {
+      const status = checkbox.checked ? "x" : " ";
+      item.classList.add("task-list-item");
+      item.dataset.taskIndex = String(index);
+      item.dataset.taskStatus = status;
+      checkbox.dataset.taskIndex = String(index);
+      index += 1;
+      continue;
+    }
+    const custom = matchCustomTaskMarker(item);
+    if (!custom) continue;
+    const info = classifyTaskStatus(custom.char);
+    item.classList.add("task-list-item");
+    item.dataset.taskIndex = String(index);
+    item.dataset.taskStatus = custom.char;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "task-status-marker";
+    button.dataset.taskIndex = String(index);
+    button.dataset.taskStatus = custom.char;
+    button.title = `${info.label} — click to cycle`;
+    button.textContent = custom.char === " " ? "·" : custom.char;
+    custom.node.replaceWith(button, document.createTextNode(custom.rest ? ` ${custom.rest}` : ""));
+    index += 1;
+  }
+}
+
+function matchCustomTaskMarker(item: HTMLElement): { char: string; rest: string; node: ChildNode } | null {
+  const node = item.firstChild;
+  if (!node || node.nodeType !== Node.TEXT_NODE) return null;
+  const text = node.textContent ?? "";
+  const match = text.match(/^\s*\[([^\]])\](?:\s+|(?=\s*$))/);
+  if (!match) return null;
+  return { char: match[1], rest: text.slice(match[0].length), node };
 }
