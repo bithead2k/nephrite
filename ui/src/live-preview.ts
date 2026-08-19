@@ -1,5 +1,5 @@
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState } from "@codemirror/state";
+import { StateEffect, type EditorState } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -7,6 +7,7 @@ import {
   ViewPlugin,
   type ViewUpdate,
 } from "@codemirror/view";
+import { DirtyGatedWork } from "./edit-scheduler";
 
 const headingClasses: Record<string, string> = {
   ATXHeading1: "cm-live-h1",
@@ -96,19 +97,43 @@ function buildDecorations(view: EditorView): DecorationSet {
   return Decoration.set(ranges, true);
 }
 
-export const livePreviewPlugin = ViewPlugin.fromClass(
-  class {
-    decorations: DecorationSet;
+const refreshLivePreview = StateEffect.define<null>();
 
-    constructor(view: EditorView) {
-      this.decorations = buildDecorations(view);
-    }
+/**
+ * Live preview decoration construction walks the syntax tree. Map the old
+ * ranges through a keystroke immediately, then rebuild only after isDirty is
+ * false. This keeps the CM6 update transaction free of document-wide work.
+ */
+export function livePreviewPlugin(isDirty: () => boolean) {
+  return ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+      private readonly deferred = new DirtyGatedWork();
 
-    update(update: ViewUpdate) {
-      if (update.docChanged || update.selectionSet || update.viewportChanged) {
-        this.decorations = buildDecorations(update.view);
+      constructor(view: EditorView) {
+        this.decorations = buildDecorations(view);
       }
-    }
-  },
-  { decorations: (plugin) => plugin.decorations },
-);
+
+      update(update: ViewUpdate) {
+        const refresh = update.transactions.some((transaction) =>
+          transaction.effects.some((effect) => effect.is(refreshLivePreview))
+        );
+        if (refresh) {
+          this.decorations = buildDecorations(update.view);
+          return;
+        }
+        if (update.docChanged) this.decorations = this.decorations.map(update.changes);
+        if (update.docChanged || update.selectionSet || update.viewportChanged) {
+          this.deferred.request(isDirty, () => {
+            update.view.dispatch({ effects: refreshLivePreview.of(null) });
+          });
+        }
+      }
+
+      destroy() {
+        this.deferred.cancel();
+      }
+    },
+    { decorations: (plugin) => plugin.decorations },
+  );
+}

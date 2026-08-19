@@ -14,7 +14,7 @@ use crate::error::{IndexError, Result};
 
 /// The only version that matters. Bump here for releases.
 /// Cargo workspace version should match as `MAJOR.MINOR.0`.
-pub const PROJECT_VERSION: Version = Version { major: 0, minor: 8 };
+pub const PROJECT_VERSION: Version = Version { major: 0, minor: 9 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {

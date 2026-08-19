@@ -1,9 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { EditorState, Text } from "@codemirror/state";
 import { frontmatterFoldRange } from "../ui/src/editor";
-import { DeferredDocumentWork, type TimerHandle } from "../ui/src/edit-scheduler";
+import {
+  DeferredDocumentWork,
+  DirtyGatedWork,
+  type TimerHandle,
+} from "../ui/src/edit-scheduler";
 import { frontmatterForDecorations } from "../ui/src/yaml-booleans";
 import {
   evaluateDql,
@@ -35,7 +41,12 @@ import { formatTimestampPart } from "../ui/src/timestamp-shortcuts";
 import { findTaskCheckboxEdit } from "../ui/src/tasks";
 import { RefreshGate } from "../ui/src/refresh-gate";
 import { canPersistSession, editorTabTitle } from "../ui/src/session-guard";
-import { vaultChangeInvalidatesPageCache, vaultChangeTouchesFileTree } from "../ui/src/vault-change";
+import {
+  DeferredVaultChanges,
+  mergeVaultChanges,
+  vaultChangeInvalidatesPageCache,
+  vaultChangeTouchesFileTree,
+} from "../ui/src/vault-change";
 import {
   countWikilinks,
   DirtyReactor,
@@ -410,6 +421,31 @@ test("rapid edits defer document reads and collapse into one preview", () => {
   assert.equal(work.pending, false);
 });
 
+test("dirty-gated work stays off 20k keystrokes and runs once after save", () => {
+  const timers = new FakeTimers();
+  const work = new DirtyGatedWork(50, timers);
+  let dirty = true;
+  let runs = 0;
+
+  const started = performance.now();
+  for (let key = 0; key < 20_000; key++) {
+    work.request(() => dirty, () => runs++);
+  }
+  const schedulingMs = performance.now() - started;
+  assert.equal(runs, 0);
+  assert.equal(timers.callbacks.size, 1, "keystrokes must share one dirty-gate timer");
+  assert.equal(timers.cleared, 0, "keystrokes must not churn browser timers");
+  assert.ok(schedulingMs < 50, `dirty gating took ${schedulingMs.toFixed(1)}ms`);
+
+  timers.flush();
+  assert.equal(runs, 0);
+  assert.equal(timers.callbacks.size, 1, "dirty work remains armed without running");
+  dirty = false;
+  timers.flush();
+  assert.equal(runs, 1);
+  assert.equal(work.pending, false);
+});
+
 test("preview patching preserves unchanged top-level content around one edit", () => {
   assert.deepEqual(
     previewPatchWindow(
@@ -581,6 +617,80 @@ test("keystroke markDirty does no work until the reactor interval", () => {
   timers.tick?.();
   assert.equal(reactions, 1);
   reactor.stop();
+});
+
+test("clean cursor and fold reactions are deferred but never starved", () => {
+  let reactions = 0;
+  const timers = {
+    setInterval: (callback: () => void, _ms: number) => {
+      (timers as { tick?: () => void }).tick = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    },
+    clearInterval: () => {},
+    tick: undefined as undefined | (() => void),
+  };
+  const reactor = new DirtyReactor(() => {
+    assert.equal(reactor.consumeReaction(), true);
+    reactions++;
+  }, 50, timers);
+  reactor.start();
+  for (let move = 0; move < 10_000; move++) reactor.requestReaction();
+  assert.equal(reactions, 0);
+  timers.tick?.();
+  assert.equal(reactions, 1);
+  timers.tick?.();
+  assert.equal(reactions, 1, "an empty interval must be a no-op");
+  reactor.stop();
+});
+
+test("watcher bursts remain coalesced until the editor is clean", () => {
+  const first = { scanned: 1, updated: 1, removed: 0, paths: ["A.md"] };
+  const second = { scanned: 2, updated: 1, removed: 1, paths: ["A.md", "B.md"] };
+  assert.deepEqual(mergeVaultChanges(first, second), {
+    scanned: 3,
+    updated: 2,
+    removed: 1,
+    paths: ["A.md", "B.md"],
+  });
+
+  const deferred = new DeferredVaultChanges();
+  deferred.defer(first);
+  deferred.defer(second);
+  assert.equal(deferred.takeIfClean(true), null);
+  assert.equal(deferred.pending, true);
+  assert.deepEqual(deferred.takeIfClean(false), {
+    scanned: 3,
+    updated: 2,
+    removed: 1,
+    paths: ["A.md", "B.md"],
+  });
+  assert.equal(deferred.pending, false);
+});
+
+test("editor transaction source contains no host or document-wide work", () => {
+  const editorSource = readFileSync(join(process.cwd(), "ui/src/editor.ts"), "utf8");
+  const listenerStart = editorSource.indexOf("EditorView.updateListener.of");
+  const listenerEnd = editorSource.indexOf("// Native caret", listenerStart);
+  assert.ok(listenerStart >= 0 && listenerEnd > listenerStart);
+  const listener = editorSource.slice(listenerStart, listenerEnd);
+  assert.doesNotMatch(
+    listener,
+    /getDoc\(|\.toString\(|renderRightPane|invoke\(|querySelector|innerHTML|localStorage|await\s/,
+  );
+
+  const liveSource = readFileSync(join(process.cwd(), "ui/src/live-preview.ts"), "utf8");
+  assert.match(
+    liveSource,
+    /if \(update\.docChanged\) this\.decorations = this\.decorations\.map\(update\.changes\)/,
+  );
+  assert.match(liveSource, /this\.deferred\.request\(isDirty/);
+
+  const mainSource = readFileSync(join(process.cwd(), "ui/src/main.ts"), "utf8");
+  const watcherStart = mainSource.indexOf("async function applyVaultChange");
+  const watcherEnd = mainSource.indexOf("function flushDeferredVaultChanges", watcherStart);
+  const watcher = mainSource.slice(watcherStart, watcherEnd);
+  assert.ok(watcher.indexOf("dirtyReactor.isDirty") < watcher.indexOf("refreshTree()"));
+  assert.match(watcher, /deferredVaultChanges\.defer\(change\)/);
 });
 
 test("autosave does not cancel the pending preview refresh", () => {

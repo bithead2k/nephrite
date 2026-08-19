@@ -95,6 +95,9 @@ export class NephriteEditor {
   private vimrcSourceWarnings: string[];
   private completionFiles: FileEntry[] = [];
   private documentRevision = 0;
+  private documentDirty = false;
+  private lastCursorLine = -1;
+  private lastDocumentLines = -1;
 
   constructor(
     parent: HTMLElement,
@@ -239,7 +242,10 @@ export class NephriteEditor {
           if (!(event.metaKey || event.ctrlKey)) return false;
           const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
           if (pos == null) return false;
-          const target = wikilinkAt(view.state.doc.toString(), pos);
+          // Wikilinks cannot span lines. Avoid serializing a large document
+          // merely because the user Ctrl/Cmd-clicked in the editor.
+          const line = view.state.doc.lineAt(pos);
+          const target = wikilinkAt(line.text, pos - line.from);
           if (!target) return false;
           event.preventDefault();
           self.callbacks.onOpenWikilink(target);
@@ -263,12 +269,22 @@ export class NephriteEditor {
         if (u.docChanged) self.documentRevision++;
         // Keystroke path: flip dirty. Preview, save, and chrome react off-thread.
         if (u.docChanged && !self.suppressDirty) {
+          self.documentDirty = true;
           self.callbacks.onDirty(true);
         }
         if (u.selectionSet || u.docChanged) {
           const head = u.state.selection.main.head;
           const line = u.state.doc.lineAt(head);
-          self.callbacks.onCursor(line.number, head - line.from + 1, u.state.doc.lines);
+          // The host only needs line/EOF transitions for scroll sympathy.
+          // Ordinary characters on the same line must not enqueue UI work.
+          if (
+            line.number !== self.lastCursorLine ||
+            u.state.doc.lines !== self.lastDocumentLines
+          ) {
+            self.lastCursorLine = line.number;
+            self.lastDocumentLines = u.state.doc.lines;
+            self.callbacks.onCursor(line.number, head - line.from + 1, u.state.doc.lines);
+          }
         }
         if (!self.suppressDirty && u.transactions.some((transaction) =>
           transaction.effects.some((effect) =>
@@ -658,7 +674,9 @@ export class NephriteEditor {
 
   setLivePreview(on: boolean) {
     this.view.dispatch({
-      effects: this.livePreviewCompartment.reconfigure(on ? livePreviewPlugin : []),
+      effects: this.livePreviewCompartment.reconfigure(
+        on ? livePreviewPlugin(() => this.documentDirty) : [],
+      ),
     });
     this.view.dom.classList.toggle("cm-live-preview", on);
   }
@@ -672,6 +690,7 @@ export class NephriteEditor {
   setDoc(text: string) {
     const unfold = this.getFoldedRanges().map((range) => unfoldEffect.of(range));
     this.suppressDirty = true;
+    this.documentDirty = false;
     this.view.dispatch({
       changes: {
         from: 0,
@@ -696,6 +715,7 @@ export class NephriteEditor {
     const head = Math.min(selection.head, text.length);
     const scrollTop = this.view.scrollDOM.scrollTop;
     this.suppressDirty = true;
+    this.documentDirty = false;
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
       selection: { anchor, head },
@@ -708,12 +728,27 @@ export class NephriteEditor {
     });
   }
 
+  /** Replace the whole source as a user edit, preserving dirty semantics. */
+  replaceDocument(text: string): void {
+    const head = Math.min(this.view.state.selection.main.head, text.length);
+    this.view.dispatch({
+      changes: { from: 0, to: this.view.state.doc.length, insert: text },
+      selection: { anchor: head },
+      effects: this.languageCompartment.reconfigure(text.length > 80_000 ? [] : markdown()),
+    });
+  }
+
   getDoc(): string {
     return this.view.state.doc.toString();
   }
 
   getDocumentRevision(): number {
     return this.documentRevision;
+  }
+
+  /** Clear dirty-gated editor work only if this exact revision reached disk. */
+  markSaved(documentRevision: number | null): void {
+    if (documentRevision === this.documentRevision) this.documentDirty = false;
   }
 
   getFoldedRanges(): FoldRange[] {

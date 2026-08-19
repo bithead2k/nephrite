@@ -26,3 +26,40 @@ export function vaultChangeInvalidatesPageCache(
     isImagePath(path) || (currentPath != null && path !== currentPath)
   ));
 }
+
+/** Coalesce watcher bursts while keeping every changed path. */
+export function mergeVaultChanges(
+  current: VaultChangeEvent | null,
+  next: VaultChangeEvent,
+): VaultChangeEvent {
+  if (!current) return { ...next, paths: [...new Set(next.paths)] };
+  return {
+    scanned: current.scanned + next.scanned,
+    updated: current.updated + next.updated,
+    removed: current.removed + next.removed,
+    paths: [...new Set([...current.paths, ...next.paths])],
+  };
+}
+
+/**
+ * Filesystem/index reactions are useful but never urgent enough to steal the
+ * main thread from an active editor. Hold and merge them until isDirty clears.
+ */
+export class DeferredVaultChanges {
+  private value: VaultChangeEvent | null = null;
+
+  defer(change: VaultChangeEvent): void {
+    this.value = mergeVaultChanges(this.value, change);
+  }
+
+  takeIfClean(isDirty: boolean): VaultChangeEvent | null {
+    if (isDirty) return null;
+    const value = this.value;
+    this.value = null;
+    return value;
+  }
+
+  get pending(): boolean {
+    return this.value != null;
+  }
+}

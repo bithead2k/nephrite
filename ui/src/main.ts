@@ -119,7 +119,11 @@ import { RefreshGate } from "./refresh-gate";
 import { resizedKanbanLaneWidth } from "./kanban-resize";
 import { canPersistSession, editorTabTitle } from "./session-guard";
 import { bindQueryUriLinks } from "./query-uri";
-import { vaultChangeInvalidatesPageCache, vaultChangeTouchesFileTree } from "./vault-change";
+import {
+  DeferredVaultChanges,
+  vaultChangeInvalidatesPageCache,
+  vaultChangeTouchesFileTree,
+} from "./vault-change";
 import {
   DirtyReactor,
   paneToRefresh,
@@ -256,21 +260,31 @@ let dirty = false;
 const savedContentByPath = new Map<string, string>();
 let pendingCursor: { line: number; col: number; totalLines: number } | null = null;
 let pendingFolds = false;
+let pendingChrome = false;
+const deferredVaultChanges = new DeferredVaultChanges();
 const dirtyReactor = new DirtyReactor(() => {
   const idle = dirtyReactor.consumeIdle(PREVIEW_DELAY_MS, AUTOSAVE_DELAY_MS);
+  const reaction = dirtyReactor.consumeReaction();
   if (idle.save) void saveFile(true);
   if (idle.preview && editor && (viewMode === "split" || viewMode === "preview")) {
     const revision = ++previewRevision;
     void renderRightPane(editor.getDoc(), revision);
   }
-  if (pendingCursor) {
+  if (reaction && pendingCursor) {
     const { line, totalLines } = pendingCursor;
     pendingCursor = null;
     setEditorDocumentEnd(line === totalLines);
   }
-  if (pendingFolds) {
+  if (reaction && pendingFolds) {
     pendingFolds = false;
     rememberEditorFolds();
+  }
+  if (reaction && pendingChrome) {
+    pendingChrome = false;
+    updateChrome();
+  }
+  if (!dirtyReactor.isDirty && deferredVaultChanges.pending) {
+    flushDeferredVaultChanges();
   }
 });
 dirtyReactor.start();
@@ -1153,19 +1167,26 @@ async function initEditor() {
     host,
     {
       onDirty: (d) => {
+        const changed = dirty !== d;
         dirty = d;
         if (d) dirtyReactor.markDirty();
         else dirtyReactor.clearDirty();
+        if (changed || !d) {
+          pendingChrome = true;
+          dirtyReactor.requestReaction();
+        }
       },
       onSave: () => saveFile(false),
       onVimMessage: (message, isError) =>
         setTransientStatus(message, isError ? "#e9ad55" : "#5ecf9a"),
       onCursor: (line, col, totalLines) => {
         pendingCursor = { line, col, totalLines };
+        dirtyReactor.requestReaction();
       },
       onOpenWikilink: (target) => void openWikilink(target),
       onFoldsChanged: () => {
         pendingFolds = true;
+        dirtyReactor.requestReaction();
       },
       onSaveAttachments: async (files) => {
         if (!currentPath) return [];
@@ -2491,9 +2512,7 @@ function persistKanban() {
     kanbanBoard.headBlock,
   );
   kanbanBoard = { ...kanbanBoard, originalSource: md };
-  editor.setDoc(md);
-  dirty = true;
-  updateChrome();
+  editor.replaceDocument(md);
   void saveFile();
 }
 
@@ -3000,6 +3019,10 @@ async function forceVaultRefresh() {
 }
 
 async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
+  if (!manual && dirtyReactor.isDirty) {
+    deferredVaultChanges.defer(change);
+    return;
+  }
   if (vaultChangeTouchesFileTree(change, mdFilesAll.map((file) => file.path))) {
     await refreshTree();
   }
@@ -3077,6 +3100,14 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
       "#5ecf9a",
     );
   }
+}
+
+function flushDeferredVaultChanges(): void {
+  const change = deferredVaultChanges.takeIfClean(dirtyReactor.isDirty);
+  if (!change) return;
+  vaultChangeQueue = vaultChangeQueue
+    .then(() => applyVaultChange(change, false))
+    .catch((error) => console.warn("[vault tracker]", error));
 }
 
 function rebuildVisibleTree() {
@@ -3924,10 +3955,13 @@ async function performSave(pending: PendingSave) {
         ? canvasContent === content
         : editor?.getDocumentRevision() === documentRevision);
   if (unchanged) {
+    editor?.markSaved(documentRevision);
     dirty = false;
     dirtyReactor.clearDirty();
+    pendingChrome = true;
+    dirtyReactor.requestReaction();
   }
-  updateChrome();
+  if (!unchanged) updateChrome();
   await runAutomationLifecycle("onNoteSave");
   if (!automatic) setTransientStatus(`Saved ${path}`, "#5ecf9a");
   if (!unchanged) scheduleAutosave();
@@ -4536,10 +4570,7 @@ function showPropertiesPanel() {
       void uiAlert("The note is no longer active.");
       return;
     }
-    editor.setDoc(next);
-    dirty = true;
-    updateChrome();
-    scheduleAutosave();
+    editor.replaceDocument(next);
     setTransientStatus("Properties updated", "#5ecf9a");
   });
 }

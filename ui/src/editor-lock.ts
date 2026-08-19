@@ -20,6 +20,7 @@ export class DirtyReactor {
   private lastMarkMs = 0;
   private previewDue = false;
   private saveDue = false;
+  private reactionDue = false;
   private handle: ReturnType<typeof setInterval> | null = null;
   private reactions = 0;
   private now: () => number;
@@ -38,6 +39,17 @@ export class DirtyReactor {
     this.lastMarkMs = this.now();
     this.previewDue = true;
     this.saveDue = true;
+  }
+
+  /** Coalesce cursor, fold, chrome, and clean-state queue reactions. */
+  requestReaction(): void {
+    this.reactionDue = true;
+  }
+
+  consumeReaction(): boolean {
+    const due = this.reactionDue;
+    this.reactionDue = false;
+    return due;
   }
 
   /** Save completed. Preview still fires once the idle window elapses. */
@@ -75,7 +87,7 @@ export class DirtyReactor {
   start(): void {
     if (this.handle != null) return;
     this.handle = this.timers.setInterval(() => {
-      if (!this.dirty && !this.previewDue) return;
+      if (!this.previewDue && !this.saveDue && !this.reactionDue) return;
       this.reactions += 1;
       this.onReact();
     }, this.intervalMs);
