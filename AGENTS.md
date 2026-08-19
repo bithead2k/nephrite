@@ -659,9 +659,9 @@ It is to create the open-source implementation of the mature local-first knowled
 
 ## Implementation Status (2026-08-19)
 
-AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.9` (0.9.0): minor upgrade from 0.8, not a full rebuild.
+AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.10` (0.10.0): minor upgrade from 0.9, not a full rebuild.
 
-Implemented and verified (behavior details live in `docs/`): vault reader + metadata index + search + editor/viewer + watcher; dirty-gated editor hot path with deferred preview/index/UI reactions; native PostgreSQL SQL (`libpg_query` + `page` lowering, read-only); Dataview DQL/DataviewJS; Vim, Markdown/Obsidian rendering, Excalidraw, Tasks metadata/recurrence/query blocks/dashboard, Git, declarative automation + Templater subset; permissioned plugin host with Obsidian facades, settings/views/processors, packaged assets, bundled ESM/CJS entrypoints, and network requests.
+Implemented and verified (behavior details live in `docs/`): vault reader + metadata index + search + editor/viewer + watcher; dirty-gated editor hot path with deferred preview/index/UI reactions; latest-wins pane switching with cached editor/preview state and incremental pane chrome; native PostgreSQL SQL (`libpg_query` + `page` lowering, read-only); Dataview DQL/DataviewJS; Vim, Markdown/Obsidian rendering, Excalidraw, Tasks metadata/recurrence/query blocks/dashboard, Git, declarative automation + Templater subset; permissioned plugin host with Obsidian facades, settings/views/processors, packaged assets, bundled ESM/CJS entrypoints, and network requests.
 
 Remaining gaps:
 
@@ -676,7 +676,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                   # 73 app + 44 index
 npm run build
-npm run test                             # 79 perf + 29 ui + 21 dataview + 11 bases + 10 people
+npm run test                             # 82 perf + 29 ui + 21 dataview + 11 bases + 10 people
 ```
 
 Expected Vite warnings about third-party `"use client"` directives and large chunks are non-fatal. The supported SQL surface is audited against the local PostgreSQL 18.4 catalog at port 5438.

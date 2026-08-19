@@ -110,6 +110,12 @@ import {
   syncEditorCursorMovement,
   withoutScrollSync,
 } from "../ui/src/scroll-sync";
+import {
+  claimOneTimeBinding,
+  LatestPaneSwitch,
+  missingAncestorPaths,
+} from "../ui/src/pane-switch";
+import { PaneStateCache } from "../ui/src/pane-cache";
 
 class FakeTimers {
   private next = 1;
@@ -132,6 +138,53 @@ class FakeTimers {
     pending.forEach((callback) => callback());
   }
 }
+
+test("rapid pane requests collapse to the latest destination", async () => {
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const started: string[] = [];
+  const committed: string[] = [];
+  const switches = new LatestPaneSwitch<string>(async (path, isCurrent) => {
+    started.push(path);
+    if (path === "A.md") await firstGate;
+    if (isCurrent()) committed.push(path);
+  });
+
+  const first = switches.request("A.md");
+  await Promise.resolve();
+  const obsolete = switches.request("B.md");
+  const latest = switches.request("C.md");
+  assert.equal(await obsolete, "superseded");
+  releaseFirst();
+  assert.equal(await first, "superseded");
+  assert.equal(await latest, "completed");
+  assert.deepEqual(started, ["A.md", "C.md"]);
+  assert.deepEqual(committed, ["C.md"]);
+});
+
+test("warm pane cache is bounded and can invalidate render state without losing source", () => {
+  const cache = new PaneStateCache(2);
+  const preview = { fragment: {} as DocumentFragment, source: "A", scrollTop: 4, scrollLeft: 2 };
+  cache.set({ path: "A.md", content: "A", fileKind: "markdown", preview });
+  cache.set({ path: "B.md", content: "B", fileKind: "markdown" });
+  assert.equal(cache.get("A.md")?.content, "A", "a cache hit refreshes LRU order");
+  cache.set({ path: "C.md", content: "C", fileKind: "markdown" });
+  assert.equal(cache.get("B.md"), undefined, "least recently used pane is evicted");
+  cache.invalidatePreviews();
+  assert.equal(cache.get("A.md")?.preview, undefined);
+  assert.equal(cache.get("A.md")?.content, "A", "preview invalidation retains authoritative baseline");
+});
+
+test("pane chrome work only expands missing ancestors and binds persistent hosts once", () => {
+  const expanded = new Set(["journals", "journals/2026"]);
+  assert.deepEqual(missingAncestorPaths("journals/2026/August/19.md", expanded), [
+    "journals/2026/August",
+  ]);
+  assert.deepEqual(missingAncestorPaths("journals/2026/18.md", expanded), []);
+  const dataset: Record<string, string | undefined> = {};
+  assert.equal(claimOneTimeBinding(dataset, "tree"), true);
+  assert.equal(claimOneTimeBinding(dataset, "tree"), false);
+});
 
 test("startup or mid-restore unload cannot overwrite a saved session with empty panes", () => {
   assert.equal(canPersistSession(false, false, false), false);

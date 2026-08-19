@@ -64,6 +64,12 @@ export type EditorCallbacks = {
 
 export type FoldRange = { from: number; to: number };
 export type EditorChange = { from: number; to: number; insert: string };
+export type EditorPaneSnapshot = {
+  state: EditorState;
+  scrollTop: number;
+  scrollLeft: number;
+  documentRevision: number;
+};
 
 /** Fold only a well-formed frontmatter block that starts on the first line. */
 export function frontmatterFoldRange(
@@ -705,6 +711,30 @@ export class NephriteEditor {
     });
     this.suppressDirty = false;
     this.callbacks.onDirty(false);
+  }
+
+  snapshotPane(): EditorPaneSnapshot {
+    return {
+      state: this.view.state,
+      scrollTop: this.view.scrollDOM.scrollTop,
+      scrollLeft: this.view.scrollDOM.scrollLeft,
+      documentRevision: this.documentRevision,
+    };
+  }
+
+  restorePane(snapshot: EditorPaneSnapshot): void {
+    this.suppressDirty = true;
+    this.documentDirty = false;
+    this.documentRevision = snapshot.documentRevision;
+    this.lastCursorLine = -1;
+    this.lastDocumentLines = -1;
+    this.view.setState(snapshot.state);
+    this.suppressDirty = false;
+    this.callbacks.onDirty(false);
+    requestAnimationFrame(() => {
+      this.view.scrollDOM.scrollTop = snapshot.scrollTop;
+      this.view.scrollDOM.scrollLeft = snapshot.scrollLeft;
+    });
   }
 
   /** Replace a clean document after an external edit without throwing the
