@@ -7,7 +7,7 @@ import { hydrateTableOfContents, renderBlockHtml, renderPreview } from "./previe
 import { planPreviewUpdate } from "./preview-blocks";
 import { PreviewWorkerClient } from "./preview-worker-client";
 import { patchPreviewHtml } from "./preview-patch";
-import { findBooleanPropertyEdit, findScalarPropertyEdit, renderPropertiesHtml, splitFrontmatter, type PropertyType } from "./frontmatter";
+import { findBooleanPropertyEdit, findScalarPropertyEdit, renderPropertiesHtml, splitFrontmatter, yamlToRows, type PropertyType } from "./frontmatter";
 import { splitWikilinkTarget } from "./wikilinks";
 import {
   buildTree,
@@ -3789,9 +3789,17 @@ async function dailyNoteStub(path: string, date: Date): Promise<string> {
       });
       if (resolved) {
         const file = await invoke<OpenFile>("read_file", { path: resolved });
+        const now = new Date(date);
+        const clock = new Date();
+        now.setHours(clock.getHours(), clock.getMinutes(), clock.getSeconds(), clock.getMilliseconds());
+        const insertions = await dailyNoteInsertions(path);
         const rendered = await renderTemplater(file.content, {
           path,
           content: "",
+          now,
+          insertions,
+          resolveInsertion: (name) =>
+            uiPrompt(`Value for {{${name}}}`, { defaultValue: "" }),
           readFile: async (requested) => {
             const target = await invoke<string | null>("resolve_wikilink", {
               target: requested,
@@ -3811,6 +3819,34 @@ async function dailyNoteStub(path: string, date: Date): Promise<string> {
   }
   const iso = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
   return `---\ntitle: Personal Journal\ndate: ${iso}\ntags:\n  - journal\n---\n\n`;
+}
+
+async function dailyNoteInsertions(path: string): Promise<Record<string, unknown>> {
+  const filename = path.replace(/\\/g, "/").split("/").pop() ?? path;
+  const values: Record<string, unknown> = {
+    title: "Personal Journal",
+    file_title: filename.replace(/\.(?:md|markdown)$/i, ""),
+  };
+  try {
+    const state = await invoke<OpenFile>("read_file", {
+      path: "journal_control/journal_state.md",
+    });
+    const yaml = splitFrontmatter(state.content).yaml;
+    if (!yaml) return values;
+    for (const row of yamlToRows(yaml)) {
+      if (row.value == null) continue;
+      values[row.key] = row.value;
+      if (row.key.startsWith("next_") && row.key.length > 5) {
+        values[row.key.slice(5)] ??= row.value;
+      }
+    }
+    if (typeof values.journal_title === "string" && values.journal_title) {
+      values.title = values.journal_title;
+    }
+  } catch {
+    /* Most vaults do not have shared journal state; built-in insertions still work. */
+  }
+  return values;
 }
 
 function showDailyCalendar() {
@@ -4667,6 +4703,7 @@ function automationTemplateContext(path: string, content: string, variables: Rec
     path,
     content,
     selection: variables.selection ?? "",
+    insertions: variables,
     readFile: async (requested: string) => (await invoke<OpenFile>("read_file", { path: requested })).content,
     prompt: async (message: string, defaultValue?: string) => uiPrompt(message, { defaultValue: defaultValue ?? "" }),
   };

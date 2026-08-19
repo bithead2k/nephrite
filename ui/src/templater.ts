@@ -4,6 +4,12 @@ export type TemplateContext = {
   path: string;
   content: string;
   selection?: string;
+  /** Clock used by {{date}}, {{time}}, and their formatted variants. */
+  now?: Date;
+  /** Host-provided values for core or vault-specific {{insertion}} tags. */
+  insertions?: Record<string, unknown>;
+  /** Optional lazy provider for insertion values not present in `insertions`. */
+  resolveInsertion?: (name: string) => Promise<unknown> | unknown;
   /** Optional ISO or local mtime string for tp.file.last_modified_date */
   mtime?: string | null;
   readFile?: (path: string) => Promise<string>;
@@ -17,6 +23,7 @@ export type TemplateResult = {
 };
 
 const COMMAND = /<%([_*+-]?)([\s\S]*?)([-_+]?)[%]>/g;
+const INSERTION = /\{\{\s*([^{}]+?)\s*\}\}/g;
 
 export async function renderTemplater(
   template: string,
@@ -24,6 +31,7 @@ export async function renderTemplater(
 ): Promise<TemplateResult> {
   const warnings: string[] = [];
   let cursor: number | null = null;
+  template = await renderInsertionTags(template, context, warnings);
   let output = "";
   let last = 0;
   for (const match of template.matchAll(COMMAND)) {
@@ -50,6 +58,66 @@ export async function renderTemplater(
   }
   output += template.slice(last);
   return { text: output, cursor, warnings };
+}
+
+async function renderInsertionTags(
+  template: string,
+  context: TemplateContext,
+  warnings: string[],
+): Promise<string> {
+  let output = "";
+  let last = 0;
+  const warned = new Set<string>();
+  for (const match of template.matchAll(INSERTION)) {
+    const index = match.index ?? 0;
+    output += template.slice(last, index);
+    const name = match[1].trim();
+    const value = await insertionValue(name, context);
+    if (value.found) {
+      output += value.value == null ? "" : String(value.value);
+    } else {
+      output += match[0];
+      if (!warned.has(name)) {
+        warnings.push(`Unknown template insertion: ${name}`);
+        warned.add(name);
+      }
+    }
+    last = index + match[0].length;
+  }
+  output += template.slice(last);
+  return output;
+}
+
+async function insertionValue(
+  name: string,
+  context: TemplateContext,
+): Promise<{ found: boolean; value?: unknown }> {
+  if (context.insertions && Object.prototype.hasOwnProperty.call(context.insertions, name)) {
+    return { found: true, value: context.insertions[name] };
+  }
+
+  const now = context.now ?? new Date();
+  if (name === "date") return { found: true, value: formatDate(now, "YYYY-MM-DD") };
+  if (name === "time") return { found: true, value: formatDate(now, "HH:mm") };
+  if (name.startsWith("date:")) return { found: true, value: formatDate(now, name.slice(5)) };
+  if (name.startsWith("time:")) return { found: true, value: formatDate(now, name.slice(5)) };
+
+  const path = context.path.replace(/\\/g, "/");
+  const filename = path.split("/").pop() ?? path;
+  if (name === "title") {
+    return { found: true, value: filename.replace(/\.(?:md|markdown)$/i, "") };
+  }
+  if (name === "path") return { found: true, value: path };
+  if (name === "folder") {
+    return { found: true, value: path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "" };
+  }
+  if (name === "selection") return { found: true, value: context.selection ?? "" };
+
+  if (context.resolveInsertion) {
+    const value = await context.resolveInsertion(name);
+    if (value !== undefined) return { found: true, value };
+  }
+  return { found: false };
 }
 
 async function evaluateExpression(expression: string, context: TemplateContext): Promise<string> {

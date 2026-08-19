@@ -446,6 +446,66 @@ test("Templater fields are evaluated immediately before template application", a
   assert.deepEqual(rendered.warnings, []);
 });
 
+test("Templater expands core and host-provided insertion tags before YAML is parsed", async () => {
+  const rendered = await renderTemplater(
+    [
+      "---",
+      "title: {{title}}",
+      "date: {{date:YYYY-MM-DD}}",
+      "reading_date: {{reading_date}}",
+      "created: {{time:HH:mm:ss}}",
+      "---",
+      "<% tp.file.title %>",
+    ].join("\n"),
+    {
+      path: "journals/2026_08_20.md",
+      content: "",
+      now: new Date(2026, 7, 20, 6, 7, 8),
+      insertions: {
+        title: "Personal Journal",
+        reading_date: "2026-05-08",
+      },
+    },
+  );
+  assert.equal(rendered.text, [
+    "---",
+    "title: Personal Journal",
+    "date: 2026-08-20",
+    "reading_date: 2026-05-08",
+    "created: 06:07:08",
+    "---",
+    "2026_08_20",
+  ].join("\n"));
+  assert.deepEqual(rendered.warnings, []);
+});
+
+test("Templater preserves unknown insertion tags and reports each one once", async () => {
+  const rendered = await renderTemplater(
+    "value: {{ missing }}\nagain: {{missing}}",
+    { path: "note.md", content: "" },
+  );
+  assert.equal(rendered.text, "value: {{ missing }}\nagain: {{missing}}");
+  assert.deepEqual(rendered.warnings, ["Unknown template insertion: missing"]);
+});
+
+test("Templater lazily resolves vault-specific insertion tags", async () => {
+  const requested: string[] = [];
+  const rendered = await renderTemplater(
+    "reading_date: {{reading_date}}",
+    {
+      path: "journals/2026_08_20.md",
+      content: "",
+      resolveInsertion: (name) => {
+        requested.push(name);
+        return name === "reading_date" ? "2026-05-08" : undefined;
+      },
+    },
+  );
+  assert.equal(rendered.text, "reading_date: 2026-05-08");
+  assert.deepEqual(requested, ["reading_date"]);
+  assert.deepEqual(rendered.warnings, []);
+});
+
 test("rapid edits defer document reads and collapse into one preview", () => {
   const timers = new FakeTimers();
   const work = new DeferredDocumentWork(350, timers);
