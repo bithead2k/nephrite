@@ -19,14 +19,23 @@ import { shortestWikilinkTargets, splitWikilinkTarget } from "../ui/src/wikilink
 import { formatQueryUri } from "../ui/src/query-uri";
 import { renderPreview } from "../ui/src/preview";
 import { extractBlock, extractHeadingSection } from "../ui/src/note-embed";
+import {
+  headingSectionAt,
+  headingSectionByOccurrence,
+  newNoteDirectory,
+  newWikilinkPath,
+  planHeadingExtract,
+  sanitizeNoteFileName,
+  uniqueNotePath,
+} from "../ui/src/extract-heading";
 import { planPreviewUpdate, splitMarkdownBlocks } from "../ui/src/preview-blocks";
 import { planTemplateApplication } from "../ui/src/template-application";
 import { renderTemplater } from "../ui/src/templater";
 import { formatTimestampPart } from "../ui/src/timestamp-shortcuts";
 import { findTaskCheckboxEdit } from "../ui/src/tasks";
 import { RefreshGate } from "../ui/src/refresh-gate";
-import { canPersistSession } from "../ui/src/session-guard";
-import { vaultChangeTouchesFileTree } from "../ui/src/vault-change";
+import { canPersistSession, editorTabTitle } from "../ui/src/session-guard";
+import { vaultChangeInvalidatesPageCache, vaultChangeTouchesFileTree } from "../ui/src/vault-change";
 import {
   countWikilinks,
   DirtyReactor,
@@ -72,6 +81,8 @@ import {
 } from "../ui/src/automation";
 import {
   permissionForPluginMethod,
+  preparePluginModuleSource,
+  rewritePluginAssetUrls,
   validatePluginDescriptor,
   type PluginDescriptor,
 } from "../ui/src/plugin-host";
@@ -111,10 +122,20 @@ class FakeTimers {
   }
 }
 
-test("startup cannot overwrite a saved vault session with an empty workspace", () => {
-  assert.equal(canPersistSession(false, false), false);
-  assert.equal(canPersistSession(true, true), false);
-  assert.equal(canPersistSession(true, false), true);
+test("startup or mid-restore unload cannot overwrite a saved session with empty panes", () => {
+  assert.equal(canPersistSession(false, false, false), false);
+  assert.equal(canPersistSession(true, false, false), false);
+  assert.equal(canPersistSession(true, true, true), false);
+  assert.equal(canPersistSession(true, false, true), true);
+});
+
+test("editor prompt stays hidden while saved tabs are waiting to paint", () => {
+  assert.equal(editorTabTitle(null, false, 0, false), "");
+  assert.equal(editorTabTitle(null, false, 3, false), "");
+  assert.equal(editorTabTitle(null, false, 3, true), "");
+  assert.equal(editorTabTitle("journals/2026_08_18.md", false, 3, true), "journals/2026_08_18.md");
+  assert.equal(editorTabTitle("journals/2026_08_18.md", true, 3, true), "journals/2026_08_18.md •");
+  assert.equal(editorTabTitle(null, false, 0, true), "Open a Markdown file");
 });
 
 test("vimrc compatibility evaluates conditionals, variables, execute, and commands", () => {
@@ -464,6 +485,34 @@ test("vault changes do not cancel an active dynamic preview", () => {
   assert.equal(gate.end(), true, "many changes collapse into one follow-up render");
   assert.equal(gate.end(), false);
   assert.equal(gate.request(), true, "an idle renderer may refresh immediately");
+});
+
+test("image-only and other-page edits invalidate the rendered page cache", () => {
+  const board = "snippets/Job Search 2026 Board.md";
+  assert.equal(vaultChangeInvalidatesPageCache({
+    scanned: 1,
+    updated: 1,
+    removed: 0,
+    paths: ["companies/assets/linkedin-texas-instruments.jpg"],
+  }, board), true, "a new/replaced logo must drop lastPreviewBody");
+  assert.equal(vaultChangeInvalidatesPageCache({
+    scanned: 1,
+    updated: 1,
+    removed: 0,
+    paths: ["job_search/2026/texas-instruments-data-engineer.md"],
+  }, board), true, "cover YAML on a card note must drop the board page cache");
+  assert.equal(vaultChangeInvalidatesPageCache({
+    scanned: 1,
+    updated: 1,
+    removed: 0,
+    paths: [board],
+  }, board), false, "the open note's own markdown is not an image-only miss");
+  assert.equal(vaultChangeTouchesFileTree({
+    scanned: 1,
+    updated: 1,
+    removed: 0,
+    paths: ["companies/assets/linkedin-texas-instruments.jpg"],
+  }, [board]), true, "a new image is still a file-tree add");
 });
 
 test("ordinary vault content changes do not rebuild the file browser", () => {
@@ -946,6 +995,11 @@ test("Dataview default() lowers to nullish coalesce()", () => {
     "helpers.contains(notes, 'default(phone)')",
     "function-like text inside a string must remain literal",
   );
+  assert.equal(
+    evaluateDql("default(mobile, company_phone)", row, current),
+    "972-555-1212",
+    "absent field names are null, not a ReferenceError",
+  );
 });
 
 test("executable fences render as code elements the executor can discover", () => {
@@ -1011,6 +1065,62 @@ test("note transclusion selects heading sections and block IDs without leaking m
     "## Interstitial\nselected text\n\nparagraph carrying a block id ^chosen",
   );
   assert.equal(extractBlock(markdown, "chosen"), "paragraph carrying a block id");
+});
+
+test("Extract Heading cuts a section into a new note and leaves a wikilink", () => {
+  const markdown = [
+    "# First",
+    "alpha",
+    "",
+    "## Interstitial",
+    "selected text",
+    "",
+    "## Next",
+    "not selected",
+  ].join("\n");
+  const onHeading = markdown.indexOf("## Interstitial") + 3;
+  const section = headingSectionAt(markdown, onHeading);
+  assert.equal(section?.heading, "Interstitial");
+  assert.equal(headingSectionAt(markdown, markdown.indexOf("selected text")), null);
+  assert.equal(headingSectionByOccurrence(markdown, "Interstitial", 0)?.text, section?.text);
+  assert.equal(sanitizeNoteFileName("Job card: Texas / TI"), "Job card Texas TI");
+  assert.equal(newNoteDirectory({ newFileLocation: "folder", newFileFolderPath: "snippets" }, "job_search/a.md"), "snippets");
+  assert.equal(newNoteDirectory({ newFileLocation: "current" }, "job_search/2026/a.md"), "job_search/2026");
+  assert.equal(
+    newWikilinkPath("Challenger", "journals/2026_08_18.md", {
+      newFileLocation: "folder",
+      newFileFolderPath: "snippets",
+    }),
+    "snippets/Challenger.md",
+  );
+  assert.equal(
+    newWikilinkPath("Challenger", "journals/2026_08_18.md", { newFileLocation: "current" }),
+    "journals/Challenger.md",
+  );
+  assert.equal(
+    newWikilinkPath("people/Ada", "journals/2026_08_18.md", {
+      newFileLocation: "folder",
+      newFileFolderPath: "snippets",
+    }),
+    "people/Ada.md",
+  );
+  assert.equal(uniqueNotePath("snippets", "Interstitial", ["snippets/Interstitial.md"]), "snippets/Interstitial 2.md");
+  const planned = planHeadingExtract({
+    markdown,
+    section: section!,
+    currentPath: "journals/today.md",
+    settings: { newFileLocation: "folder", newFileFolderPath: "snippets" },
+    existingPaths: [],
+    linkFor: (path) => path.replace(/^.*\//, "").replace(/\.md$/i, ""),
+  });
+  assert.ok(!("error" in planned));
+  if ("error" in planned) return;
+  assert.equal(planned.path, "snippets/Interstitial.md");
+  assert.equal(planned.content, "## Interstitial\nselected text\n");
+  assert.equal(
+    markdown.slice(0, planned.from) + planned.insert + markdown.slice(planned.to),
+    "# First\nalpha\n\n[[Interstitial]]\n\n## Next\nnot selected",
+  );
 });
 
 test("incremental preview planning preserves fences and invalidates YAML-only edits", () => {
@@ -1257,6 +1367,7 @@ test("plugin descriptors require a compatible API and methods map to explicit pe
   assert.equal(validatePluginDescriptor(plugin), null);
   assert.equal(permissionForPluginMethod("vault.read"), "vault.read");
   assert.equal(permissionForPluginMethod("workspace.registerCommand"), "workspace.commands");
+  assert.equal(permissionForPluginMethod("network.requestUrl"), "network.request");
   assert.equal(permissionForPluginMethod("host.secret"), null);
   assert.match(validatePluginDescriptor({ ...plugin, api_version: 2 }) || "", /plugin API 2/);
   assert.match(validatePluginDescriptor({ ...plugin, id: "../escape" }) || "", /Invalid plugin id/);
@@ -1264,6 +1375,24 @@ test("plugin descriptors require a compatible API and methods map to explicit pe
     validatePluginDescriptor({ ...plugin, permissions: ["vault.read", "vault.read"] }) || "",
     /Duplicate/,
   );
+});
+
+test("plugin package CSS resolves bundled assets without granting filesystem access", () => {
+  const data = "data:font/woff2;base64,AAE=";
+  assert.equal(
+    rewritePluginAssetUrls("@font-face{src:url('./fonts/ui.woff2')} .remote{background:url(https://example.test/x.png)}", {
+      id: "theme-tools",
+      assets: { "fonts/ui.woff2": data },
+    }),
+    `@font-face{src:url("${data}")} .remote{background:url(https://example.test/x.png)}`,
+  );
+});
+
+test("plugin host accepts bundled ESM Obsidian entrypoints", () => {
+  const source = preparePluginModuleSource("import { Plugin as Base } from 'obsidian'; export default class Demo extends Base {}");
+  assert.match(source, /const \{ Plugin: Base \} = require\("obsidian"\)/);
+  assert.match(source, /module\.exports\.default = class Demo/);
+  assert.throws(() => preparePluginModuleSource("import helper from './helper.js';"), /unbundled ES module/);
 });
 
 test("Obsidian app aliases inherit Nephrite capability and path security", async () => {

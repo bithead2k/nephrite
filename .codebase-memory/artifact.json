@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "92c372689f14537cac9c40d9e07364736a61647c",
+    "indexed_at": "2026-08-19T10:11:24Z",
+    "project": "nephrite",
+    "nodes": 3815,
+    "edges": 14833,
+    "original_size": 12124160,
+    "compressed_size": 2392356,
+    "compression_level": 9
+}

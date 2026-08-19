@@ -49,7 +49,7 @@ import {
   ensureDefaultJobBoardHooks,
   resolveBoardHooks,
 } from "./kanban-hooks-config";
-import { installZoomKeys, getZoom } from "./zoom";
+import { installZoomKeys } from "./zoom";
 import { uiAlert, uiConfirm, uiPickFile, uiPrompt } from "./dialogs";
 import { mergeTexts, showMergeEditor } from "./file-merge";
 import {
@@ -60,6 +60,7 @@ import {
 import { installWindowStatePersistence } from "./window-state";
 import {
   showContextMenu,
+  showItemMenu,
   parentDir,
   joinPath,
   baseName,
@@ -67,6 +68,16 @@ import {
   type CtxAction,
   type CtxTarget,
 } from "./context-menu";
+import {
+  headingSectionAt,
+  headingSectionByOccurrence,
+  newWikilinkPath,
+  normalizeExtractHeading,
+  planHeadingExtract,
+  type HeadingSection,
+  type NewFileSettings,
+} from "./extract-heading";
+import { shortestWikilinkTarget } from "./wikilinks";
 import {
   clearScrollSync,
   CURSOR_SYNC_DELAY_MS,
@@ -77,9 +88,7 @@ import {
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
 import { bindKanbanCardPreview, bindKanbanScrollPreviewGuard, dismissKanbanCardPreview } from "./kanban-card-preview";
 import { clearKanbanCoverCache, hydrateKanbanCardCovers } from "./kanban-cover";
-import { findTaskCheckboxEdit, findTaskStatusEdit, hydratePreviewTaskMarkers } from "./tasks";
-import { nextTaskStatusChar } from "./task-status";
-import { VimPowerlineClient } from "./vim-powerline";
+import { findNextTaskStatusEdit, hydratePreviewTaskMarkers } from "./tasks";
 import {
   emptyExcalidrawFile,
   isObsidianExcalidrawMarkdown,
@@ -90,8 +99,8 @@ import { renderTemplater } from "./templater";
 import { planTemplateApplication } from "./template-application";
 import { hydrateExcalidrawEmbeds } from "./excalidraw-embed";
 import { hydrateNoteEmbeds } from "./note-embed";
-import { hydrateMarkdownImages } from "./image-embed";
-import { isAudioPath, isBasePath, isCodePath, isCsvPath, isPdfPath, isStructuredPath, isVideoPath } from "./file-kinds";
+import { clearMediaSrcCache, hydrateMarkdownImages } from "./image-embed";
+import { isAudioPath, isBasePath, isCodePath, isCsvPath, isImagePath, isPdfPath, isStructuredPath, isVideoPath } from "./file-kinds";
 import { highlightPreviewCode } from "./syntax-highlight";
 import { hydrateMermaid } from "./mermaid";
 import { clearCodeView, renderCodeView } from "./code-view";
@@ -108,9 +117,9 @@ import type { SqlQueryResult } from "./dv-engine";
 import { DeferredDocumentWork } from "./edit-scheduler";
 import { RefreshGate } from "./refresh-gate";
 import { resizedKanbanLaneWidth } from "./kanban-resize";
-import { canPersistSession } from "./session-guard";
+import { canPersistSession, editorTabTitle } from "./session-guard";
 import { bindQueryUriLinks } from "./query-uri";
-import { vaultChangeTouchesFileTree } from "./vault-change";
+import { vaultChangeInvalidatesPageCache, vaultChangeTouchesFileTree } from "./vault-change";
 import {
   DirtyReactor,
   paneToRefresh,
@@ -124,7 +133,12 @@ import { CanvasView, serializeCanvas } from "./canvas-view";
 import { renderGraph } from "./graph-view";
 import { renderLinkHealth } from "./link-health";
 import { renderNoteContext, renderTagBrowser } from "./note-context";
-import { renderCommandBar, type AppCommand } from "./command-bar";
+import { collectPeople, renderAttendancePanel, type PersonRow } from "./people";
+import {
+  renderPersistentCommandBar,
+  type AppCommand,
+  type PersistentCommandBar,
+} from "./command-bar";
 import {
   PluginManager,
   type PluginDescriptor,
@@ -236,6 +250,10 @@ let drawingContent = "";
 let drawingDocument: ExcalidrawDocument | null = null;
 let canvasContent = "";
 let dirty = false;
+// Last bytes read or successfully written for each open file. Editor saves
+// send this baseline to the backend so an external change cannot be silently
+// overwritten by autosave.
+const savedContentByPath = new Map<string, string>();
 let pendingCursor: { line: number; col: number; totalLines: number } | null = null;
 let pendingFolds = false;
 const dirtyReactor = new DirtyReactor(() => {
@@ -246,12 +264,9 @@ const dirtyReactor = new DirtyReactor(() => {
     void renderRightPane(editor.getDoc(), revision);
   }
   if (pendingCursor) {
-    const { line, col, totalLines } = pendingCursor;
+    const { line, totalLines } = pendingCursor;
     pendingCursor = null;
-    statusLine = line;
-    statusColumn = col;
     setEditorDocumentEnd(line === totalLines);
-    scheduleCursorChromeUpdate();
   }
   if (pendingFolds) {
     pendingFolds = false;
@@ -287,10 +302,7 @@ let vaultOpen = false;
 let refreshInProgress = false;
 let activeOpenPlan: VaultOpenPlan | null = null;
 let vaultChangeQueue: Promise<void> = Promise.resolve();
-let statusLine = 1;
-let statusColumn = 1;
-let cursorChromeFrame: number | null = null;
-let vimPowerline: VimPowerlineClient | null = null;
+let commandPrompt: PersistentCommandBar | null = null;
 let expanded = loadExpanded();
 let treeRoot: TreeNode = { name: "", path: "", kind: "dir", children: [] };
 let kanbanBoard: KanbanBoard | null = null;
@@ -306,6 +318,8 @@ let rightPath: string | null = null;
 let paneSplit = loadPaneSplit();
 /** Skip session writes during restore. */
 let restoringSession = false;
+/** True only after vault data, plugins, automation, and pane restoration finish. */
+let sessionPersistenceReady = false;
 /** Preview-only fold state; never written into vault files. */
 const propertiesFoldState = new Map<string, boolean>();
 let propertiesFoldStorageKey: string | null = null;
@@ -467,7 +481,7 @@ function saveSession() {
   // The last-vault key exists before automatic startup indexing finishes.
   // Do not let the crash-safety timer overwrite a valid saved workspace with
   // the still-empty startup state while a large index is opening.
-  if (!canPersistSession(vaultOpen, restoringSession)) return;
+  if (!canPersistSession(vaultOpen, restoringSession, sessionPersistenceReady)) return;
   const vault = localStorage.getItem(LAST_VAULT_KEY);
   if (!vault) return;
   const tabs = [...openTabs];
@@ -646,7 +660,6 @@ async function renderShell() {
       <div class="actions">
         <button type="button" id="btn-today" title="Jump to today's journal" disabled>Today</button>
         <button type="button" id="btn-save" disabled title="Save (Ctrl/Cmd+S)">Save</button>
-        <button type="button" id="btn-command" title="Command bar (Ctrl+P)">Command</button>
         <div class="seg" role="group" aria-label="View mode">
           <button type="button" data-mode="source" class="seg-btn" title="Source only">Source</button>
           <button type="button" data-mode="live" class="seg-btn" title="Live preview editor">Live</button>
@@ -769,7 +782,7 @@ async function renderShell() {
           <progress aria-label="Vault indexing in progress"></progress>
         </div>
         <div id="tab-bar" class="tab-bar"></div>
-        <div id="tab" class="tab">Open a Markdown file</div>
+        <div id="tab" class="tab"></div>
         <div id="panes" class="panes mode-${viewMode}">
           <div id="editor-host" class="editor-host"></div>
           <div id="pane-splitter" class="pane-splitter" role="separator"
@@ -814,11 +827,8 @@ async function renderShell() {
             <div id="data-host" class="data-host hidden" tabindex="-1"></div>
           </div>
         </div>
-        <footer class="statusbar" id="statusbar">
-          <span id="status-powerline" hidden></span>
-          <span id="status-path" class="status-muted">—</span>
-          <span id="status-cursor" class="status-muted">Ln 1, Col 1</span>
-          <span id="status-zoom" class="status-muted">100%</span>
+        <footer class="command-footer" id="command-footer" aria-label="Command bar">
+          <div id="persistent-command-bar"></div>
           <span id="status-hint" class="status-muted">${STATUS_HINT}</span>
         </footer>
       </section>
@@ -841,6 +851,11 @@ async function renderShell() {
     </div>
   `;
   applyAppearanceFonts(appearanceFonts);
+  commandPrompt = renderPersistentCommandBar(
+    $("persistent-command-bar"),
+    () => commandCatalog(true).filter((command) => command.id !== "command"),
+    (command) => shFull(command),
+  );
 
   $("btn-open").addEventListener("click", () => {
     closePreferences();
@@ -896,7 +911,6 @@ async function renderShell() {
   $("canvas-zoom-reset").addEventListener("click", () => canvasView?.resetZoom());
   $("canvas-zoom-in").addEventListener("click", () => canvasView?.changeZoom(0.1));
   $("btn-template").addEventListener("click", () => void showTemplatePanel());
-  $("btn-command").addEventListener("click", showCommandBar);
   document.addEventListener("keydown", (event) => {
     if (event.defaultPrevented) return;
     const commands = commandCatalog(false);
@@ -972,7 +986,6 @@ async function renderShell() {
     vimOn = (e.target as HTMLInputElement).checked;
     localStorage.setItem(VIM_KEY, vimOn ? "1" : "0");
     editor?.setVim(vimOn);
-    updateVimPowerline();
   });
   $("file-filter").addEventListener("input", (e) => {
     filterQuery = (e.target as HTMLInputElement).value.trim().toLowerCase();
@@ -1005,13 +1018,9 @@ async function renderShell() {
   syncModeButtons();
   setSidebarCollapsed(sidebarCollapsed, false);
   installZoomKeys();
-  updateZoomLabel();
-  window.addEventListener("nephrite-zoom", () => updateZoomLabel());
-  window.addEventListener("resize", () => updateVimPowerline());
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && dirty) void saveFile(true);
   });
-  vimPowerline = new VimPowerlineClient();
   await initEditor();
   pluginManager = new PluginManager({
     listFiles: () => mdFilesAll,
@@ -1095,6 +1104,7 @@ async function renderShell() {
     executeShell: (command, args) => invoke("shell_command", {
       command: [command, ...args].map(shellArgument).join(" "), cwd: null, timeoutMs: 60_000,
     }),
+    requestUrl: (request) => invoke("plugin_http_request", { request }),
   }, renderPreferencesPlugins);
   canvasView = new CanvasView(
     $("canvas-host"),
@@ -1166,16 +1176,20 @@ async function initEditor() {
     vimOn,
     userVimrc,
   );
-  schedulePreview("");
-}
-
-function scheduleCursorChromeUpdate() {
-  if (cursorChromeFrame != null) return;
-  cursorChromeFrame = requestAnimationFrame(() => {
-    cursorChromeFrame = null;
-    $("status-cursor").textContent = `Ln ${statusLine}, Col ${statusColumn}`;
-    updateVimPowerline();
+  editor.view.dom.addEventListener("contextmenu", (event) => {
+    if (!editor || currentFileKind !== "markdown") return;
+    const pos = editor.view.posAtCoords({ x: event.clientX, y: event.clientY });
+    if (pos == null) return;
+    const section = headingSectionAt(editor.getDoc(), pos);
+    if (!section) return;
+    event.preventDefault();
+    showItemMenu(event.clientX, event.clientY, [
+      { id: "extract-heading", label: "Extract Heading" },
+    ], (id) => {
+      if (id === "extract-heading") void extractHeadingSectionToNote(section);
+    });
   });
+  schedulePreview("");
 }
 
 function focusFileFilter() {
@@ -1255,7 +1269,6 @@ function saveAppearanceFontPreferences() {
   localStorage.setItem(APPEARANCE_FONTS_KEY, JSON.stringify(appearanceFonts));
   applyAppearanceFonts(appearanceFonts);
   loadAppearanceFontInputs();
-  updateVimPowerline();
   setTransientStatus("Appearance fonts saved", "#5ecf9a");
 }
 
@@ -1264,7 +1277,6 @@ function resetAppearanceFontPreferences() {
   localStorage.removeItem(APPEARANCE_FONTS_KEY);
   applyAppearanceFonts(appearanceFonts);
   loadAppearanceFontInputs();
-  updateVimPowerline();
   setTransientStatus("Appearance fonts reset", "#5ecf9a");
 }
 
@@ -1409,11 +1421,6 @@ function setupScrollSync() {
   }
   const previewHost = document.getElementById("preview-host");
   rebindScrollSync(ed, previewHost);
-}
-
-function updateZoomLabel() {
-  const el = document.getElementById("status-zoom");
-  if (el) el.textContent = `${Math.round(getZoom() * 100)}%`;
 }
 
 function schedulePreview(text: string) {
@@ -1574,7 +1581,7 @@ async function renderRightPane(text: string, revision: number) {
       previewEl.querySelectorAll(".dv-block, .dv-inline").forEach((el) => el.remove());
       for (let index = 0; index < plan.blocks.length; index++) {
         const block = plan.blocks[index];
-        if (!/```(?:pgsql\b|dataview|dataviewjs|js|javascript)/i.test(block)) continue;
+        if (!/```(?:pgsql\b|dataview|dataviewjs|js|javascript|tasks\b)/i.test(block)) continue;
         const node = previewEl.querySelector(
           `:scope > .md-block[data-block-index="${index}"]`,
         ) as HTMLElement | null;
@@ -1843,12 +1850,16 @@ function bindPreviewContent(root: HTMLElement, path: string, revision?: number) 
       checkbox.disabled = path !== currentPath || !editor;
       checkbox.title = checkbox.disabled
         ? "Open this note to change the task"
-        : "Update task in Markdown";
-      checkbox.addEventListener("change", () => {
+        : "Click to cycle task status";
+      checkbox.addEventListener("click", (event) => {
+        event.preventDefault();
         if (!editor || path !== currentPath) return;
-        const edit = findTaskCheckboxEdit(editor.getDoc(), taskIndex, checkbox.checked);
+        const edit = findNextTaskStatusEdit(
+          editor.getDoc(),
+          taskIndex,
+          checkbox.closest<HTMLElement>("li")?.dataset.taskStatus || " ",
+        );
         if (!edit) {
-          checkbox.checked = !checkbox.checked;
           setTransientStatus("Could not safely locate this task in Markdown", "#e9ad55");
           return;
         }
@@ -1863,8 +1874,11 @@ function bindPreviewContent(root: HTMLElement, path: string, revision?: number) 
     button.disabled = path !== currentPath || !editor;
     button.addEventListener("click", () => {
       if (!editor || path !== currentPath) return;
-      const next = nextTaskStatusChar(button.dataset.taskStatus || " ");
-      const edit = findTaskStatusEdit(editor.getDoc(), taskIndex, next);
+      const edit = findNextTaskStatusEdit(
+        editor.getDoc(),
+        taskIndex,
+        button.dataset.taskStatus || " ",
+      );
       if (!edit) {
         setTransientStatus("Could not safely locate this task in Markdown", "#e9ad55");
         return;
@@ -1942,6 +1956,86 @@ function bindPreviewContent(root: HTMLElement, path: string, revision?: number) 
     openLink: (target) => void openWikilink(target),
   });
   hydrateTableOfContents(root);
+  bindPreviewHeadingExtract(root, path);
+}
+
+function bindPreviewHeadingExtract(root: HTMLElement, path: string) {
+  const headings = Array.from(root.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6"))
+    .filter((heading) => !heading.closest(".note-embed"));
+  headings.forEach((heading) => {
+    if (heading.dataset.extractBound === "1") return;
+    heading.dataset.extractBound = "1";
+    heading.addEventListener("contextmenu", (event) => {
+      if (path !== currentPath || !editor) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const label = heading.textContent?.trim() || "";
+      const wanted = normalizeExtractHeading(label);
+      const occurrence = headings
+        .filter((el) => normalizeExtractHeading(el.textContent || "") === wanted)
+        .indexOf(heading);
+      const section = headingSectionByOccurrence(editor.getDoc(), label, occurrence);
+      if (!section) {
+        setTransientStatus("Could not locate this heading in Markdown", "#e9ad55");
+        return;
+      }
+      showItemMenu(event.clientX, event.clientY, [
+        { id: "extract-heading", label: "Extract Heading" },
+      ], (id) => {
+        if (id === "extract-heading") void extractHeadingSectionToNote(section);
+      });
+    });
+  });
+}
+
+async function readNewFileSettings(): Promise<NewFileSettings> {
+  try {
+    const file = await invoke<{ content: string }>("read_file", { path: ".obsidian/app.json" });
+    return JSON.parse(file.content) as NewFileSettings;
+  } catch {
+    return {};
+  }
+}
+
+function extractHeadingAtCursor() {
+  if (!editor || currentFileKind !== "markdown") {
+    setTransientStatus("Open a Markdown note to extract a heading", "#e9ad55");
+    return;
+  }
+  const section = headingSectionAt(editor.getDoc(), editor.getCursor());
+  if (!section) {
+    setTransientStatus("Place the cursor on a heading line", "#e9ad55");
+    return;
+  }
+  void extractHeadingSectionToNote(section);
+}
+
+async function extractHeadingSectionToNote(section: HeadingSection) {
+  if (!editor || !currentPath || currentFileKind !== "markdown") return;
+  const markdown = editor.getDoc();
+  const settings = await readNewFileSettings();
+  const existing = vaultFilesAll.map((file) => file.path);
+  const planned = planHeadingExtract({
+    markdown,
+    section,
+    currentPath,
+    settings,
+    existingPaths: existing,
+    linkFor: (path) => shortestWikilinkTarget(path, [...vaultFilesAll, { path }]),
+  });
+  if ("error" in planned) {
+    setTransientStatus(planned.error, "#e9ad55");
+    return;
+  }
+  try {
+    await invoke("create_file", { path: planned.path, content: planned.content });
+  } catch (error) {
+    setTransientStatus(String(error), "#e9ad55");
+    return;
+  }
+  editor.replaceRange(planned.from, planned.to, planned.insert);
+  await refreshTree();
+  setTransientStatus(`Extracted heading to ${planned.path}`, "#5ecf9a");
 }
 
 async function renderDynamicPreview(
@@ -2601,22 +2695,14 @@ async function runKanbanHookScript(
 function updateChrome() {
   const save = $("btn-save") as HTMLButtonElement;
   save.disabled = !currentPath || !dirty;
-  if (dirty) {
-    const tab = $("tab");
-    if (currentPath) {
-      tab.textContent = `${currentPath} •`;
-      $("status-path").textContent = currentPath;
-    }
-    return;
-  }
   const tab = $("tab");
-  if (!currentPath) {
-    tab.textContent = "Open a Markdown file";
-    $("status-path").textContent = "—";
-  } else {
-    tab.textContent = dirty ? `${currentPath} •` : currentPath;
-    $("status-path").textContent = currentPath;
-  }
+  tab.textContent = editorTabTitle(
+    currentPath,
+    dirty,
+    openTabs.length,
+    sessionPersistenceReady,
+  );
+  if (dirty) return;
   const hasVault = mdFiles.length > 0 || !!localStorage.getItem(LAST_VAULT_KEY);
   ($("btn-refresh") as HTMLButtonElement).disabled = !vaultOpen || refreshInProgress;
   ($("btn-today") as HTMLButtonElement).disabled = !hasVault && mdFiles.length === 0;
@@ -2633,18 +2719,6 @@ function updateChrome() {
   ($("activity-git") as HTMLButtonElement).disabled = !hasVault;
   ($("activity-attachments") as HTMLButtonElement).disabled = !hasVault;
   ($("activity-sql") as HTMLButtonElement).disabled = !hasVault;
-  updateVimPowerline();
-}
-
-function updateVimPowerline() {
-  if (dirty) return;
-  vimPowerline?.update({
-    enabled: vimOn,
-    path: currentPath,
-    line: statusLine,
-    column: statusColumn,
-    dirty,
-  });
 }
 
 async function openVault() {
@@ -2665,6 +2739,11 @@ async function openVaultPath(path: string) {
       if (!proceed) return;
     }
   }
+  // Preserve the old vault before entering the non-persistable loading state.
+  // From this point until the final commit, unload must not serialize the
+  // deliberately cleared intermediate workspace.
+  saveSession();
+  sessionPersistenceReady = false;
   rememberPropertiesFoldState($("preview"));
   rememberEditorFolds();
   const previousRightBody = document.getElementById("right-body");
@@ -2739,6 +2818,9 @@ async function openVaultPath(path: string) {
   // Restore tabs + active note + right pane from last session for this vault.
   await restoreSession(path);
   await runAutomationLifecycle("onVaultOpen");
+  sessionPersistenceReady = true;
+  updateChrome();
+  saveSession();
 }
 
 function showIndexProgress(action: string) {
@@ -2922,6 +3004,20 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
     await refreshTree();
   }
   const changed = new Set(change.paths);
+  const kanbanVisible = Boolean(
+    currentFileKind === "markdown" &&
+    kanbanBoard &&
+    !$("kanban").classList.contains("hidden"),
+  );
+  const pageCacheStale = vaultChangeInvalidatesPageCache(change, currentPath);
+  if (pageCacheStale) {
+    lastPreviewBody = null;
+    lastPreviewPath = null;
+    clearKanbanCoverCache();
+    if (change.paths.some(isImagePath)) {
+      clearMediaSrcCache();
+    }
+  }
 
   if (currentPath && changed.has(currentPath) && change.removed > 0 && !pathExistsInIndex(currentPath)) {
     if (dirty) {
@@ -2942,7 +3038,17 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
   } else if (shouldReloadEditorFromVault(currentPath, currentFileKind, dirty, changed)) {
     const file = await invoke<OpenFile>("read_file", { path: currentPath! });
     if (editor && file.content !== editor.getDoc()) editor.reloadDoc(file.content);
-  } else if (shouldRefreshPreviewFromOtherPages(currentPath, viewMode, changed)) {
+    if (
+      pageCacheStale &&
+      (shouldKeepPreviewWork(viewMode) || kanbanVisible) &&
+      vaultPreviewRefresh.request()
+    ) {
+      scheduleEditorPreview();
+    }
+  } else if (
+    shouldRefreshPreviewFromOtherPages(currentPath, viewMode, changed) ||
+    (pageCacheStale && (shouldKeepPreviewWork(viewMode) || kanbanVisible))
+  ) {
     if (vaultPreviewRefresh.request()) scheduleEditorPreview();
   }
 
@@ -3173,6 +3279,9 @@ async function openNoteSerialized(
     : await invoke<OpenFile>("read_file", { path });
   // A newer openNote won the race — do not clobber editor/path.
   if (generation !== openNoteGeneration) return;
+  if (file.content !== "" || !(isPdfPath(path) || isAudioPath(path) || isVideoPath(path))) {
+    savedContentByPath.set(file.path, file.content);
+  }
   if (currentPath && editor && currentPath !== file.path) {
     tabCursors[currentPath] = editor.getCursor();
   }
@@ -3577,7 +3686,8 @@ async function openWikilink(target: string) {
       void uiAlert(`Could not resolve [[${target}]]`);
       return;
     }
-    const path = pathForNewWikilink(note);
+    const settings = await readNewFileSettings();
+    const path = newWikilinkPath(note, currentPath ?? "", settings);
     const title = path
       .replace(/\.md$/i, "")
       .split("/")
@@ -3600,23 +3710,6 @@ async function openWikilink(target: string) {
   } catch (e) {
     void uiAlert(String(e));
   }
-}
-
-/** Vault-relative path for a missing wikilink target (Obsidian-style). */
-function pathForNewWikilink(note: string): string {
-  let key = note.trim().replace(/\\/g, "/").replace(/^\/+/, "");
-  if (!key) key = "Untitled";
-  // Strip accidental .md for title handling; re-add below.
-  const hasExt = /\.md$/i.test(key);
-  if (!hasExt) key = `${key}.md`;
-  // Path-like targets are vault-relative.
-  if (key.includes("/")) return key;
-  // Bare names land next to the current note when possible.
-  if (currentPath && currentPath.includes("/")) {
-    const dir = currentPath.slice(0, currentPath.lastIndexOf("/"));
-    return `${dir}/${key}`;
-  }
-  return key;
 }
 
 function jumpToWikilinkFragment(
@@ -3766,6 +3859,7 @@ type PendingSave = {
   path: string;
   kind: string;
   content: string;
+  expectedContent: string | null;
   documentRevision: number | null;
   automatic: boolean;
 };
@@ -3797,6 +3891,7 @@ function saveFile(automatic = false): Promise<void> {
         : currentFileKind === "canvas"
           ? canvasContent
           : editor!.getDoc(),
+    expectedContent: savedContentByPath.get(currentPath) ?? null,
     documentRevision:
       currentFileKind === "markdown" ? editor!.getDocumentRevision() : null,
     automatic,
@@ -3809,9 +3904,9 @@ function saveFile(automatic = false): Promise<void> {
 }
 
 async function performSave(pending: PendingSave) {
-  const { path, kind, content, documentRevision, automatic } = pending;
+  const { path, kind, content, expectedContent, documentRevision, automatic } = pending;
   try {
-    await invoke("write_file", { path, content });
+    await invoke("write_file", { path, content, expectedContent });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     setTransientStatus(`Save failed: ${message}`, "#e07070");
@@ -3819,6 +3914,7 @@ async function performSave(pending: PendingSave) {
     if (!automatic) void uiAlert(`Save failed: ${message}`);
     return;
   }
+  savedContentByPath.set(path, content);
   const unchanged =
     currentPath === path &&
     currentFileKind === kind &&
@@ -4774,13 +4870,9 @@ async function exportCurrentPagePdf() {
 }
 
 function showCommandBar() {
-  const body = openFeaturePanel("Command bar");
-  const vault = document.getElementById("vault-label")?.textContent?.trim() || "vault";
-  renderCommandBar(body, commandCatalog(true), closeFeaturePanel, {
-    vault,
-    file: currentPath,
-    mode: currentFileKind === "markdown" ? viewMode : currentFileKind,
-  });
+  if (!$("feature-panel").classList.contains("hidden")) closeFeaturePanel();
+  closePreferences();
+  commandPrompt?.focus();
 }
 
 function openFindCommand() {
@@ -4802,6 +4894,12 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     { id: "file-search", title: "Search file names", keywords: "quick open", run: focusFileFilter },
     { id: "find", title: "Find in current note or board", keywords: "search current", run: openFindCommand },
     {
+      id: "extract-heading",
+      title: "Extract Heading",
+      keywords: "create note from header section heading split",
+      run: () => void extractHeadingAtCursor(),
+    },
+    {
       id: "refresh-pane",
       title: "Refresh current pane",
       keywords: "reload preview board f5 rescan",
@@ -4821,6 +4919,7 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     { id: "bookmarks", title: "Open bookmarks", run: showBookmarksPanel },
     { id: "git", title: "Open Git history", keywords: "versions source control", run: showGitPanel },
     { id: "templates", title: "Apply template", keywords: "templater automation", run: showTemplatePanel },
+    { id: "attendance", title: "Insert attendance list", keywords: "people company tag roster check-in", run: () => void showAttendancePanel() },
     { id: "today", title: "Open today's journal", keywords: "daily note", run: openToday },
     { id: "daily-calendar", title: "Daily notes calendar", keywords: "journal month", run: showDailyCalendar },
     { id: "ereyesterday", title: "Open ereyesterday", keywords: "vorgestern day before yesterday journal", run: () => void openAdjacentDaily(-2) },
@@ -4838,7 +4937,6 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
       localStorage.setItem(VIM_KEY, vimOn ? "1" : "0");
       ($("vim-toggle") as HTMLInputElement).checked = vimOn;
       editor?.setVim(vimOn);
-      updateVimPowerline();
     } },
     { id: "preferences", title: "Open preferences", keywords: "settings", run: togglePreferences },
     { id: "plugins", title: "Manage plugins", keywords: "extensions permissions install browse community", run: () => void showPluginManager() },
@@ -5076,6 +5174,49 @@ async function showTemplatePanel() {
   body.append(explanation, search, list);
   renderMatches();
   requestAnimationFrame(() => search.focus());
+}
+
+async function showAttendancePanel() {
+  if (!vaultOpen) {
+    void uiAlert("Open a vault first.");
+    return;
+  }
+  if (!currentPath || currentFileKind !== "markdown" || !editor) {
+    void uiAlert("Open a Markdown note before inserting an attendance list.");
+    return;
+  }
+  const targetPath = currentPath;
+  const targetSelection = editor.getSelectionRange();
+  let people: ReturnType<typeof collectPeople>;
+  try {
+    const rows = await invoke<PersonRow[]>("list_pages", { source: null });
+    people = collectPeople(rows);
+  } catch (error) {
+    void uiAlert(String(error));
+    return;
+  }
+  const body = openFeaturePanel("Insert attendance list");
+  if (!people.length) {
+    body.innerHTML = '<div class="feature-empty">No people notes found under /people in this vault.</div>';
+    return;
+  }
+  renderAttendancePanel(body, {
+    people,
+    onInsert: (text) => {
+      if (!text) return;
+      if (!editor || currentPath !== targetPath) {
+        void uiAlert("The active note changed while choosing the list.");
+        return;
+      }
+      editor.applyChanges(
+        [{ from: targetSelection.from, to: targetSelection.to, insert: text }],
+        targetSelection.from + text.length,
+      );
+      closeFeaturePanel();
+      const count = text.split("\n").filter((line) => line.includes("- [ ]")).length;
+      setTransientStatus(`Inserted ${count} person${count === 1 ? "" : "s"}`, "#5ecf9a");
+    },
+  });
 }
 
 async function renderTemplateForCurrent(source: string, targetPath: string, selection?: string) {

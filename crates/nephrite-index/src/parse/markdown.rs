@@ -79,8 +79,12 @@ pub struct TaskFact {
     pub start_date: Option<String>,
     pub done_date: Option<String>,
     pub created_date: Option<String>,
+    pub cancelled_date: Option<String>,
     pub priority: Option<String>,
     pub recurrence: Option<String>,
+    pub task_uid: Option<String>,
+    pub depends_on_json: Option<String>,
+    pub on_completion: Option<String>,
     pub tags_json: Option<String>,
 }
 
@@ -436,8 +440,21 @@ fn parse_task_line(
     let start_date = task_date(&text, "🛫");
     let done_date = task_date(&text, "✅");
     let created_date = task_date(&text, "➕");
+    let cancelled_date = task_date(&text, "❌");
     let priority = task_priority(&text);
     let recurrence = task_recurrence(&text);
+    let task_uid = task_token(&text, "🆔");
+    let depends_on = task_token(&text, "⛔")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let on_completion = task_token(&text, "🏁").map(|value| value.to_ascii_lowercase());
     Some(TaskFact {
         task_id: 0,
         status: status.into(),
@@ -454,8 +471,13 @@ fn parse_task_line(
         start_date,
         done_date,
         created_date,
+        cancelled_date,
         priority,
         recurrence,
+        task_uid,
+        depends_on_json: (!depends_on.is_empty())
+            .then(|| serde_json::to_string(&depends_on).unwrap_or_else(|_| "[]".into())),
+        on_completion,
         tags_json: (!tags.is_empty()).then(|| {
             format!(
                 "[{}]",
@@ -496,11 +518,27 @@ fn task_priority(text: &str) -> Option<String> {
 
 fn task_recurrence(text: &str) -> Option<String> {
     let rest = text.split_once("🔁")?.1.trim();
-    let end = ["📅", "⏳", "🛫", "✅", "➕", "🔺", "⏫", "🔼", "🔽", "⏬"]
-        .into_iter()
-        .filter_map(|marker| rest.find(marker))
-        .min()
-        .unwrap_or(rest.len());
+    let end = [
+        "📅", "⏳", "🛫", "✅", "➕", "❌", "🔺", "⏫", "🔼", "🔽", "⏬", "🆔", "⛔", "🏁",
+    ]
+    .into_iter()
+    .filter_map(|marker| rest.find(marker))
+    .min()
+    .unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn task_token(text: &str, marker: &str) -> Option<String> {
+    let rest = text.split_once(marker)?.1.trim_start();
+    let end = [
+        "📅", "⏳", "🛫", "✅", "➕", "❌", "🔁", "🔺", "⏫", "🔼", "🔽", "⏬", "🆔", "⛔", "🏁",
+    ]
+    .into_iter()
+    .filter(|candidate| *candidate != marker)
+    .filter_map(|candidate| rest.find(candidate))
+    .min()
+    .unwrap_or(rest.len());
     let value = rest[..end].trim();
     (!value.is_empty()).then(|| value.to_string())
 }
@@ -1202,6 +1240,21 @@ See ![[Other#Section]] and [[Note|alias]].
         assert_eq!(task.scheduled.as_deref(), Some("2026-08-10"));
         assert_eq!(task.due.as_deref(), Some("2026-08-12"));
         assert_eq!(task.tags_json.as_deref(), Some("[\"admin\"]"));
+    }
+
+    #[test]
+    fn extracts_tasks_dependencies_ids_cancellation_and_completion_policy() {
+        let facts = parse_markdown(
+            "- [-] Follow up ❌ 2026-08-19 🆔 follow-up ⛔ intro, profile 🏁 delete",
+        );
+        let task = &facts.tasks[0];
+        assert_eq!(task.cancelled_date.as_deref(), Some("2026-08-19"));
+        assert_eq!(task.task_uid.as_deref(), Some("follow-up"));
+        assert_eq!(
+            task.depends_on_json.as_deref(),
+            Some(r#"["intro","profile"]"#)
+        );
+        assert_eq!(task.on_completion.as_deref(), Some("delete"));
     }
 
     #[test]

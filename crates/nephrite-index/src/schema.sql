@@ -128,8 +128,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     start_date        TEXT,
     done_date         TEXT,
     created_date      TEXT,
+    cancelled_date    TEXT,
     priority          TEXT,
     recurrence        TEXT,
+    task_uid          TEXT,
+    depends_on_json   TEXT,
+    on_completion     TEXT,
     is_recurring      INTEGER NOT NULL DEFAULT 0,
     completed         INTEGER NOT NULL DEFAULT 0,
     list_indent       INTEGER NOT NULL DEFAULT 0,
@@ -313,8 +317,15 @@ SELECT
             'start', todo.start_date,
             'done', todo.done_date,
             'created', todo.created_date,
+            'cancelled', todo.cancelled_date,
             'priority', todo.priority,
             'recurrence', todo.recurrence,
+            'task_uid', todo.task_uid,
+            'depends_on', CASE
+                WHEN json_valid(todo.depends_on_json) THEN json(todo.depends_on_json)
+                ELSE json('[]')
+            END,
+            'on_completion', todo.on_completion,
             'tags', CASE
                 WHEN json_valid(todo.tags_json) THEN json(todo.tags_json)
                 ELSE json('[]')

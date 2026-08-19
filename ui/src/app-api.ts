@@ -19,6 +19,7 @@ export type AppPermission =
   | "editor.write"
   | "workspace.commands"
   | "workspace.views"
+  | "network.request"
   | "shell.execute";
 
 export type AppFile = {
@@ -50,6 +51,7 @@ export type AppHostServices = {
   registerCommand?: (id: string, title: string, keywords: string) => unknown;
   registerView?: (id: string, title: string) => unknown;
   executeShell?: (command: string, args: string[]) => unknown | Promise<unknown>;
+  requestUrl?: (request: unknown) => unknown | Promise<unknown>;
   pluginInfo?: (id?: string) => unknown;
   loadPluginData?: () => unknown;
   savePluginData?: (value: unknown) => unknown;
@@ -74,6 +76,7 @@ export const APP_METHOD_PERMISSIONS: Record<string, AppPermission> = {
   "workspace.executeCommand": "workspace.commands",
   "workspace.registerCommand": "workspace.commands",
   "workspace.registerView": "workspace.views",
+  "network.requestUrl": "network.request",
   "plugins.get": "vault.read",
   "plugins.getService": "vault.read",
   "plugins.loadData": "vault.read",
@@ -303,6 +306,7 @@ export class NephriteApp {
       case "workspace.executeCommand": return required(this.services.executeCommand, method)(String(args[0]));
       case "workspace.registerCommand": return required(this.services.registerCommand, method)(String(args[0]), String(args[1]), String(args[2] ?? ""));
       case "workspace.registerView": return required(this.services.registerView, method)(String(args[0]), String(args[1]));
+      case "network.requestUrl": return required(this.services.requestUrl, method)(args[0]);
       case "plugins.get":
       case "plugins.getService": return this.services.pluginInfo?.(args[0] == null ? undefined : String(args[0])) ?? null;
       case "plugins.loadData": return this.services.loadPluginData?.() ?? null;

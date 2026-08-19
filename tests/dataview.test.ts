@@ -4,12 +4,14 @@ import path from "node:path";
 import test from "node:test";
 import { JSDOM } from "jsdom";
 import {
+  bindDqlFieldIdentifiers,
   dqlContains,
   evaluateDql,
   filterPagesBySource,
   parseDql,
   runDqlBlock,
   runScriptBlock,
+  runTasksBlock,
   type DvPage,
   type EngineContext,
 } from "../ui/src/dv-engine";
@@ -78,6 +80,22 @@ function context(changes: unknown[] = []): EngineContext {
   };
 }
 
+test("Tasks fences filter sort group and preserve source-backed task controls", async () => {
+  const mount = document.createElement("div");
+  const taskPage = page("Projects/Launch.md", ["#project"]);
+  taskPage.file.tasks = [
+    { path: taskPage.path, task_id: 1, text: "Ship release", completed: false, due: "2026-08-20", priority: "high", tags: ["release"] },
+    { path: taskPage.path, task_id: 2, text: "Old work", completed: true, due: "2026-08-01", priority: "low", tags: [] },
+  ];
+  await runTasksBlock("not done\ntag includes #release\nsort by due\ngroup by file\nlimit to 5 tasks", mount, {
+    ...context(), loadPages: async () => [taskPage],
+  });
+  assert.match(mount.textContent ?? "", /Ship release/);
+  assert.doesNotMatch(mount.textContent ?? "", /Old work/);
+  const checkbox = mount.querySelector<HTMLInputElement>("input[data-task-id='1']");
+  assert.equal(checkbox?.dataset.taskPath, "Projects/Launch.md");
+});
+
 test("DQL parser preserves the complete ordered clause surface", () => {
   const query = parseDql(`TABLE WITHOUT ID company AS "Company"
 FROM "people" AND #recruiter
@@ -141,6 +159,47 @@ test("DQL functions cover collection, string, date, and duration operations", ()
   assert.equal(evaluateDql("sum(list(2, 3, 5))", brady, brady), 10);
   assert.equal(evaluateDql("date(interview).year", brady, brady), 2026);
   assert.equal(evaluateDql("dur(2 days).days", brady, brady), 2);
+});
+
+test("missing YAML fields are null, not a query error", () => {
+  const untitled = page("meetings/2026_08_01 Standup.md", []);
+  const molina = page("meetings/2026_08_10 Molina.md", [], { company: "Molina Healthcare" });
+  const infosys = page("meetings/2026_08_11 Infosys.md", [], { company: "Infosys" });
+  assert.equal(
+    bindDqlFieldIdentifiers('helpers.string(company)'),
+    'helpers.string(row["company"])',
+  );
+  assert.equal(evaluateDql("string(company)", untitled, untitled), "");
+  assert.equal(evaluateDql("string(phone)", untitled, untitled), "");
+  assert.equal(evaluateDql('contains(string(company), "Molina")', untitled, untitled), false);
+  assert.equal(evaluateDql('contains(string(company), "Molina")', molina, molina), true);
+  assert.equal(evaluateDql('icontains(company, "acme")', untitled, untitled), false);
+  assert.equal(evaluateDql('default(phone, "none")', untitled, untitled), "none");
+  assert.equal(evaluateDql("company.name", untitled, untitled), undefined);
+});
+
+test("LIST WHERE string(field) skips pages that lack the field", async () => {
+  const untitled = page("meetings/2026_08_01 Standup.md", []);
+  const molina = page("meetings/2026_08_10 Molina.md", [], { company: "Molina Healthcare" });
+  const infosys = page("meetings/2026_08_11 Infosys.md", [], { company: "Infosys" });
+  const stray = page("people/No Company.md", []);
+  const mount = document.createElement("div");
+  await runDqlBlock(
+    `LIST
+FROM "meetings"
+WHERE contains(string(company), "Molina") OR contains(string(company), "Infosys")
+SORT file.name DESC`,
+    mount,
+    {
+      ...context(),
+      loadPages: async () => [untitled, molina, infosys, stray, ...pages],
+    },
+  );
+  const text = mount.textContent ?? "";
+  assert.doesNotMatch(text, /error/i);
+  assert.match(text, /Infosys/);
+  assert.match(text, /Molina/);
+  assert.doesNotMatch(text, /Standup|No Company|Brady/);
 });
 
 test("inline date arithmetic with a page date field computes days", async () => {

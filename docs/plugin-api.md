@@ -17,13 +17,14 @@ require explicit permission approval.
 }
 ```
 
-Plugin JavaScript runs in a sandboxed iframe with no same-origin access, network
-access, filesystem access, or direct access to Nephrite's DOM. All host access
+Plugin JavaScript runs in a sandboxed iframe with no same-origin access,
+filesystem access, or direct access to Nephrite's DOM. All host access
 goes through the frozen `nephrite` object and is checked against the manifest.
-The v1 loader accepts one self-contained classic JavaScript file; module imports
-and package dependencies are not yet supported for native packages. Bundled
-Obsidian packages may use `require("obsidian")`; other external/Node modules are
-rejected by the compatibility loader.
+The v1 loader accepts the bundled `main.js` format used by Obsidian packages,
+including CommonJS and bundled ESM wrappers. `require("obsidian")` and ESM
+imports from `obsidian` are aliases over the host facade. Unbundled relative or
+external/Node modules are rejected. Package assets are exposed as capped data
+URLs and CSS `url(...)` references are resolved inside the sandbox.
 
 ```js
 nephrite.onLoad(async () => {
@@ -55,6 +56,7 @@ nephrite.onUnload(() => {
 | `editor.write` | `editor.replaceSelection(content)` |
 | `workspace.commands` | `workspace.registerCommand(...)` |
 | `workspace.views` | `workspace.registerView(...)` |
+| `network.request` | `network.requestUrl(...)`; HTTP(S), response-size and header checks apply |
 | `shell.execute` | `shell.execute(executable, args)` |
 
 The same host is also exposed through an Obsidian-shaped `app` facade. For

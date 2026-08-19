@@ -24,6 +24,7 @@ export type PluginDescriptor = {
   source: string;
   compatibility?: "nephrite" | "obsidian";
   style?: string | null;
+  assets?: Record<string, string>;
   enabled?: boolean;
 };
 
@@ -76,6 +77,13 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
   window.activeDocument = window.document;
   window.activeWindow = window;
   const pluginId = ${JSON.stringify(plugin.id)};
+  const pluginAssets = ${JSON.stringify(plugin.assets ?? {})};
+  const resourcePath = (path) => {
+    const normalized = String(path || "").replace(/\\\\/g, "/").replace(/^\.\//, "");
+    const prefixes = [".obsidian/plugins/" + pluginId + "/", pluginId + "/"];
+    const relative = prefixes.reduce((value, prefix) => value.startsWith(prefix) ? value.slice(prefix.length) : value, normalized);
+    return pluginAssets[relative] || pluginAssets[normalized] || "";
+  };
   const callbacks = new Map();
   const views = new Map();
   const loadHandlers = [];
@@ -154,6 +162,7 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
     commands: Object.freeze({ executeCommandById: (id) => send("workspace.executeCommand", [id]) }),
     events: Object.freeze({ on: eventApi.on, off: eventApi.offref, offref: eventApi.offref }),
     shell: Object.freeze({ execute: (command, args = []) => send("shell.execute", [command, args]) }),
+    network: Object.freeze({ requestUrl: (request) => send("network.requestUrl", [request]) }),
   });
   window.nephrite = nephrite;
   const pathOf = (file) => typeof file === "object" && file ? file.path : file;
@@ -182,6 +191,7 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
           files: fileSnapshot.filter((file) => file.path.startsWith(String(folder).replace(/\\/$/, "") + "/")).map((file) => file.path),
           folders: [],
         }),
+        getResourcePath: resourcePath,
       }),
     }),
     metadataCache: Object.freeze({
@@ -387,7 +397,12 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       };
       return registerCommand({ ...command, name: command.name || command.id, callback });
     }
-    registerView(type, creator) { return registerView({ id: type, name: type, onOpen: () => creator({ type, openFile: (file) => app.workspace.getLeaf().openFile(file) }) }); }
+    registerView(type, creator) { return registerView({ id: type, name: type, onOpen: async () => {
+      const view = creator({ type, openFile: (file) => app.workspace.getLeaf().openFile(file) });
+      await view?.onOpen?.();
+      const content = view?.contentEl?.innerHTML || view?.containerEl?.innerHTML || "";
+      return { type: "markdown", content };
+    } }); }
     addRibbonIcon(_icon, _title, callback) { const el = document.createElement("button"); el.addEventListener("click", callback); return el; }
     addStatusBarItem() { return document.createElement("span"); }
     addSettingTab(tab) {
@@ -423,8 +438,12 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
     normalizePath: (path) => String(path).replace(/\\\\/g, "/").replace(/^\\.\\//, ""),
     debounce: (callback, wait = 0) => { let timer; return (...args) => { clearTimeout(timer); timer = setTimeout(() => callback(...args), wait); }; },
     MarkdownRenderer: Object.freeze({ render: async (_app, markdown, element) => { element.textContent = String(markdown); } }),
-    requestUrl: async () => { throw new Error("Network access is not granted by the app host"); },
-    request: async () => { throw new Error("Network access is not granted by the app host"); },
+    requestUrl: (request) => nephrite.network.requestUrl(typeof request === "string" ? { url: request } : request).then((response) => {
+      const binary = atob(response.arrayBufferBase64 || "");
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      return Object.freeze({ ...response, arrayBuffer: bytes.buffer });
+    }),
+    request: (request) => nephrite.network.requestUrl(typeof request === "string" ? { url: request } : request).then((response) => response.text),
     createFragment: (callback) => {
       const fragment = document.createDocumentFragment();
       callback?.(fragment);
@@ -446,6 +465,7 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       name: plugin.name,
       version: plugin.version,
       minAppVersion: plugin.min_app_version,
+      dir: `.obsidian/plugins/${plugin.id}`,
     })});
     window.__obsidianPluginInstance = instance;
     if (typeof instance.onload === "function") loadHandlers.push(() => instance.onload());
@@ -531,12 +551,43 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
     }
   });
 })();`;
-  const source = plugin.source.replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
-  const style = (plugin.style ?? "").replace(/<\/style/gi, "<\\/style");
+  const source = preparePluginModuleSource(plugin.source).replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
+  const style = rewritePluginAssetUrls(plugin.style ?? "", plugin).replace(/<\/style/gi, "<\\/style");
   const startCompatibility = plugin.compatibility === "obsidian" ? "window.__startObsidianPlugin();" : "";
   const settingsCss = `html,body{height:100%;box-sizing:border-box}body.plugin-settings-host{margin:0;padding:18px 22px 28px;font:16px/1.5 system-ui,sans-serif;color:#e7eef7;background:#101820}body.plugin-settings-host p{color:#9aacbf;font-size:14px}.plugin-settings-error{color:#ff9c9c}.setting-item{display:flex;gap:16px;align-items:flex-start;justify-content:space-between;padding:12px 0;border-bottom:1px solid #243041}.setting-item-heading{display:block;border-bottom:1px solid #3a4d63;margin-top:12px;padding-top:4px}.setting-item-info{min-width:0;flex:1}.setting-item-name{font-size:16px;font-weight:650}.setting-item-description{color:#9aacbf;font-size:13px;margin-top:3px}.setting-item-control{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.setting-item-control input[type=text],.setting-item-control textarea,.setting-item-control select{background:#0b1119;color:#e7eef7;border:1px solid #53677e;border-radius:6px;padding:7px 10px;font-size:15px;min-width:18rem}.setting-item-control textarea{min-width:min(36rem,100%);min-height:5rem}.setting-item-control input[type=checkbox]{width:1.05rem;height:1.05rem}.setting-item-control button{background:#1e4b3b;color:#fff;border:0;border-radius:6px;padding:6px 12px;font-size:14px}.setting-item-control button.mod-cta{background:#2f7d5b}.kroki-header-row{display:grid;gap:6px;margin-top:8px;width:100%}.kroki-header-label{color:#9aacbf;font-size:13px}.kroki-header-textarea{width:100%;min-height:5rem;background:#0b1119;color:#e7eef7;border:1px solid #53677e;border-radius:6px;padding:8px 10px;font:14px ui-monospace,monospace}`;
-  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"><style>${settingsCss}${style}</style>
+  return `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:"><style>${settingsCss}${style}</style>
 <script>${bootstrap}\ntry {\n${source}\n${startCompatibility}\nparent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"ready"},"*");\n} catch(error) { parent.postMessage({nephritePlugin:true,pluginId:${JSON.stringify(plugin.id)},type:"error",message:String(error)},"*"); }<\/script>`;
+}
+
+/** Accept the ESM wrapper emitted by modern plugin builds while retaining the
+ * CommonJS contract used by the Obsidian community registry. Relative imports
+ * are expected to have been bundled into main.js, as they are for Obsidian. */
+export function preparePluginModuleSource(source: string): string {
+  let output = source
+    .replace(/\bimport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+["']obsidian["']\s*;?/g, "const $1 = require(\"obsidian\");")
+    .replace(/\bimport\s+\{([^}]+)\}\s+from\s+["']obsidian["']\s*;?/g, (_all, names: string) => {
+      const bindings = names.split(",").map((name) => name.trim().replace(/\s+as\s+/, ": ")).join(", ");
+      return `const { ${bindings} } = require("obsidian");`;
+    })
+    .replace(/\bimport\s+([A-Za-z_$][\w$]*)\s+from\s+["']obsidian["']\s*;?/g, "const $1 = require(\"obsidian\").default;")
+    .replace(/\bexport\s+default\s+/g, "module.exports.default = ");
+  if (/\b(?:import|export)\s/.test(output)) {
+    throw new Error("Plugin main.js contains unbundled ES module imports or exports");
+  }
+  return output;
+}
+
+export function rewritePluginAssetUrls(style: string, plugin: Pick<PluginDescriptor, "id" | "assets">): string {
+  const assets = plugin.assets ?? {};
+  return style.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (whole, _quote: string, raw: string) => {
+    const value = raw.trim();
+    if (/^(?:data:|blob:|https?:|#)/i.test(value)) return whole;
+    const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "");
+    const prefix = `.obsidian/plugins/${plugin.id}/`;
+    const relative = normalized.startsWith(prefix) ? normalized.slice(prefix.length) : normalized;
+    const url = assets[relative] ?? assets[normalized];
+    return url ? `url("${url}")` : whole;
+  });
 }
 
 export class IsolatedPlugin {

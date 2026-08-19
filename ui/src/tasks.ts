@@ -83,6 +83,14 @@ export function findTaskStatusEdit(
   return null;
 }
 
+export function findNextTaskStatusEdit(
+  markdown: string,
+  taskIndex: number,
+  current: string,
+): TaskCheckboxEdit | null {
+  return findTaskStatusEdit(markdown, taskIndex, nextTaskStatusChar(current));
+}
+
 /** Logseq-style Ctrl-Enter cycle on the current line. */
 export function cycleTaskLine(view: EditorView): boolean {
   const { state } = view;

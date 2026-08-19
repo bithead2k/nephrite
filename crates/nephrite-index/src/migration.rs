@@ -16,8 +16,10 @@ use crate::error::Result;
 use crate::{Version, PROJECT_VERSION};
 
 pub const DATAVIEW_INLINE_FIELDS_VERSION: &str = "1";
+pub const TASKS_EXTENDED_METADATA_VERSION: &str = "1";
 
 pub const MIGRATION_DATAVIEW_INLINE_FIELDS: &str = "dataview-inline-fields";
+pub const MIGRATION_TASKS_EXTENDED_METADATA: &str = "tasks-extended-metadata";
 pub const MIGRATION_LEGACY_02_CANVAS: &str = "legacy-02-canvas";
 
 pub struct Migration {
@@ -73,6 +75,28 @@ pub const MIGRATIONS: &[Migration] = &[
                 conn,
                 "dataview_inline_fields_version",
                 DATAVIEW_INLINE_FIELDS_VERSION,
+            )
+        },
+    },
+    Migration {
+        id: MIGRATION_TASKS_EXTENDED_METADATA,
+        action: "Backfilling Tasks metadata",
+        unit: "note",
+        units: "notes",
+        targets: |path| extension_is(path, "md"),
+        completion_key: "tasks_extended_metadata_version",
+        pending: |conn| {
+            meta_missing(
+                conn,
+                "tasks_extended_metadata_version",
+                TASKS_EXTENDED_METADATA_VERSION,
+            )
+        },
+        complete: |conn| {
+            set_meta(
+                conn,
+                "tasks_extended_metadata_version",
+                TASKS_EXTENDED_METADATA_VERSION,
             )
         },
     },
@@ -302,8 +326,10 @@ mod tests {
         assert!((MIGRATIONS[0].targets)(Path::new("Note.md")));
         assert!((MIGRATIONS[0].targets)(Path::new("sub/Note.MD")));
         assert!(!(MIGRATIONS[0].targets)(Path::new("Plan.canvas")));
-        assert!((MIGRATIONS[1].targets)(Path::new("Plan.canvas")));
-        assert!(!(MIGRATIONS[1].targets)(Path::new("Note.md")));
+        assert!((MIGRATIONS[1].targets)(Path::new("Note.md")));
+        assert!(!(MIGRATIONS[1].targets)(Path::new("Plan.canvas")));
+        assert!((MIGRATIONS[2].targets)(Path::new("Plan.canvas")));
+        assert!(!(MIGRATIONS[2].targets)(Path::new("Note.md")));
     }
 
     #[test]
@@ -337,7 +363,10 @@ mod tests {
         assert!(!plan.rebuild);
         assert_eq!(plan.migrations[0].id, MIGRATION_DATAVIEW_INLINE_FIELDS);
         assert_eq!(plan.migrations[0].remaining, 2);
-        assert_eq!(plan.action, "Backfilling Dataview fields across 2 notes…");
+        assert_eq!(
+            plan.action,
+            "Backfilling Dataview fields across 2 notes and 1 other step…"
+        );
     }
 
     #[test]

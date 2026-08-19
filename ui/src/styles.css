@@ -2522,6 +2522,37 @@ body.resizing-panes .cm-editor {
   margin-bottom: 0.55rem;
 }
 
+.attendance-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.55rem;
+  margin: 0.6rem 0;
+}
+.attendance-preview {
+  max-height: min(22rem, 46vh);
+  overflow: auto;
+  border: 1px solid #34465a;
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  background: #0b1119;
+  color: var(--text);
+  font: 0.82rem var(--mono);
+  white-space: pre-wrap;
+  margin: 0 0 0.55rem;
+}
+.attendance-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.attendance-count {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.attendance-footer button {
+  margin-left: auto;
+}
+
 .template-list {
   display: grid;
   max-height: min(28rem, 58vh);
@@ -3154,16 +3185,19 @@ body.resizing-panes .cm-editor {
   margin: 1.35em 0;
 }
 
-.statusbar {
+.command-footer {
   display: flex;
-  gap: 0.85rem;
+  gap: 0.65rem;
   align-items: center;
-  padding: 0.22rem 0.7rem;
+  position: relative;
+  z-index: 30;
+  overflow: visible;
+  padding: 0;
   border-top: 1px solid var(--border);
   background: var(--bg-elev);
   font-size: 0.7rem;
   font-family: var(--mono);
-  min-height: 26px;
+  min-height: 32px;
   flex-shrink: 0;
 }
 
@@ -3171,37 +3205,10 @@ body.resizing-panes .cm-editor {
   color: var(--muted);
 }
 
-#status-powerline {
-  display: inline-flex;
-  align-items: stretch;
+#status-hint {
   flex: 0 1 auto;
-  max-width: 68%;
-  overflow: hidden;
-  white-space: pre;
-  line-height: 20px;
-  border-radius: 2px;
-  cursor: default;
-  font-family: var(--powerline-font);
-  font-variant-ligatures: none;
-}
-
-#status-powerline[hidden] {
-  display: none;
-}
-
-#status-powerline.vim-dirty::after {
-  content: " + MODIFIED ";
-  display: inline-block;
-  flex: 0 0 auto;
-  padding: 0 0.45rem;
-  background: #e5c07b;
-  color: #101419;
-  font-weight: 800;
-  letter-spacing: 0.03em;
-}
-
-#status-path {
-  flex: 1;
+  max-width: 42%;
+  padding-right: 0.7rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3453,6 +3460,84 @@ body.resizing-panes .cm-editor {
 .command-bar-segment-0 { background: #5ecf9a; }
 .command-bar-segment-1 { background: #6aa6e8; }
 .command-bar-segment-2 { background: #e5c07b; }
+
+#persistent-command-bar {
+  flex: 1 1 auto;
+  min-width: 12rem;
+}
+.persistent-command-bar {
+  position: relative;
+  min-width: 0;
+}
+.persistent-command-row {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+}
+.persistent-command-prompt {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  cursor: text;
+  font-variant-ligatures: none;
+}
+.persistent-command-prompt .command-bar-segment {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.3rem 0.6rem 0.3rem 0.7rem;
+  line-height: 1.55;
+}
+.persistent-command-prompt .command-bar-segment {
+  padding-right: 0.9rem;
+}
+.persistent-command-prompt .command-bar-segment::after {
+  content: "\e0b0";
+  position: absolute;
+  z-index: 1;
+  right: -0.72em;
+  font-size: 1.55em;
+  line-height: 1;
+}
+.persistent-command-prompt .command-bar-segment-0::after { color: #5ecf9a; }
+.persistent-command-prompt .command-bar-segment-1::after { color: #6aa6e8; }
+.persistent-command-input {
+  min-width: 0;
+  flex: 1 1 auto;
+  width: auto;
+  border: 0;
+  padding: 0.35rem 0.75rem 0.35rem 1rem;
+  background: #090f16;
+  line-height: 1.4;
+}
+.persistent-command-input:focus {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+.persistent-command-results {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 1px);
+  left: 0;
+  z-index: 100;
+  max-height: min(32rem, 62vh);
+  border: 1px solid var(--border);
+  background: #0b1119;
+  box-shadow: 0 -10px 28px #0009;
+}
+.persistent-command-results[hidden] { display: none; }
+.command-bar-shell-output {
+  margin: 0;
+  padding: 0.65rem 0.8rem;
+  overflow: auto;
+  color: var(--text);
+  font: 0.82rem/1.45 var(--mono);
+  white-space: pre-wrap;
+}
+.command-bar-shell-output.error { color: #ff9c9c; }
 
 .attachment-panel,
 .sql-console,

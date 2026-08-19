@@ -657,29 +657,26 @@ The long-term objective is not merely to create another Markdown editor.
 
 It is to create the open-source implementation of the mature local-first knowledge system that the Obsidian ecosystem has already demonstrated users want.
 
-## Implementation Status (2026-08-15)
+## Implementation Status (2026-08-19)
 
-AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.6` (0.6.0): minor upgrade from 0.5, not a full rebuild.
+AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.8` (0.8.0): minor upgrade from 0.6, not a full rebuild.
 
-Implemented and verified (behavior details live in `docs/`): vault reader + metadata index + search + editor/viewer + watcher; native PostgreSQL SQL (`libpg_query` + `page` lowering, read-only); Dataview DQL/DataviewJS; Vim, Markdown/Obsidian rendering, Excalidraw, tasks dashboard, Git, declarative automation + Templater subset; plugin permission host.
+Implemented and verified (behavior details live in `docs/`): vault reader + metadata index + search + editor/viewer + watcher; native PostgreSQL SQL (`libpg_query` + `page` lowering, read-only); Dataview DQL/DataviewJS; Vim, Markdown/Obsidian rendering, Excalidraw, Tasks metadata/recurrence/query blocks/dashboard, Git, declarative automation + Templater subset; permissioned plugin host with Obsidian facades, settings/views/processors, packaged assets, bundled ESM/CJS entrypoints, and network requests.
 
 Remaining gaps:
 
-* Tasks (Phase 5): full Obsidian Tasks syntax parity, recurrence-series project views, tighter source navigation.
 * Automation (Phase 6): sandboxed JS runtime + richer declarative actions (`<%* %>` preserved with warning).
-* Plugin API (Phase 8): view/settings adapters; ES module/package support; packaged assets; stability contract.
-* Vault compat: block-reference/edge-case link + hierarchical YAML write discipline; reconcile robustness under concurrent external changes.
 * Preview/query/kanban hardening ongoing.
-* Out of scope: mobile, full Obsidian plugin API, Sync, proprietary formats, unrestricted Node/Electron, undocumented internals.
+* Out of scope: mobile, Obsidian Sync, proprietary formats, unrestricted Node/Electron, CodeMirror 5 internals, and undocumented Obsidian internals.
 
 Verify:
 
 ```sh
 cargo fmt --check
-cargo clippy --workspace --all-targets   # warnings denied
-cargo test --workspace                   # 64 app + 17 index
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                   # 73 app + 44 index
 npm run build
-npm run test                             # 53 perf + 6 ui + 10 dataview
+npm run test                             # 75 perf + 29 ui + 21 dataview + 11 bases + 10 people
 ```
 
 Expected Vite warnings about third-party `"use client"` directives and large chunks are non-fatal. The supported SQL surface is audited against the local PostgreSQL 18.4 catalog at port 5438.

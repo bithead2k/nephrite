@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "nephrite"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "nephrite-index"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "hex",
  "rusqlite",
@@ -2301,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "nephrite-index-cli"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "nephrite-index",
 ]

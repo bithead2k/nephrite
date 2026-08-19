@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use state::{AppState, VisiblePages};
 use std::collections::{HashMap, HashSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -113,10 +114,116 @@ pub struct PluginDescriptor {
     pub source: String,
     pub compatibility: String,
     pub style: Option<String>,
+    pub assets: HashMap<String, String>,
     pub enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginHttpRequest {
+    pub url: String,
+    pub method: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub content_type: Option<String>,
+    pub body: Option<serde_json::Value>,
+    #[serde(rename = "throw")]
+    pub throw_on_error: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginHttpResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub text: String,
+    pub json: Option<serde_json::Value>,
+    pub array_buffer_base64: String,
+}
+
+#[tauri::command]
+fn plugin_http_request(request: PluginHttpRequest) -> Result<PluginHttpResponse, String> {
+    const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+    let url = request.url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['\r', '\n']) {
+        return Err("Plugin network requests require an HTTP(S) URL".into());
+    }
+    let authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err("Plugin network URLs cannot contain credentials".into());
+    }
+    let method = request
+        .method
+        .unwrap_or_else(|| {
+            if request.body.is_some() {
+                "POST".into()
+            } else {
+                "GET".into()
+            }
+        })
+        .to_ascii_uppercase();
+    if !matches!(
+        method.as_str(),
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+    ) {
+        return Err(format!("Unsupported plugin HTTP method: {method}"));
+    }
+    let mut outgoing = ureq::request(&method, url).set("User-Agent", "Nephrite/0.8 (plugin host)");
+    if let Some(content_type) = request.content_type.as_deref() {
+        outgoing = outgoing.set("Content-Type", content_type);
+    }
+    for (name, value) in request.headers.unwrap_or_default() {
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err("Invalid plugin HTTP header".into());
+        }
+        outgoing = outgoing.set(&name, &value);
+    }
+    let response_result = match request.body {
+        Some(serde_json::Value::String(body)) => outgoing.send_string(&body),
+        Some(body) => outgoing.send_string(&body.to_string()),
+        None => outgoing.call(),
+    };
+    let response = match response_result {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) if request.throw_on_error == Some(false) => response,
+        Err(error) => return Err(format!("Plugin request failed: {error}")),
+    };
+    let status = response.status();
+    let headers = response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .map(|value| (name, value.to_string()))
+        })
+        .collect();
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_RESPONSE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_RESPONSE {
+        return Err("Plugin response exceeded 16 MiB".into());
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let json = serde_json::from_str(&text).ok();
+    let array_buffer_base64 = BASE64.encode(&bytes);
+    Ok(PluginHttpResponse {
+        status,
+        headers,
+        text,
+        json,
+        array_buffer_base64,
+    })
+}
+
 const MAX_PLUGIN_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PLUGIN_ASSET_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PLUGIN_ASSETS_TOTAL: u64 = 16 * 1024 * 1024;
 const PLUGIN_PERMISSIONS: &[&str] = &[
     "vault.read",
     "vault.write",
@@ -125,6 +232,7 @@ const PLUGIN_PERMISSIONS: &[&str] = &[
     "editor.write",
     "workspace.commands",
     "workspace.views",
+    "network.request",
     "shell.execute",
 ];
 
@@ -334,6 +442,7 @@ fn discover_plugins(
                     "editor.write".into(),
                     "workspace.commands".into(),
                     "workspace.views".into(),
+                    "network.request".into(),
                 ]
             } else {
                 Vec::new()
@@ -374,9 +483,87 @@ fn discover_plugins(
                     .filter(|metadata| metadata.len() <= 2 * 1024 * 1024)
                     .and_then(|_| std::fs::read_to_string(style_path).ok())
             },
+            assets: read_plugin_assets(&canonical_entry, &canonical_main)?,
         });
     }
     Ok(plugins)
+}
+
+fn read_plugin_assets(root: &Path, main: &Path) -> Result<HashMap<String, String>, String> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        main: &Path,
+        total: &mut u64,
+        output: &mut HashMap<String, String>,
+    ) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| error.to_string())?;
+            if file_type.is_dir() {
+                visit(root, &path, main, total, output)?;
+                continue;
+            }
+            if !file_type.is_file() || path == main {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if matches!(relative.as_str(), "manifest.json" | "styles.css") {
+                continue;
+            }
+            let size = entry.metadata().map_err(|error| error.to_string())?.len();
+            if size > MAX_PLUGIN_ASSET_BYTES || *total + size > MAX_PLUGIN_ASSETS_TOTAL {
+                continue;
+            }
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            *total += size;
+            output.insert(
+                relative.clone(),
+                format!(
+                    "data:{};base64,{}",
+                    plugin_asset_mime(&relative),
+                    BASE64.encode(bytes)
+                ),
+            );
+        }
+        Ok(())
+    }
+    let mut output = HashMap::new();
+    let mut total = 0;
+    visit(root, root, main, &mut total, &mut output)?;
+    Ok(output)
+}
+
+fn plugin_asset_mime(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "css" => "text/css",
+        "json" => "application/json",
+        "wasm" => "application/wasm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1714,7 +1901,12 @@ fn read_media_file(path: String, state: State<'_, AppState>) -> Result<MediaFile
 }
 
 #[tauri::command]
-fn write_file(path: String, content: String, state: State<'_, AppState>) -> Result<(), String> {
+fn write_file(
+    path: String,
+    content: String,
+    expected_content: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     // Resolve the target while the current vault identity is stable, but do
     // not hold the database mutex across filesystem I/O.
     let (root, abs) = {
@@ -1739,8 +1931,19 @@ fn write_file(path: String, content: String, state: State<'_, AppState>) -> Resu
         if !canonical_target.starts_with(&root) {
             return Err("Path escapes vault through a symbolic link".into());
         }
+        if let Some(expected) = expected_content.as_deref() {
+            let current = std::fs::read_to_string(&abs).map_err(|e| e.to_string())?;
+            if current != expected {
+                return Err(
+                    "File changed on disk since it was opened; reload or merge before saving"
+                        .into(),
+                );
+            }
+        }
+    } else if expected_content.is_some() {
+        return Err("File was removed on disk since it was opened; reload before saving".into());
     }
-    std::fs::write(&abs, content.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write_file(&abs, content.as_bytes())?;
     let abs_c = abs.canonicalize().map_err(|e| e.to_string())?;
     if !abs_c.starts_with(&root) {
         return Err("Path escapes vault".into());
@@ -1759,6 +1962,38 @@ fn write_file(path: String, content: String, state: State<'_, AppState>) -> Resu
     index
         .index_path_with_content(&path, Some(&content))
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Replace a vault file from a same-directory temporary file. This prevents a
+/// crash or interrupted write from leaving half a Markdown document behind.
+fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("File has no parent directory: {}", path.display()))?;
+    let permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    temporary.write_all(bytes).map_err(|e| e.to_string())?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|e| e.to_string())?;
+    if let Some(permissions) = permissions {
+        temporary
+            .as_file_mut()
+            .set_permissions(permissions)
+            .map_err(|e| e.to_string())?;
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| error.error.to_string())?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
     Ok(())
 }
 
@@ -1794,7 +2029,7 @@ fn write_media_file(path: String, data: String, state: State<'_, AppState>) -> R
             return Err("Path escapes vault through a symbolic link".into());
         }
     }
-    std::fs::write(&abs, &bytes).map_err(|e| e.to_string())?;
+    atomic_write_file(&abs, &bytes)?;
     let abs_c = abs.canonicalize().map_err(|e| e.to_string())?;
     if !abs_c.starts_with(&root) {
         return Err("Path escapes vault".into());
@@ -1845,6 +2080,13 @@ pub struct TaskRow {
     pub scheduled: Option<String>,
     pub priority: Option<String>,
     pub recurrence: Option<String>,
+    pub start_date: Option<String>,
+    pub done_date: Option<String>,
+    pub created_date: Option<String>,
+    pub cancelled_date: Option<String>,
+    pub task_uid: Option<String>,
+    pub depends_on: Vec<String>,
+    pub on_completion: Option<String>,
     pub tags: Vec<String>,
 }
 
@@ -1857,7 +2099,9 @@ fn list_tasks(
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
     let sql = "SELECT t.path, t.task_id, t.status, t.status_char, t.text, t.raw_line, t.line, t.completed,
-                      t.due, t.scheduled, t.priority, t.recurrence, COALESCE(t.tags_json, '[]')
+                      t.due, t.scheduled, t.priority, t.recurrence, COALESCE(t.tags_json, '[]'),
+                      t.start_date, t.done_date, t.created_date, t.cancelled_date, t.task_uid,
+                      COALESCE(t.depends_on_json, '[]'), t.on_completion
                FROM tasks t
                LEFT JOIN file_frontmatter fm ON fm.path = t.path
                WHERE (?1 IS NULL OR t.completed = ?1)
@@ -1910,6 +2154,14 @@ fn list_tasks(
                     priority: row.get(10)?,
                     recurrence: row.get(11)?,
                     tags: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+                    start_date: row.get(13)?,
+                    done_date: row.get(14)?,
+                    created_date: row.get(15)?,
+                    cancelled_date: row.get(16)?,
+                    task_uid: row.get(17)?,
+                    depends_on: serde_json::from_str(&row.get::<_, String>(18)?)
+                        .unwrap_or_default(),
+                    on_completion: row.get(19)?,
                 })
             },
         )
@@ -1928,12 +2180,12 @@ fn set_task_completed(
 ) -> Result<(), String> {
     let mut guard = state.index.lock();
     let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
-    let (start, end, recurrence): (i64, i64, Option<String>) = index
+    let (start, end, recurrence, on_completion, indexed_line): (i64, i64, Option<String>, Option<String>, String) = index
         .connection()
         .query_row(
-            "SELECT start_offset, end_offset, recurrence FROM tasks WHERE path = ?1 AND task_id = ?2",
+            "SELECT start_offset, end_offset, recurrence, on_completion, raw_line FROM tasks WHERE path = ?1 AND task_id = ?2",
             rusqlite::params![path, task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(|e| format!("Task is stale or missing: {e}"))?;
     let absolute = vault_abs(index, &path)?;
@@ -1943,6 +2195,16 @@ fn set_task_completed(
     let line = content
         .get(from..to)
         .ok_or_else(|| "Task offsets are stale".to_string())?;
+    let eol = if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    if line.trim_end_matches(['\r', '\n']) != indexed_line {
+        return Err("Task changed on disk; refresh before editing its status".into());
+    }
     let marker = line
         .find('[')
         .and_then(|open| line[open + 1..].find(']').map(|close| open + 1 + close))
@@ -1955,17 +2217,38 @@ fn set_task_completed(
     if completed {
         if let Some(recurrence) = recurrence.as_deref() {
             let source = line.trim_end_matches(['\r', '\n']);
-            let eol = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
             let today = Local::now().date_naive();
             let (completed_line, next_line) = recurring_task_lines(source, recurrence, today)?;
-            content.replace_range(from..to, &format!("{completed_line}{eol}{next_line}{eol}"));
+            let replacement = if on_completion.as_deref() == Some("delete") {
+                format!("{next_line}{eol}")
+            } else {
+                format!("{completed_line}{eol}{next_line}{eol}")
+            };
+            content.replace_range(from..to, &replacement);
+        } else if on_completion.as_deref() == Some("delete") {
+            content.replace_range(from..to, "");
         } else {
             content.replace_range(marker_from..marker_to, "x");
+            let updated_to = to;
+            let current = content.get(from..updated_to).unwrap_or_default();
+            if !current.contains('✅') {
+                let dated = insert_task_metadata(
+                    current.trim_end_matches(['\r', '\n']),
+                    &format!("✅ {}", Local::now().date_naive().format("%Y-%m-%d")),
+                )?;
+                content.replace_range(from..updated_to, &format!("{dated}{eol}"));
+            }
         }
     } else {
         content.replace_range(marker_from..marker_to, " ");
+        let current = content.get(from..to).unwrap_or_default();
+        let cleaned = regex::Regex::new(r"\s*✅\s*\d{4}-\d{2}-\d{2}")
+            .map_err(|error| error.to_string())?
+            .replace_all(current.trim_end_matches(['\r', '\n']), "")
+            .into_owned();
+        content.replace_range(from..to, &format!("{}{eol}", cleaned.trim_end()));
     }
-    std::fs::write(&absolute, content.as_bytes()).map_err(|e| e.to_string())?;
+    atomic_write_file(&absolute, content.as_bytes())?;
     index.index_path(&path).map_err(|e| e.to_string())
 }
 
@@ -1979,6 +2262,18 @@ fn task_line_with_status(line: &str, status: char) -> Result<String, String> {
         .ok_or_else(|| "Task checkbox is no longer present".to_string())?;
     let mut output = line.to_string();
     output.replace_range(open + 1..close, &status.to_string());
+    Ok(output)
+}
+
+fn insert_task_metadata(line: &str, metadata: &str) -> Result<String, String> {
+    let block =
+        regex::Regex::new(r"(\s+\^[A-Za-z0-9-]+\s*)$").map_err(|error| error.to_string())?;
+    let mut output = line.trim_end().to_string();
+    if let Some(found) = block.find(&output) {
+        output.insert_str(found.start(), &format!(" {metadata}"));
+    } else {
+        output.push_str(&format!(" {metadata}"));
+    }
     Ok(output)
 }
 
@@ -2057,6 +2352,12 @@ fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, 
         ("saturday", Weekday::Sat),
         ("sunday", Weekday::Sun),
     ];
+    let weekday_named = |name: &str| {
+        weekdays
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .map(|(_, day)| *day)
+    };
     if let Some((_, weekday)) = weekdays.iter().find(|(name, _)| value == *name) {
         let mut next = date + ChronoDuration::days(1);
         while next.weekday() != *weekday {
@@ -2065,6 +2366,64 @@ fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, 
         return Ok(next);
     }
     let words = value.split_whitespace().collect::<Vec<_>>();
+    if let Some(on) = words.iter().position(|word| *word == "on") {
+        let prefix = &words[..on];
+        let suffix = &words[on + 1..];
+        let count = prefix
+            .first()
+            .and_then(|word| word.parse::<i64>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let unit = prefix.last().copied().unwrap_or("").trim_end_matches('s');
+        if unit == "week" {
+            if let Some(target) = suffix.first().and_then(|word| weekday_named(word)) {
+                let mut next = date + ChronoDuration::days(1);
+                while next.weekday() != target {
+                    next += ChronoDuration::days(1);
+                }
+                return Ok(next + ChronoDuration::weeks(count - 1));
+            }
+        }
+        if unit == "month" {
+            let spec = suffix.strip_prefix(&["the"]).unwrap_or(suffix);
+            let next_month =
+                add_calendar_months(date.with_day(1).ok_or("Invalid recurrence date")?, count)?;
+            if spec.first() == Some(&"last") && spec.len() == 1 {
+                return last_day_of_month(next_month.year(), next_month.month());
+            }
+            if let Some(day) = spec.first().and_then(|word| parse_ordinal_number(word)) {
+                if spec.len() == 1 {
+                    return day_of_month_clamped(next_month.year(), next_month.month(), day);
+                }
+                if let Some(weekday) = spec.get(1).and_then(|word| weekday_named(word)) {
+                    return ordinal_weekday_of_month(
+                        next_month.year(),
+                        next_month.month(),
+                        day,
+                        weekday,
+                    );
+                }
+            }
+            if spec.first() == Some(&"last") {
+                if let Some(weekday) = spec.get(1).and_then(|word| weekday_named(word)) {
+                    return last_weekday_of_month(next_month.year(), next_month.month(), weekday);
+                }
+            }
+        }
+        if unit == "year" && suffix.len() >= 2 {
+            if let Some(month) = parse_month(suffix[0]) {
+                if let Some(day) = parse_ordinal_number(suffix[1]) {
+                    return day_of_month_clamped(
+                        date.year()
+                            + i32::try_from(count)
+                                .map_err(|_| "Recurrence year is out of range")?,
+                        month,
+                        day,
+                    );
+                }
+            }
+        }
+    }
     let (count, unit) = if words.len() >= 2 {
         (words[0].parse::<i64>().unwrap_or(1).max(1), words[1])
     } else {
@@ -2077,6 +2436,84 @@ fn next_recurrence_date(date: NaiveDate, recurrence: &str) -> Result<NaiveDate, 
         "year" | "yearly" | "annually" => add_calendar_months(date, count * 12),
         _ => Err(format!("Unsupported recurrence: {recurrence}")),
     }
+}
+
+fn parse_ordinal_number(value: &str) -> Option<u32> {
+    match value {
+        "first" => Some(1),
+        "second" => Some(2),
+        "third" => Some(3),
+        "fourth" => Some(4),
+        "fifth" => Some(5),
+        _ => value
+            .trim_end_matches(|ch: char| ch.is_ascii_alphabetic())
+            .parse::<u32>()
+            .ok()
+            .filter(|day| *day > 0),
+    }
+}
+
+fn parse_month(value: &str) -> Option<u32> {
+    [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ]
+    .iter()
+    .position(|month| *month == value)
+    .map(|index| index as u32 + 1)
+}
+
+fn last_day_of_month(year: i32, month: u32) -> Result<NaiveDate, String> {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .map(|date| date - ChronoDuration::days(1))
+        .ok_or_else(|| "Invalid recurrence month".into())
+}
+
+fn day_of_month_clamped(year: i32, month: u32, day: u32) -> Result<NaiveDate, String> {
+    let last = last_day_of_month(year, month)?;
+    NaiveDate::from_ymd_opt(year, month, day.min(last.day()))
+        .ok_or_else(|| "Invalid recurrence date".into())
+}
+
+fn ordinal_weekday_of_month(
+    year: i32,
+    month: u32,
+    ordinal: u32,
+    weekday: Weekday,
+) -> Result<NaiveDate, String> {
+    let mut date = NaiveDate::from_ymd_opt(year, month, 1).ok_or("Invalid recurrence month")?;
+    while date.weekday() != weekday {
+        date += ChronoDuration::days(1);
+    }
+    let candidate = date + ChronoDuration::weeks(i64::from(ordinal.saturating_sub(1)));
+    if candidate.month() == month {
+        Ok(candidate)
+    } else {
+        last_weekday_of_month(year, month, weekday)
+    }
+}
+
+fn last_weekday_of_month(year: i32, month: u32, weekday: Weekday) -> Result<NaiveDate, String> {
+    let mut date = last_day_of_month(year, month)?;
+    while date.weekday() != weekday {
+        date -= ChronoDuration::days(1);
+    }
+    Ok(date)
 }
 
 fn add_calendar_months(date: NaiveDate, months: i64) -> Result<NaiveDate, String> {
@@ -2136,9 +2573,18 @@ fn set_task_status(
     if current.trim_end_matches(['\r', '\n']) != indexed_line {
         return Err("Task changed on disk; refresh before editing its status".into());
     }
-    let replacement = task_line_with_status(&indexed_line, status)?;
+    let mut replacement = task_line_with_status(&indexed_line, status)?;
+    let cancelled =
+        regex::Regex::new(r"\s*❌\s*\d{4}-\d{2}-\d{2}").map_err(|error| error.to_string())?;
+    replacement = cancelled.replace_all(&replacement, "").into_owned();
+    if status == '-' {
+        replacement = insert_task_metadata(
+            &replacement,
+            &format!("❌ {}", Local::now().date_naive().format("%Y-%m-%d")),
+        )?;
+    }
     content.replace_range(from..to, &format!("{replacement}{eol}"));
-    std::fs::write(&absolute, content.as_bytes()).map_err(|error| error.to_string())?;
+    atomic_write_file(&absolute, content.as_bytes())?;
     index.index_path(&path).map_err(|error| error.to_string())
 }
 
@@ -2186,7 +2632,7 @@ fn replace_task_line(
         return Err("Task changed on disk; refresh before editing its metadata".into());
     }
     content.replace_range(from..to, &format!("{replacement}{eol}"));
-    std::fs::write(&absolute, content.as_bytes()).map_err(|error| error.to_string())?;
+    atomic_write_file(&absolute, content.as_bytes())?;
     index.index_path(&path).map_err(|error| error.to_string())
 }
 
@@ -3872,6 +4318,14 @@ fn base_target_unique(index: &VaultIndex, base: &str) -> Result<bool, String> {
 
 /// Compute the replacement text for one indexed wikilink/embed after a rename.
 /// Returns `None` when the link should be left untouched.
+struct WikilinkRewriteContext<'a> {
+    from: &'a str,
+    to: &'a str,
+    from_key: &'a str,
+    to_key: &'a str,
+    to_base_unique: bool,
+}
+
 fn compute_wikilink_rewrite(
     target_raw: &str,
     target_heading: &Option<String>,
@@ -3879,24 +4333,20 @@ fn compute_wikilink_rewrite(
     display_text: &Option<String>,
     is_embed: bool,
     resolved_target_path: Option<&str>,
-    from: &str,
-    to: &str,
-    from_key: &str,
-    to_key: &str,
-    to_base_unique: bool,
+    context: &WikilinkRewriteContext<'_>,
 ) -> Option<String> {
     let new_raw: String = if let Some(rtp) = resolved_target_path {
         // Resolved link: rewrite the resolved path, preserving link "shape".
-        let suffix = rtp.strip_prefix(from)?;
+        let suffix = rtp.strip_prefix(context.from)?;
         let new_full = if suffix.is_empty() {
-            to.to_string()
+            context.to.to_string()
         } else {
-            format!("{to}{suffix}")
+            format!("{}{suffix}", context.to)
         };
         let new_full_key = wikilink_key(&new_full);
         if target_raw.contains('/') {
             new_full_key
-        } else if to_base_unique {
+        } else if context.to_base_unique {
             base_segment(&new_full_key)
         } else {
             new_full_key
@@ -3905,16 +4355,16 @@ fn compute_wikilink_rewrite(
         // Unresolved wikilink: match by raw identity against the old file.
         let raw_key = wikilink_key(target_raw.trim());
         let raw_base = base_segment(&raw_key);
-        let from_base = base_segment(from_key);
-        let to_base = base_segment(to_key);
-        if raw_key == from_key || raw_key == wikilink_key(from) {
-            to_key.to_string()
+        let from_base = base_segment(context.from_key);
+        let to_base = base_segment(context.to_key);
+        if raw_key == context.from_key || raw_key == wikilink_key(context.from) {
+            context.to_key.to_string()
         } else if raw_base == from_base {
             if raw_key.contains('/') {
-                if let Some(rest) = raw_key.strip_prefix(from_key) {
-                    format!("{to_key}{rest}")
+                if let Some(rest) = raw_key.strip_prefix(context.from_key) {
+                    format!("{}{rest}", context.to_key)
                 } else {
-                    to_key.to_string()
+                    context.to_key.to_string()
                 }
             } else {
                 to_base
@@ -3966,6 +4416,13 @@ fn collect_link_rewrites(
     let to_key = wikilink_key(to);
     let from_base = base_segment(&from_key);
     let to_base_unique = base_target_unique(index, &base_segment(&to_key))?;
+    let context = WikilinkRewriteContext {
+        from,
+        to,
+        from_key: &from_key,
+        to_key: &to_key,
+        to_base_unique,
+    };
     let mut rewrites: Vec<LinkRewrite> = Vec::new();
 
     // Resolved links (target_path == from, or a child of `from` for dir moves).
@@ -4003,11 +4460,7 @@ fn collect_link_rewrites(
                 &display,
                 is_embed != 0,
                 target_path.as_deref(),
-                from,
-                to,
-                &from_key,
-                &to_key,
-                to_base_unique,
+                &context,
             ) {
                 rewrites.push(LinkRewrite {
                     source: src,
@@ -4060,11 +4513,7 @@ fn collect_link_rewrites(
                 &display,
                 is_embed != 0,
                 None,
-                from,
-                to,
-                &from_key,
-                &to_key,
-                to_base_unique,
+                &context,
             ) {
                 rewrites.push(LinkRewrite {
                     source: src,
@@ -4107,30 +4556,116 @@ fn rewrite_ref_url(url: &str, variants: &[(String, String)]) -> Option<String> {
 
 fn rewrite_markdown_refs(text: &str, variants: &[(String, String)]) -> String {
     let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b']' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            let mut j = i + 2;
-            while j < bytes.len() && bytes[j] != b')' {
-                j += 1;
+    let mut fenced: Option<char> = None;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().filter(|ch| *ch == '`' || *ch == '~');
+        let marker_count = marker
+            .map(|ch| {
+                trimmed
+                    .chars()
+                    .take_while(|candidate| *candidate == ch)
+                    .count()
+            })
+            .unwrap_or(0);
+        if marker_count >= 3 {
+            if fenced == marker {
+                fenced = None;
+            } else if fenced.is_none() {
+                fenced = marker;
             }
-            if j < bytes.len() {
-                let url = &text[i + 2..j];
-                if let Some(repl) = rewrite_ref_url(url, variants) {
-                    out.push_str("](");
-                    out.push_str(&repl);
-                    out.push(')');
-                    i = j + 1;
+            out.push_str(line);
+            continue;
+        }
+        if fenced.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&rewrite_markdown_ref_line(line, variants));
+    }
+    out
+}
+
+fn rewrite_markdown_ref_line(line: &str, variants: &[(String, String)]) -> String {
+    let bytes = line.as_bytes();
+    let mut output = String::with_capacity(line.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    let mut inline_ticks = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let run = bytes[index..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            inline_ticks = if inline_ticks == run {
+                0
+            } else if inline_ticks == 0 {
+                run
+            } else {
+                inline_ticks
+            };
+            index += run;
+            continue;
+        }
+        if inline_ticks == 0 && bytes[index] == b']' && bytes.get(index + 1) == Some(&b'(') {
+            let mut start = index + 2;
+            while bytes
+                .get(start)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                start += 1;
+            }
+            let (url_start, mut end, angled) = if bytes.get(start) == Some(&b'<') {
+                (start + 1, start + 1, true)
+            } else {
+                (start, start, false)
+            };
+            let mut nested = 0usize;
+            let mut escaped = false;
+            while end < bytes.len() {
+                let byte = bytes[end];
+                if escaped {
+                    escaped = false;
+                    end += 1;
+                    continue;
+                }
+                if byte == b'\\' {
+                    escaped = true;
+                    end += 1;
+                    continue;
+                }
+                if angled && byte == b'>' {
+                    break;
+                }
+                if !angled {
+                    if byte == b'(' {
+                        nested += 1;
+                    } else if byte == b')' {
+                        if nested == 0 {
+                            break;
+                        }
+                        nested -= 1;
+                    } else if byte.is_ascii_whitespace() && nested == 0 {
+                        break;
+                    }
+                }
+                end += 1;
+            }
+            if end > url_start {
+                if let Some(replacement) = rewrite_ref_url(&line[url_start..end], variants) {
+                    output.push_str(&line[cursor..url_start]);
+                    output.push_str(&replacement);
+                    cursor = end;
+                    index = end;
                     continue;
                 }
             }
         }
-        let ch = text[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        index += 1;
     }
-    out
+    output.push_str(&line[cursor..]);
+    output
 }
 
 /// Scan every Markdown file for Markdown-style references to the renamed path and
@@ -4216,7 +4751,7 @@ fn apply_rewrites(
             text = format!("{before}{new_text}{after}");
         }
         let text = rewrite_markdown_refs(&text, &variants);
-        std::fs::write(&abs, text.as_bytes()).map_err(|e| e.to_string())?;
+        atomic_write_file(&abs, text.as_bytes())?;
         reindex_path(index, &source)?;
         modified.insert(source);
     }
@@ -4228,7 +4763,7 @@ fn apply_rewrites(
             continue;
         }
         let abs = vault_abs(index, &rel)?;
-        std::fs::write(&abs, content.as_bytes()).map_err(|e| e.to_string())?;
+        atomic_write_file(&abs, content.as_bytes())?;
         reindex_path(index, &rel)?;
         modified.insert(rel);
     }
@@ -4241,7 +4776,9 @@ fn create_folder(path: String, state: State<'_, AppState>) -> Result<(), String>
     let mut guard = state.index.lock();
     let index = guard.as_mut().ok_or_else(|| "No vault open".to_string())?;
     let abs = vault_abs(index, &path)?;
+    ensure_secure_parent(index.vault_root(), &abs)?;
     std::fs::create_dir_all(&abs).map_err(|e| e.to_string())?;
+    ensure_existing_inside(index.vault_root(), &abs)?;
     Ok(())
 }
 
@@ -4253,10 +4790,8 @@ fn create_file(path: String, content: String, state: State<'_, AppState>) -> Res
     if abs.exists() {
         return Err(format!("Already exists: {path}"));
     }
-    if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&abs, content.as_bytes()).map_err(|e| e.to_string())?;
+    ensure_secure_parent(index.vault_root(), &abs)?;
+    atomic_write_file(&abs, content.as_bytes())?;
     reindex_path(index, &path)?;
     Ok(())
 }
@@ -4277,9 +4812,8 @@ fn rename_path(
     if dst.exists() {
         return Err(format!("Already exists: {to}"));
     }
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    ensure_existing_inside(index.vault_root(), &src)?;
+    ensure_secure_parent(index.vault_root(), &dst)?;
     let was_dir = src.is_dir();
     // Collect reference rewrites before the index identity changes, so links
     // pointing at the old path are still resolvable in `links.target_path`.
@@ -4304,6 +4838,7 @@ fn delete_path(path: String, state: State<'_, AppState>) -> Result<(), String> {
     if !abs.exists() {
         return Err(format!("Not found: {path} (resolved {})", abs.display()));
     }
+    ensure_existing_inside(index.vault_root(), &abs)?;
     if abs.is_dir() {
         std::fs::remove_dir_all(&abs).map_err(|e| e.to_string())?;
         index.reconcile().map_err(|e| e.to_string())?;
@@ -4326,15 +4861,56 @@ fn copy_path(from: String, to: String, state: State<'_, AppState>) -> Result<(),
     if dst.exists() {
         return Err(format!("Already exists: {to}"));
     }
+    ensure_existing_inside(index.vault_root(), &src)?;
+    ensure_secure_parent(index.vault_root(), &dst)?;
     if src.is_dir() {
         copy_dir_recursive(&src, &dst).map_err(|e| e.to_string())?;
         index.reconcile().map_err(|e| e.to_string())?;
     } else {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
         std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
         reindex_path(index, &to)?;
+    }
+    Ok(())
+}
+
+fn ensure_existing_inside(vault_root: &Path, path: &Path) -> Result<(), String> {
+    let root = vault_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    if !canonical.starts_with(&root) {
+        return Err("Path escapes vault through a symbolic link".into());
+    }
+    Ok(())
+}
+
+fn ensure_secure_parent(vault_root: &Path, path: &Path) -> Result<(), String> {
+    let root = vault_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Path has no parent".to_string())?;
+    let mut existing = parent;
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| "Path has no existing ancestor".to_string())?;
+    }
+    if !existing
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .starts_with(&root)
+    {
+        return Err("Path escapes vault through a symbolic link".into());
+    }
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    if !parent
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .starts_with(&root)
+    {
+        return Err("Path escapes vault through a symbolic link".into());
     }
     Ok(())
 }
@@ -5144,60 +5720,60 @@ async fn render_vim_powerline(
     let cursor_command = format!("call cursor({}, {})", line.max(1), column.max(1));
 
     tauri::async_runtime::spawn_blocking(move || {
-    let mut command = Command::new("vim");
-    command.arg("--not-a-term").arg("-n");
-    if let Some(path) = vimrc.as_ref().filter(|path| path.is_file()) {
-        command.arg("-Nu").arg(path);
-    } else {
-        command.args(["-Nu", "NONE"]);
-    }
-    command
-        .args(["--cmd", &runtime_command])
-        .args(["--cmd", "runtime plugin/powerline.vim"])
-        .arg(&absolute)
-        .args(["-c", &cursor_command]);
-    if dirty {
-        command.args(["-c", "set modified"]);
-    }
-    command
-        .args(["-c", "redrawstatus"])
-        .args(["-c", "sleep 10m"])
-        .args(["-c", "qa!"])
-        .env("TERM", "xterm-256color")
-        .env("COLUMNS", columns.to_string())
-        .env("LINES", rows.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        let mut command = Command::new("vim");
+        command.arg("--not-a-term").arg("-n");
+        if let Some(path) = vimrc.as_ref().filter(|path| path.is_file()) {
+            command.arg("-Nu").arg(path);
+        } else {
+            command.args(["-Nu", "NONE"]);
+        }
+        command
+            .args(["--cmd", &runtime_command])
+            .args(["--cmd", "runtime plugin/powerline.vim"])
+            .arg(&absolute)
+            .args(["-c", &cursor_command]);
+        if dirty {
+            command.args(["-c", "set modified"]);
+        }
+        command
+            .args(["-c", "redrawstatus"])
+            .args(["-c", "sleep 10m"])
+            .args(["-c", "qa!"])
+            .env("TERM", "xterm-256color")
+            .env("COLUMNS", columns.to_string())
+            .env("LINES", rows.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("start Vim Powerline: {e}"))?;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdout = Vec::new();
-        let mut stderr = String::new();
-        if let Some(ref mut output) = stdout_pipe {
-            let _ = output.read_to_end(&mut stdout);
-        }
-        if let Some(ref mut error) = stderr_pipe {
-            let _ = error.read_to_string(&mut stderr);
-        }
-        let status = child.wait();
-        let _ = tx.send((status, stdout, stderr));
-    });
-    let (status, stdout, stderr) = rx
-        .recv_timeout(Duration::from_secs(12))
-        .map_err(|_| "Vim Powerline render timed out after 12 seconds".to_string())?;
-    Ok(VimPowerlineResult {
-        screen: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr,
-        rows,
-        columns,
-        ok: status.map(|value| value.success()).unwrap_or(false),
-    })
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("start Vim Powerline: {e}"))?;
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdout = Vec::new();
+            let mut stderr = String::new();
+            if let Some(ref mut output) = stdout_pipe {
+                let _ = output.read_to_end(&mut stdout);
+            }
+            if let Some(ref mut error) = stderr_pipe {
+                let _ = error.read_to_string(&mut stderr);
+            }
+            let status = child.wait();
+            let _ = tx.send((status, stdout, stderr));
+        });
+        let (status, stdout, stderr) = rx
+            .recv_timeout(Duration::from_secs(12))
+            .map_err(|_| "Vim Powerline render timed out after 12 seconds".to_string())?;
+        Ok(VimPowerlineResult {
+            screen: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+            rows,
+            columns,
+            ok: status.map(|value| value.success()).unwrap_or(false),
+        })
     })
     .await
     .map_err(|error| format!("Vim Powerline task failed: {error}"))?
@@ -5347,6 +5923,7 @@ pub fn run() {
             vault_tags,
             pages_for_tag,
             list_plugins,
+            plugin_http_request,
             plugin_catalog,
             install_community_plugin,
             uninstall_community_plugin,
@@ -5404,10 +5981,11 @@ pub fn run() {
 #[cfg(test)]
 mod sql_query_tests {
     use super::{
-        discover_plugins, fts_query, is_conflict_status, is_core_replaced_obsidian_plugin,
-        next_recurrence_date, page_properties, recurring_task_lines, run_readonly_sql,
+        atomic_write_file, discover_plugins, ensure_secure_parent, fts_query, is_conflict_status,
+        is_core_replaced_obsidian_plugin, next_recurrence_date, page_properties,
+        plugin_http_request, recurring_task_lines, rewrite_markdown_refs, run_readonly_sql,
         search_yaml_properties, translate_page_sql, translate_page_sql_residual,
-        vault_search_terms,
+        vault_search_terms, PluginHttpRequest,
     };
     use chrono::NaiveDate;
 
@@ -5450,6 +6028,8 @@ mod sql_query_tests {
             "const { Plugin } = require('obsidian'); module.exports = class extends Plugin {};",
         )
         .unwrap();
+        std::fs::create_dir_all(obsidian.join("icons")).unwrap();
+        std::fs::write(obsidian.join("icons/tool.svg"), "<svg/>").unwrap();
         let obsidian_plugins =
             discover_plugins(&directory.path().join("obsidian"), "obsidian", None).unwrap();
         assert_eq!(obsidian_plugins[0].compatibility, "obsidian");
@@ -5459,6 +6039,9 @@ mod sql_query_tests {
         assert_eq!(
             obsidian_plugins[0].min_app_version.as_deref(),
             Some("1.5.0")
+        );
+        assert!(
+            obsidian_plugins[0].assets["icons/tool.svg"].starts_with("data:image/svg+xml;base64,")
         );
     }
 
@@ -5511,6 +6094,69 @@ mod sql_query_tests {
     }
 
     #[test]
+    fn markdown_rename_rewrites_destinations_without_touching_code_or_titles() {
+        let source = "[note](Old.md \"A title\")\n`[code](Old.md)`\n```md\n[fenced](Old.md)\n```\n[angle](<Old.md>)\n[nested](Old(1).md)\n";
+        let rewritten = rewrite_markdown_refs(
+            source,
+            &[
+                ("Old.md".into(), "New.md".into()),
+                ("Old(1).md".into(), "New(1).md".into()),
+            ],
+        );
+        assert!(rewritten.contains("[note](New.md \"A title\")"));
+        assert!(rewritten.contains("`[code](Old.md)`"));
+        assert!(rewritten.contains("[fenced](Old.md)"));
+        assert!(rewritten.contains("[angle](<New.md>)"));
+        assert!(rewritten.contains("[nested](New(1).md)"));
+    }
+
+    #[test]
+    fn atomic_write_replaces_complete_content_and_preserves_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Note.md");
+        std::fs::write(&path, "before").unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        atomic_write_file(&path, b"after").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().readonly(),
+            permissions.readonly()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_parent_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), vault.path().join("escape")).unwrap();
+        let error =
+            ensure_secure_parent(vault.path(), &vault.path().join("escape/Note.md")).unwrap_err();
+        assert!(error.contains("symbolic link"));
+    }
+
+    #[test]
+    fn plugin_http_transport_rejects_unsafe_urls_before_network_access() {
+        let request = |url: &str| PluginHttpRequest {
+            url: url.into(),
+            method: None,
+            headers: None,
+            content_type: None,
+            body: None,
+            throw_on_error: None,
+        };
+        assert!(plugin_http_request(request("file:///etc/passwd"))
+            .unwrap_err()
+            .contains("HTTP(S)"));
+        assert!(
+            plugin_http_request(request("https://user:pass@example.com/"))
+                .unwrap_err()
+                .contains("credentials")
+        );
+    }
+
+    #[test]
     fn recurring_tasks_advance_dates_and_preserve_month_ends() {
         let today = NaiveDate::from_ymd_opt(2026, 8, 12).unwrap();
         let (completed, next) = recurring_task_lines(
@@ -5529,6 +6175,18 @@ mod sql_query_tests {
             )
             .unwrap(),
             NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+        );
+        assert_eq!(
+            next_recurrence_date(today, "every week on friday").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(),
+        );
+        assert_eq!(
+            next_recurrence_date(today, "every month on the last friday").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+        );
+        assert_eq!(
+            next_recurrence_date(today, "every year on january 31st").unwrap(),
+            NaiveDate::from_ymd_opt(2027, 1, 31).unwrap(),
         );
     }
 

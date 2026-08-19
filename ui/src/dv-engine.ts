@@ -142,6 +142,7 @@ const ALWAYS_ENGINE = new Set([
   "javascript",
   "nephrite",
   "nephritejs",
+  "tasks",
   ...SQL_LANGS,
 ]);
 
@@ -1240,6 +1241,52 @@ export function lowerDqlFunctionAliases(expression: string): string {
   return output;
 }
 
+const DQL_BOUND_IDENTS: ReadonlySet<string> = new Set([
+  "helpers", "row", "current", "true", "false", "null", "undefined", "NaN", "Infinity",
+]);
+
+/**
+ * Bind bare DQL field names to `row["field"]` so a missing YAML key is
+ * `undefined` (Dataview null), not a JavaScript ReferenceError.
+ * Property tails (`.name`) stay as-is; `helpers.*` / `row` / `current` stay bound.
+ */
+export function bindDqlFieldIdentifiers(expression: string): string {
+  let output = "";
+  let quote = "";
+  for (let index = 0; index < expression.length;) {
+    const char = expression[index];
+    if (quote) {
+      output += char;
+      if (char === quote && expression[index - 1] !== "\\") quote = "";
+      index++;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      output += char;
+      index++;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(char)) {
+      let end = index + 1;
+      while (end < expression.length && /[A-Za-z0-9_]/.test(expression[end])) end++;
+      const identifier = expression.slice(index, end);
+      const prev = expression.slice(0, index).replace(/\s+$/, "").at(-1);
+      const propertyAccess = prev === "." || prev === "?";
+      if (!propertyAccess && !DQL_BOUND_IDENTS.has(identifier)) {
+        output += `row[${JSON.stringify(identifier)}]`;
+      } else {
+        output += identifier;
+      }
+      index = end;
+      continue;
+    }
+    output += char;
+    index++;
+  }
+  return output;
+}
+
 const DQL_HELPER_NAMES: ReadonlySet<string> = new Set([
   "contains", "icontains", "econtains", "containsword", "startswith", "endswith",
   "string", "number", "length", "choice", "coalesce", "regexmatch", "regextest",
@@ -1553,7 +1600,7 @@ export function evaluateDql(expression: string, row: DqlRow, current: DvPage): u
     .replace(/\bOR\b/gi, "||")
     .replace(/\bNOT\b/gi, "!")
     .replace(/(?<![<>=!])=(?!=)/g, "==");
-  const javascriptRewritten = rewriteDateArithmetic(javascript);
+  const javascriptRewritten = bindDqlFieldIdentifiers(rewriteDateArithmetic(javascript));
   const helpers = {
     current,
     contains: dqlContains,
@@ -1625,7 +1672,13 @@ export function evaluateDql(expression: string, row: DqlRow, current: DvPage): u
     "helpers",
     `with (helpers) { with (row) { return (${javascriptRewritten}); } }`,
   ) as (row: DqlRow, helpers: Record<string, unknown>) => unknown;
-  return evaluator(row, helpers);
+  try {
+    return evaluator(row, helpers);
+  } catch {
+    // Missing fields, null.property, or a bad coercion: Dataview yields null,
+    // not a failed query. Syntax errors still throw from `new Function` above.
+    return undefined;
+  }
 }
 
 /**
@@ -1919,6 +1972,75 @@ function esc(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+type TasksFenceRow = DvTask & {
+  path: string; task_id: number; text: string; completed: boolean;
+  status?: string; status_char?: string; due?: string | null; scheduled?: string | null;
+  priority?: string | null; recurrence?: string | null; tags?: string[];
+};
+
+/** Compatibility frontend for the Obsidian Tasks query block. Markdown task
+ * records still come from the shared vault index; this parser only projects
+ * familiar Tasks filter/sort/group instructions over them. */
+export async function runTasksBlock(source: string, mount: HTMLElement, ctx: EngineContext): Promise<void> {
+  const pages = await ctx.loadPages();
+  let rows: TasksFenceRow[] = pages.flatMap((page) => (page.file.tasks ?? []).map((raw) => {
+    const task = raw as TasksFenceRow;
+    return { ...task, path: String(task.path || page.file.path), task_id: Number(task.task_id ?? (task as any).id ?? 0), text: String(task.text ?? ""), completed: Boolean(task.completed) };
+  }));
+  let sort = "";
+  let group = "";
+  let limit = Number.POSITIVE_INFINITY;
+  const todayDate = new Date();
+  const iso = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  const today = iso(todayDate);
+  const tomorrowDate = new Date(todayDate); tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const resolveDate = (value: string) => value === "today" ? today : value === "tomorrow" ? iso(tomorrowDate) : value;
+  for (const raw of source.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    let match: RegExpMatchArray | null;
+    if (line === "not done") rows = rows.filter((task) => !task.completed);
+    else if (line === "done") rows = rows.filter((task) => task.completed);
+    else if (line === "is recurring") rows = rows.filter((task) => Boolean(task.recurrence));
+    else if (line === "is not recurring" || line === "not recurring") rows = rows.filter((task) => !task.recurrence);
+    else if (line === "has due date") rows = rows.filter((task) => Boolean(task.due));
+    else if (line === "no due date") rows = rows.filter((task) => !task.due);
+    else if ((match = line.match(/^due (before|after|on) (.+)$/i))) {
+      const operation = match[1].toLowerCase();
+      const value = resolveDate(match[2].trim().toLowerCase());
+      rows = rows.filter((task) => Boolean(task.due) && (operation === "before" ? task.due! < value : operation === "after" ? task.due! > value : task.due === value));
+    } else if ((match = line.match(/^due (today|tomorrow)$/i))) rows = rows.filter((task) => task.due === resolveDate(match![1].toLowerCase()));
+    else if ((match = line.match(/^(path|folder|description|tag) includes (.+)$/i))) {
+      const field = match[1].toLowerCase(); const value = match[2].trim().replace(/^#/, "").toLowerCase();
+      rows = rows.filter((task) => {
+        if (field === "description") return task.text.toLowerCase().includes(value);
+        if (field === "tag") return (task.tags ?? []).some((tag) => tag.replace(/^#/, "").toLowerCase() === value);
+        const path = field === "folder" ? task.path.replace(/\/[^/]+$/, "") : task.path;
+        return path.toLowerCase().includes(value);
+      });
+    } else if ((match = line.match(/^priority is (.+)$/i))) rows = rows.filter((task) => (task.priority ?? "none").toLowerCase() === match![1].trim().toLowerCase());
+    else if ((match = line.match(/^status (?:is|name includes) (.+)$/i))) rows = rows.filter((task) => `${task.status ?? ""} ${task.status_char ?? ""}`.toLowerCase().includes(match![1].trim().toLowerCase()));
+    else if ((match = line.match(/^sort by (.+)$/i))) sort = match[1].trim().toLowerCase();
+    else if ((match = line.match(/^group by (.+)$/i))) group = match[1].trim().toLowerCase();
+    else if ((match = line.match(/^limit (?:to )?(\d+) tasks?$/i))) limit = Number(match[1]);
+  }
+  const priorityRank: Record<string, number> = { highest: 0, high: 1, medium: 2, low: 3, lowest: 4 };
+  const key = (task: TasksFenceRow, name: string) => name.includes("priority") ? String(priorityRank[task.priority ?? ""] ?? 9)
+    : name.includes("scheduled") ? task.scheduled ?? "9999-12-31"
+    : name.includes("path") || name.includes("file") ? task.path.toLowerCase()
+    : task.due ?? "9999-12-31";
+  if (sort) rows.sort((left, right) => key(left, sort).localeCompare(key(right, sort)) || left.path.localeCompare(right.path));
+  rows = rows.slice(0, limit);
+  const groupKey = (task: TasksFenceRow) => group.includes("folder") ? task.path.replace(/\/[^/]+$/, "") || "Vault root"
+    : group.includes("file") ? task.path
+    : group.includes("priority") ? task.priority ?? "No priority"
+    : group.includes("due") ? task.due ?? "No due date" : "Tasks";
+  const groups = new Map<string, TasksFenceRow[]>();
+  for (const task of rows) groups.set(groupKey(task), [...(groups.get(groupKey(task)) ?? []), task]);
+  mount.innerHTML = [...groups].map(([name, tasks]) => `${group ? `<h4>${esc(name)}</h4>` : ""}<ul class="dv-task-list">${tasks.map((task) => `<li><label><input type="checkbox" data-task-path="${esc(task.path)}" data-task-id="${task.task_id}" ${task.completed ? "checked" : ""}><span>${esc(task.text)}</span></label> <button class="dv-task-source" type="button" data-wikilink="${esc(task.path)}">${esc(task.path)}</button></li>`).join("")}</ul>`).join("") || "<p>No matching tasks.</p>";
+  bindPreviewLinks(mount, ctx);
+}
+
 /**
  * Replace script fences in HTML preview with placeholder divs, then execute.
  * Works on the original markdown to find blocks and inject into a container.
@@ -1959,6 +2081,7 @@ export async function executeBlocksInPreview(
   ) => {
     try {
       if (inline) await runScriptBlock(source, mount, ctx, true);
+      else if (lang === "tasks") await runTasksBlock(source, mount, ctx);
       else if (lang === "dataview") await runDqlBlock(source, mount, ctx);
       else if (SQL_LANGS.has(lang)) await runSqlBlock(source, mount, ctx);
       else await runScriptBlock(source, mount, ctx);

@@ -76,6 +76,10 @@ export function isVideoPath(path: string): boolean {
   return ["mp4", "webm", "ogv", "mov", "m4v"].includes(fileExtension(path));
 }
 
+export function isImagePath(path: string): boolean {
+  return ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"].includes(fileExtension(path));
+}
+
 export function isCsvPath(path: string): boolean {
   return fileExtension(path) === "csv";
 }

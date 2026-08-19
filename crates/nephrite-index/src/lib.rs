@@ -21,7 +21,7 @@ use migration::has_migration_state_table;
 pub use migration::{
     format_count, format_open_action, pending_migrations, plan_open, remaining_for, Migration,
     OpenPlan, PlannedMigration, MIGRATIONS, MIGRATION_DATAVIEW_INLINE_FIELDS,
-    MIGRATION_LEGACY_02_CANVAS,
+    MIGRATION_LEGACY_02_CANVAS, MIGRATION_TASKS_EXTENDED_METADATA,
 };
 pub use parse::MarkdownFacts;
 pub use resolve::{wikilink_key, IndexedFile, LinkResolver};
@@ -41,9 +41,7 @@ use walkdir::WalkDir;
 use file_kind::FileKind as FK;
 use parse::parse_markdown;
 pub use pathutil::should_skip_rel;
-use pathutil::{
-    abs_from_rel, name_of, normalize_rel, parent_of, rel_from_abs_cached, stem_ext,
-};
+use pathutil::{abs_from_rel, name_of, normalize_rel, parent_of, rel_from_abs_cached, stem_ext};
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
@@ -73,6 +71,17 @@ pub enum ProgressPhase {
 
 pub type ProgressFn<'a> = dyn FnMut(ProgressPhase, usize, usize, Option<&str>) + 'a;
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Filesystem-vs-index delta. Computing this does not write the database.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconcilePlan {
@@ -87,10 +96,7 @@ impl ReconcilePlan {
         !self.updated.is_empty() || !self.removed.is_empty()
     }
 
-    pub fn from_scan(
-        disk: &[(String, i64, i64)],
-        indexed: &HashMap<String, (i64, i64)>,
-    ) -> Self {
+    pub fn from_scan(disk: &[(String, i64, i64)], indexed: &HashMap<String, (i64, i64)>) -> Self {
         let mut updated = Vec::new();
         let mut unchanged = 0;
         let mut disk_paths = HashSet::new();
@@ -136,12 +142,7 @@ pub fn background_then_visible(
 /// Strip Obsidian `#heading` / `|alias` / `|250` from a wikilink target.
 fn link_note(raw: &str) -> String {
     let no_alias = raw.split_once('|').map(|(note, _)| note).unwrap_or(raw);
-    no_alias
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    no_alias.split('#').next().unwrap_or("").trim().to_string()
 }
 
 /// Archive-bit work list: only dirty paths, on-screen dirty files last.
@@ -212,6 +213,19 @@ impl VaultIndex {
     fn ensure_schema(&mut self) -> Result<()> {
         // Additive / IF NOT EXISTS DDL — safe across minor bumps.
         self.conn.execute_batch(SCHEMA_SQL)?;
+        for (name, declaration) in [
+            ("cancelled_date", "TEXT"),
+            ("task_uid", "TEXT"),
+            ("depends_on_json", "TEXT"),
+            ("on_completion", "TEXT"),
+        ] {
+            if !table_has_column(&self.conn, "tasks", name)? {
+                self.conn.execute(
+                    &format!("ALTER TABLE tasks ADD COLUMN {name} {declaration}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -310,7 +324,7 @@ impl VaultIndex {
 
     /// Best-effort WAL trim. PASSIVE does not block readers.
     pub fn wal_checkpoint_passive(&self) -> Result<()> {
-        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
 
@@ -358,22 +372,24 @@ impl VaultIndex {
         let disk = self.list_vault_files()?;
         progress(ProgressPhase::Scan, disk.len(), disk.len(), None);
 
-        // Map path -> (mtime, size) from index
-        let mut index_meta: HashMap<String, (i64, i64)> = HashMap::new();
+        // Keep the content digest too. Editors and sync tools can preserve both
+        // size and timestamp, so metadata alone is not a safe unchanged test.
+        let mut index_meta: HashMap<String, (i64, i64, Option<String>)> = HashMap::new();
         {
             let mut stmt = self
                 .conn
-                .prepare("SELECT path, mtime_ms, size_bytes FROM files")?;
+                .prepare("SELECT path, mtime_ms, size_bytes, content_hash FROM files")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?;
             for row in rows {
-                let (p, m, s) = row?;
-                index_meta.insert(p, (m, s));
+                let (p, m, s, hash) = row?;
+                index_meta.insert(p, (m, s, hash));
             }
         }
 
@@ -402,7 +418,16 @@ impl VaultIndex {
                         .is_some_and(|done| done.contains(rel))
             });
             let reindex = match index_meta.get(rel) {
-                Some((im, is)) if *im == *mtime_ms && *is == *size_bytes => backfill_needed,
+                Some((im, is, indexed_hash)) if *im == *mtime_ms && *is == *size_bytes => {
+                    let content_changed = indexed_hash.as_ref().is_some_and(|expected| {
+                        let absolute = abs_from_rel(&self.vault_root, rel).ok();
+                        let actual = absolute
+                            .and_then(|path| fs::read_to_string(path).ok())
+                            .map(|content| hash_str(&content));
+                        actual.as_ref() != Some(expected)
+                    });
+                    backfill_needed || content_changed
+                }
                 _ => true,
             };
             if reindex {
@@ -1129,8 +1154,8 @@ fn write_file_index(tx: &rusqlite::Transaction, file: &PreparedFile) -> Result<(
                     path, task_id, status, status_char, text, raw_line, line,
                     start_offset, end_offset, completed, list_indent, is_recurring,
                     due, scheduled, start_date, done_date, created_date, priority,
-                    recurrence, tags_json
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                    recurrence, tags_json, cancelled_date, task_uid, depends_on_json, on_completion
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 params![
                     rel,
                     t.task_id,
@@ -1152,6 +1177,10 @@ fn write_file_index(tx: &rusqlite::Transaction, file: &PreparedFile) -> Result<(
                     t.priority,
                     t.recurrence,
                     t.tags_json,
+                    t.cancelled_date,
+                    t.task_uid,
+                    t.depends_on_json,
+                    t.on_completion,
                 ],
             )?;
         }
@@ -1563,6 +1592,34 @@ Rating:: 5
     }
 
     #[test]
+    fn reconcile_detects_same_size_content_with_restored_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("Note.md");
+        fs::write(&note, "# Alpha\n").unwrap();
+        let (_index, _) = VaultIndex::open(dir.path()).unwrap();
+        let modified = fs::metadata(&note).unwrap().modified().unwrap();
+        fs::write(&note, "# Bravo\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&note)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+
+        let (index, stats) = VaultIndex::open(dir.path()).unwrap();
+        assert_eq!(stats.updated, 1);
+        let title: String = index
+            .connection()
+            .query_row(
+                "SELECT text FROM headings WHERE path = 'Note.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Bravo");
+    }
+
+    #[test]
     fn resolve_all_links_uses_obsidian_vault_global_order() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
@@ -1644,10 +1701,7 @@ Rating:: 5
     #[test]
     fn archive_index_order_does_not_reindex_clean_visible_pages() {
         let visible = HashSet::from(["open.md".to_string(), "other-tab.md".to_string()]);
-        let order = archive_index_order(
-            ["sync.md".to_string(), "open.md".to_string()],
-            &visible,
-        );
+        let order = archive_index_order(["sync.md".to_string(), "open.md".to_string()], &visible);
         assert_eq!(order, vec!["sync.md", "open.md"]);
         assert!(!order.contains(&"other-tab.md".to_string()));
     }
@@ -1656,17 +1710,25 @@ Rating:: 5
     fn resolve_link_exact_image_path_stays_under_10ms() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path();
-        fs::write(vault.join("pic.png"), [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        fs::write(
+            vault.join("pic.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
         fs::write(vault.join("note.md"), "![[pic.png]]\n").unwrap();
         let (idx, _) = VaultIndex::open(vault).unwrap();
         assert_eq!(
-            idx.resolve_link("pic.png", Some("note.md")).unwrap().as_deref(),
+            idx.resolve_link("pic.png", Some("note.md"))
+                .unwrap()
+                .as_deref(),
             Some("pic.png")
         );
         let started = std::time::Instant::now();
         for _ in 0..50 {
             assert_eq!(
-                idx.resolve_link("pic.png", Some("note.md")).unwrap().as_deref(),
+                idx.resolve_link("pic.png", Some("note.md"))
+                    .unwrap()
+                    .as_deref(),
                 Some("pic.png")
             );
         }

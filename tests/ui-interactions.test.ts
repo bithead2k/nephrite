@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { JSDOM } from "jsdom";
-import { renderCommandBar, type AppCommand } from "../ui/src/command-bar";
+import {
+  bangShellCommand,
+  renderCommandBar,
+  renderPersistentCommandBar,
+  type AppCommand,
+} from "../ui/src/command-bar";
 import {
   showContextMenu,
   type CtxAction,
@@ -37,7 +42,7 @@ import {
 } from "../ui/src/daily-notes";
 import { hydrateMermaid, looksLikeMermaidFence } from "../ui/src/mermaid";
 import { nextTaskForm } from "../ui/src/tasks";
-import { hydratePreviewTaskMarkers } from "../ui/src/tasks";
+import { findNextTaskStatusEdit, hydratePreviewTaskMarkers } from "../ui/src/tasks";
 import { nextTaskStatusChar } from "../ui/src/task-status";
 import { slashCompletionMatch } from "../ui/src/slash-commands";
 import { hydrateCsvFences, parseCsv } from "../ui/src/csv-view";
@@ -243,6 +248,66 @@ test("Escape closes a mounted command bar without executing an action", () => {
   );
   assert.equal(closed, true);
   assert.equal(executed, false);
+});
+
+test("the persistent Powerline command prompt stays mounted and executes commands", () => {
+  document.body.replaceChildren();
+  const host = document.createElement("footer");
+  document.body.append(host);
+  const executed: string[] = [];
+  const prompt = renderPersistentCommandBar(host, () => [
+    { id: "save", title: "Save current file", run: () => executed.push("save") },
+    { id: "graph", title: "Open graph", run: () => executed.push("graph") },
+  ]);
+
+  assert.deepEqual(
+    [...host.querySelectorAll(".command-bar-segment")].map((node) => node.textContent),
+    ["NEPHRITE", "COMMAND"],
+  );
+  const input = host.querySelector<HTMLInputElement>(".persistent-command-input");
+  assert.ok(input);
+  prompt.focus();
+  input.value = "graph";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  assert.equal(host.querySelector(".command-bar-result span")?.textContent, "Open graph");
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  assert.deepEqual(executed, ["graph"]);
+  assert.ok(host.querySelector(".persistent-command-input"), "prompt remains mounted");
+  assert.equal(input.value, "");
+});
+
+test("a leading bang clears the prompt, executes shell code, and displays its output", async () => {
+  document.body.replaceChildren();
+  const host = document.createElement("footer");
+  document.body.append(host);
+  const executed: string[] = [];
+  const prompt = renderPersistentCommandBar(host, () => [], async (command) => {
+    executed.push(command);
+    return {
+      stdout: "/home/kroybal/Documents/notes\n",
+      stderr: "",
+      code: 0,
+      ok: true,
+    };
+  });
+
+  assert.equal(bangShellCommand("notes"), null);
+  assert.equal(bangShellCommand("! pwd"), "pwd");
+  const input = host.querySelector<HTMLInputElement>(".persistent-command-input");
+  assert.ok(input);
+  prompt.focus();
+  input.value = "! pwd";
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  assert.equal(host.querySelector(".command-bar-result span")?.textContent, "Run shell: pwd");
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(executed, ["pwd"]);
+  assert.equal(
+    host.querySelector(".command-bar-shell-output")?.textContent,
+    "/home/kroybal/Documents/notes",
+  );
+  assert.equal(input.value, "");
 });
 
 test("the main preview hydration path expands an Obsidian heading embed", async () => {
@@ -470,6 +535,18 @@ test("task cycle walks the extended status set", () => {
   hydratePreviewTaskMarkers(host);
   assert.equal(host.querySelectorAll("[data-task-index]").length >= 2, true);
   assert.ok(host.querySelector("button.task-status-marker"));
+});
+
+test("repeated preview clicks follow the editor task status order", () => {
+  let source = "- [ ] work";
+  const statuses = ["/", ">", "<", "?", "!", "x", "-", " "];
+  for (const status of statuses) {
+    const current = source.match(/\[([^\]])\]/)?.[1] ?? " ";
+    const edit = findNextTaskStatusEdit(source, 0, current);
+    assert.ok(edit);
+    source = source.slice(0, edit.from) + edit.insert + source.slice(edit.to);
+    assert.equal(source, `- [${status}] work`);
+  }
 });
 
 test("slash completion matches a line-start command", () => {

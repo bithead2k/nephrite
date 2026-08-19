@@ -140,6 +140,48 @@ export function hideContextMenu() {
   menuEl.innerHTML = "";
 }
 
+export type MenuChoice = { id: string; label: string; danger?: boolean };
+
+export function showItemMenu(
+  x: number,
+  y: number,
+  items: readonly MenuChoice[],
+  onAction: (id: string) => void,
+) {
+  const menu = ensureMenu();
+  menu.innerHTML = "";
+  menu.classList.remove("hidden");
+
+  for (const it of items) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "ctx-item" + (it.danger ? " danger" : "");
+    btn.setAttribute("role", "menuitem");
+    btn.textContent = it.label;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      hideContextMenu();
+      onAction(it.id);
+    });
+    menu.appendChild(btn);
+  }
+
+  const pad = 6;
+  menu.style.left = "0px";
+  menu.style.top = "0px";
+  const rect = menu.getBoundingClientRect();
+  let left = x;
+  let top = y;
+  if (left + rect.width > window.innerWidth - pad) {
+    left = window.innerWidth - rect.width - pad;
+  }
+  if (top + rect.height > window.innerHeight - pad) {
+    top = window.innerHeight - rect.height - pad;
+  }
+  menu.style.left = `${Math.max(pad, left)}px`;
+  menu.style.top = `${Math.max(pad, top)}px`;
+}
+
 export function showContextMenu(
   x: number,
   y: number,
@@ -173,7 +215,6 @@ export function showContextMenu(
   const pad = 6;
   menu.style.left = "0px";
   menu.style.top = "0px";
-  // force layout
   const rect = menu.getBoundingClientRect();
   let left = x;
   let top = y;

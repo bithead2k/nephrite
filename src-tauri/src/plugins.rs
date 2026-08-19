@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub const COMMUNITY_REGISTRY: &str =
     "https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json";
-pub const USER_AGENT: &str = "Nephrite/0.6 (plugin catalog)";
+pub const USER_AGENT: &str = "Nephrite/0.8 (plugin catalog)";
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_MAIN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STYLE_BYTES: usize = 2 * 1024 * 1024;

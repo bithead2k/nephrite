@@ -1,9 +1,8 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { isImagePath } from "./file-kinds";
 import type { MediaFile } from "./types";
 
-export function isImagePath(path: string): boolean {
-  return /\.(?:png|jpe?g|gif|webp|svg|bmp|ico)$/i.test(path);
-}
+export { isImagePath };
 
 /** Replace an Obsidian wikilink image embed with a native image element. */
 export async function hydrateWikilinkImage(
@@ -54,6 +53,10 @@ export async function hydrateMarkdownImages(
 }
 
 const mediaSrcCache = new Map<string, string>();
+
+export function clearMediaSrcCache(): void {
+  mediaSrcCache.clear();
+}
 
 export async function vaultMediaSrc(path: string): Promise<string> {
   const cached = mediaSrcCache.get(path);

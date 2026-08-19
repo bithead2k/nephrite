@@ -90,6 +90,13 @@ export type TaskRow = {
   scheduled: string | null;
   priority: string | null;
   recurrence: string | null;
+  start_date: string | null;
+  done_date: string | null;
+  created_date: string | null;
+  cancelled_date: string | null;
+  task_uid: string | null;
+  depends_on: string[];
+  on_completion: string | null;
   tags: string[];
 };
 
