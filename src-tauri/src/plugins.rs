@@ -13,6 +13,8 @@ pub const USER_AGENT: &str = "Nephrite/0.9 (plugin catalog)";
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_MAIN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STYLE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EXTRA_ASSET_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXTRA_ASSETS_TOTAL: usize = 64 * 1024 * 1024;
 
 pub fn is_core_replaced_obsidian_plugin(id: &str) -> bool {
     hides_core_plugin(id, "", "")
@@ -126,6 +128,16 @@ pub fn community_plugins_path(root: &Path) -> PathBuf {
 }
 
 pub fn github_release_asset_url(repo: &str, filename: &str) -> Result<String, String> {
+    let repo = valid_repo(repo)?;
+    if !matches!(filename, "manifest.json" | "main.js" | "styles.css") {
+        return Err(format!("Refusing to download {filename}"));
+    }
+    Ok(format!(
+        "https://github.com/{repo}/releases/latest/download/{filename}"
+    ))
+}
+
+fn valid_repo(repo: &str) -> Result<&str, String> {
     let repo = repo.trim().trim_start_matches('/');
     if repo.is_empty()
         || repo.contains("..")
@@ -136,12 +148,7 @@ pub fn github_release_asset_url(repo: &str, filename: &str) -> Result<String, St
     {
         return Err(format!("Invalid plugin repository: {repo}"));
     }
-    if !matches!(filename, "manifest.json" | "main.js" | "styles.css") {
-        return Err(format!("Refusing to download {filename}"));
-    }
-    Ok(format!(
-        "https://github.com/{repo}/releases/latest/download/{filename}"
-    ))
+    Ok(repo)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -201,7 +208,7 @@ pub fn write_enabled_ids(root: &Path, ids: &[String]) -> Result<(), String> {
     std::fs::write(path, format_enabled_ids(ids)).map_err(|error| error.to_string())
 }
 
-pub fn download_text(url: &str, limit: usize) -> Result<String, String> {
+pub fn download_bytes(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     let response = ureq::get(url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", "application/octet-stream, text/plain, */*")
@@ -216,7 +223,77 @@ pub fn download_text(url: &str, limit: usize) -> Result<String, String> {
     if bytes.len() > limit {
         return Err(format!("Download exceeded {limit} bytes"));
     }
-    String::from_utf8(bytes).map_err(|_| "Download was not UTF-8".to_string())
+    Ok(bytes)
+}
+
+pub fn download_text(url: &str, limit: usize) -> Result<String, String> {
+    String::from_utf8(download_bytes(url, limit)?).map_err(|_| "Download was not UTF-8".to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: usize,
+}
+
+fn install_release_assets(dir: &Path, repo: &str) -> Result<(), String> {
+    let repo = valid_repo(repo)?;
+    let release = download_text(
+        &format!("https://api.github.com/repos/{repo}/releases/latest"),
+        2 * 1024 * 1024,
+    )?;
+    let release: GithubRelease = serde_json::from_str(&release)
+        .map_err(|error| format!("GitHub release metadata: {error}"))?;
+    let mut total = 0usize;
+    for asset in release.assets {
+        if matches!(
+            asset.name.as_str(),
+            "manifest.json" | "main.js" | "styles.css"
+        ) || !asset
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || asset.size > MAX_EXTRA_ASSET_BYTES
+            || total.saturating_add(asset.size) > MAX_EXTRA_ASSETS_TOTAL
+        {
+            continue;
+        }
+        let extension = Path::new(&asset.name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(
+            extension.as_str(),
+            "js" | "mjs"
+                | "cjs"
+                | "json"
+                | "wasm"
+                | "css"
+                | "svg"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "otf"
+        ) {
+            continue;
+        }
+        let bytes = download_bytes(&asset.browser_download_url, MAX_EXTRA_ASSET_BYTES)?;
+        total += bytes.len();
+        std::fs::write(dir.join(asset.name), bytes).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn install_release_files(root: &Path, id: &str, repo: &str) -> Result<String, String> {
@@ -261,6 +338,7 @@ pub fn install_release_files(root: &Path, id: &str, repo: &str) -> Result<String
     if let Some(css) = styles {
         std::fs::write(dir.join("styles.css"), css).map_err(|error| error.to_string())?;
     }
+    let _ = install_release_assets(&dir, repo);
     let mut enabled = read_enabled_ids(root);
     enabled = set_enabled_id(&enabled, id, true);
     write_enabled_ids(root, &enabled)?;

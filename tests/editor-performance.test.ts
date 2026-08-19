@@ -1551,11 +1551,13 @@ test("plugin package CSS resolves bundled assets without granting filesystem acc
   );
 });
 
-test("plugin host accepts bundled ESM Obsidian entrypoints", () => {
+test("plugin host accepts static ESM package entrypoints", () => {
   const source = preparePluginModuleSource("import { Plugin as Base } from 'obsidian'; export default class Demo extends Base {}");
   assert.match(source, /const \{ Plugin: Base \} = require\("obsidian"\)/);
   assert.match(source, /module\.exports\.default = class Demo/);
-  assert.throws(() => preparePluginModuleSource("import helper from './helper.js';"), /unbundled ES module/);
+  const relative = preparePluginModuleSource("import helper from './helper.js'; export { helper };");
+  assert.match(relative, /require\("\.\/helper\.js"\)/);
+  assert.match(relative, /module\.exports\["helper"\] = helper/);
 });
 
 test("Obsidian app aliases inherit Nephrite capability and path security", async () => {
@@ -1672,8 +1674,8 @@ test("ObsidianApp aliases project the full Obsidian facade over the permission g
   await app.commands.executeCommandById("nephrite:noop");
   assert.deepEqual(opened.slice(-1), ["cmd:nephrite:noop"]);
 
-  assert.equal(app.workspace.getLeavesOfType("markdown").length, 0);
-  assert.equal(app.workspace.getActiveViewOfType("markdown"), null);
+  assert.equal(app.workspace.getLeavesOfType("markdown").length, 1);
+  assert.equal((app.workspace.getActiveViewOfType("markdown") as { getViewType: () => string }).getViewType(), "markdown");
 });
 
 test("file merge keeps shared prefix/suffix and inserts conflict markers", () => {

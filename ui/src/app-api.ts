@@ -33,6 +33,16 @@ export type AppFile = {
 
 export type AppEventReference = { name: string; callback: (...args: any[]) => void };
 
+export type AppEditorState = {
+  path: string | null;
+  content: string;
+  selection: string;
+  from?: number;
+  to?: number;
+  cursor?: { line: number; ch: number };
+  anchor?: { line: number; ch: number };
+};
+
 export type AppHostServices = {
   listFiles: () => readonly AppFile[] | Promise<readonly AppFile[]>;
   readFile: (path: string) => string | Promise<string>;
@@ -44,12 +54,15 @@ export type AppHostServices = {
   pageMetadata?: (path: string) => unknown | Promise<unknown>;
   metadataSnapshot?: () => readonly unknown[] | Promise<readonly unknown[]>;
   resolveLink?: (link: string, sourcePath: string) => AppFile | null | Promise<AppFile | null>;
-  editorState: () => { path: string | null; content: string; selection: string };
+  editorState: () => AppEditorState;
   replaceSelection?: (content: string) => unknown;
+  setEditorValue?: (content: string) => unknown;
+  setEditorSelection?: (from: number, to: number) => unknown;
   openPath: (path: string) => unknown | Promise<unknown>;
   executeCommand?: (id: string) => unknown | Promise<unknown>;
   registerCommand?: (id: string, title: string, keywords: string) => unknown;
   registerView?: (id: string, title: string) => unknown;
+  renderMarkdown?: (markdown: string, sourcePath: string) => unknown;
   executeShell?: (command: string, args: string[]) => unknown | Promise<unknown>;
   requestUrl?: (request: unknown) => unknown | Promise<unknown>;
   pluginInfo?: (id?: string) => unknown;
@@ -71,11 +84,14 @@ export const APP_METHOD_PERMISSIONS: Record<string, AppPermission> = {
   "index.query": "index.query",
   "editor.getState": "editor.read",
   "editor.replaceSelection": "editor.write",
+  "editor.setValue": "editor.write",
+  "editor.setSelection": "editor.write",
   "workspace.open": "vault.read",
   "workspace.getActiveFile": "editor.read",
   "workspace.executeCommand": "workspace.commands",
   "workspace.registerCommand": "workspace.commands",
   "workspace.registerView": "workspace.views",
+  "workspace.renderMarkdown": "vault.read",
   "network.requestUrl": "network.request",
   "plugins.get": "vault.read",
   "plugins.getService": "vault.read",
@@ -186,6 +202,8 @@ export type AppIndexApi = { query: (sql: unknown) => unknown };
 export type AppEditorApi = {
   getState: () => unknown;
   replaceSelection: (content: unknown) => unknown;
+  setValue: (content: unknown) => unknown;
+  setSelection: (from: unknown, to?: unknown) => unknown;
 };
 export type AppPluginsApi = {
   getPlugin: (id?: unknown) => unknown;
@@ -251,6 +269,8 @@ export class NephriteApp {
     this.editor = Object.freeze({
       getState: () => this.call("editor.getState"),
       replaceSelection: (content: unknown) => this.call("editor.replaceSelection", content),
+      setValue: (content: unknown) => this.call("editor.setValue", content),
+      setSelection: (from: unknown, to?: unknown) => this.call("editor.setSelection", from, to ?? from),
     });
     this.workspace = Object.freeze({
       open: (path: unknown) => this.call("workspace.open", path),
@@ -301,11 +321,17 @@ export class NephriteApp {
       case "index.query": return this.services.queryIndex(String(args[0]));
       case "editor.getState": return this.services.editorState();
       case "editor.replaceSelection": return required(this.services.replaceSelection, method)(String(args[0]));
+      case "editor.setValue": return required(this.services.setEditorValue, method)(String(args[0]));
+      case "editor.setSelection": return required(this.services.setEditorSelection, method)(
+        Math.max(0, Number(args[0]) || 0),
+        Math.max(0, Number(args[1]) || 0),
+      );
       case "workspace.open": return this.services.openPath(String(args[0]));
       case "workspace.getActiveFile": return fileFromPath(this.services.editorState().path);
       case "workspace.executeCommand": return required(this.services.executeCommand, method)(String(args[0]));
       case "workspace.registerCommand": return required(this.services.registerCommand, method)(String(args[0]), String(args[1]), String(args[2] ?? ""));
       case "workspace.registerView": return required(this.services.registerView, method)(String(args[0]), String(args[1]));
+      case "workspace.renderMarkdown": return required(this.services.renderMarkdown, method)(String(args[0]), String(args[1] ?? ""));
       case "network.requestUrl": return required(this.services.requestUrl, method)(args[0]);
       case "plugins.get":
       case "plugins.getService": return this.services.pluginInfo?.(args[0] == null ? undefined : String(args[0])) ?? null;
@@ -345,10 +371,19 @@ export type ObsidianVaultApi = AppVaultApi & {
 export type ObsidianWorkspaceApi = AppWorkspaceApi & {
   openLinkText: (link: unknown, sourcePath: unknown) => unknown;
   getActiveFile: () => unknown;
-  getLeaf: () => { openFile: (file: unknown) => unknown };
-  getLeavesOfType: (type: unknown) => never[];
-  getActiveViewOfType: (type: unknown) => null;
+  getLeaf: () => ObsidianLeafApi;
+  getLeavesOfType: (type: unknown) => ObsidianLeafApi[];
+  getActiveViewOfType: (type: unknown) => unknown;
   onLayoutReady: (callback: () => void) => void;
+};
+
+export type ObsidianLeafApi = {
+  id: string;
+  view: { getViewType: () => string; getState: () => { file: string | null }; file: unknown };
+  openFile: (file: unknown) => unknown;
+  getViewState: () => { type: string; state: { file: string | null }; active: boolean };
+  setViewState: (state: { type?: unknown; state?: { file?: unknown } }) => unknown;
+  detach: () => void;
 };
 
 export type ObsidianMetadataCacheApi = AppEventApi & {
@@ -382,6 +417,23 @@ export class ObsidianApp extends NephriteApp {
     const nativeVault = this.vault;
     const nativeMetadata = this.metadata;
     const nativeWorkspace = this.workspace;
+    let detached = false;
+    const activeView = {
+      getViewType: () => "markdown",
+      getState: () => ({ file: this.services.editorState().path }),
+      get file() { return fileFromPath(services.editorState().path); },
+    };
+    const activeLeaf: ObsidianLeafApi = {
+      id: "nephrite-active-leaf",
+      view: activeView,
+      openFile: (file: unknown) => { detached = false; return nativeWorkspace.open(filePath(file)); },
+      getViewState: () => ({ type: "markdown", state: activeView.getState(), active: !detached }),
+      setViewState: (state) => {
+        detached = false;
+        return state?.state?.file == null ? undefined : nativeWorkspace.open(filePath(state.state.file));
+      },
+      detach: () => { detached = true; },
+    };
     this.vault = Object.freeze({
       ...nativeVault,
       getName: () => "Nephrite vault",
@@ -436,9 +488,13 @@ export class ObsidianApp extends NephriteApp {
         return mapMaybe(target, (file) => file ? nativeWorkspace.open(file.path) : undefined);
       },
       getActiveFile: () => this.call("workspace.getActiveFile"),
-      getLeaf: () => Object.freeze({ openFile: (file: unknown) => nativeWorkspace.open(filePath(file)) }),
-      getLeavesOfType: () => [],
-      getActiveViewOfType: () => null,
+      getLeaf: () => activeLeaf,
+      getLeavesOfType: (type: unknown) => !detached && String(type) === "markdown" ? [activeLeaf] : [],
+      getActiveViewOfType: (type: unknown) => {
+        if (detached) return null;
+        if (typeof type === "string") return type === "markdown" ? activeView : null;
+        return typeof type === "function" && activeView instanceof type ? activeView : null;
+      },
       onLayoutReady: (callback: () => void) => queueMicrotask(callback),
       on: nativeWorkspace.on,
       off: nativeWorkspace.off,

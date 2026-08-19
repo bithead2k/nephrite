@@ -557,6 +557,7 @@ fn plugin_asset_mime(path: &str) -> &'static str {
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "css" => "text/css",
+        "js" | "mjs" | "cjs" => "text/javascript",
         "json" => "application/json",
         "wasm" => "application/wasm",
         "mp3" => "audio/mpeg",

@@ -407,7 +407,7 @@ test("a bundled plugin registers post/code processors that the sandbox can run",
   assert.match(document, /type: "processor-registered", kind: "code", language/);
   assert.match(document, /message\.type === "process-post"/);
   assert.match(document, /message\.type === "process-code"/);
-  assert.match(document, /window\.__obsidianPluginInstance\?\._postProcessor/);
+  assert.match(document, /window\.__obsidianPluginInstance\?\._postProcessors/);
   assert.match(document, /window\.__obsidianPluginInstance\?\._codeProcessors\?\.get/);
   assert.match(document, /getService: \(id\) => send\("plugins.getService"/);
 });

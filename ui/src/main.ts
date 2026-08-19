@@ -689,6 +689,7 @@ async function renderShell() {
         <button type="button" id="btn-drawing" title="Create an Excalidraw drawing" disabled>Draw</button>
         <button type="button" id="btn-canvas" title="Create an Obsidian canvas" disabled>Canvas</button>
         <button type="button" id="btn-template" title="Apply a template (Ctrl-Y)" disabled>Template</button>
+        <div id="plugin-status-items" class="plugin-status-items" aria-label="Plugin status"></div>
       </div>
     </header>
     <div class="main">
@@ -705,6 +706,7 @@ async function renderShell() {
           <button type="button" id="activity-query-log" class="activity-button" title="Query log" aria-label="Query log" aria-pressed="false">${activityIcon("query-log")}</button>
           <button type="button" id="activity-attachments" class="activity-button" title="Attachments" aria-label="Attachments" aria-pressed="false" disabled>${activityIcon("attachments")}</button>
           <button type="button" id="activity-sql" class="activity-button" title="SQL console" aria-label="SQL console" aria-pressed="false" disabled>${activityIcon("sql")}</button>
+          <div id="plugin-ribbon-actions" class="plugin-ribbon-actions" aria-label="Plugin actions"></div>
         </div>
         <button type="button" id="btn-preferences" class="activity-button" title="Preferences" aria-label="Preferences" aria-expanded="false" aria-controls="preferences-popover">${activityIcon("settings")}</button>
         <section id="preferences-popover" class="preferences-popover hidden" role="dialog" aria-modal="false" aria-labelledby="preferences-title">
@@ -1081,14 +1083,40 @@ async function renderShell() {
         file_kind: "markdown",
       } : null;
     },
-    editorState: () => ({
-      path: currentPath,
-      content: currentFileKind === "markdown" ? editor?.getDoc() ?? "" : "",
-      selection: currentFileKind === "markdown" ? editor?.getSelection() ?? "" : "",
-    }),
+    editorState: () => {
+      if (currentFileKind !== "markdown" || !editor) {
+        return { path: currentPath, content: "", selection: "", from: 0, to: 0, cursor: { line: 0, ch: 0 }, anchor: { line: 0, ch: 0 } };
+      }
+      const content = editor.getDoc();
+      const range = editor.getSelectionRange();
+      const position = (offset: number) => {
+        const line = editor!.view.state.doc.lineAt(Math.min(Math.max(0, offset), editor!.view.state.doc.length));
+        return { line: line.number - 1, ch: offset - line.from };
+      };
+      return {
+        path: currentPath,
+        content,
+        selection: content.slice(range.from, range.to),
+        from: range.from,
+        to: range.to,
+        cursor: position(editor.view.state.selection.main.head),
+        anchor: position(editor.view.state.selection.main.anchor),
+      };
+    },
     replaceSelection: (content) => {
       if (currentFileKind !== "markdown" || !editor) throw new Error("No Markdown editor is active");
       editor.replaceSelection(content);
+    },
+    setEditorValue: (content) => {
+      if (currentFileKind !== "markdown" || !editor) throw new Error("No Markdown editor is active");
+      const cursor = Math.min(editor.view.state.selection.main.head, content.length);
+      editor.applyChanges([{ from: 0, to: editor.view.state.doc.length, insert: content }], cursor);
+    },
+    setEditorSelection: (from, to) => {
+      if (currentFileKind !== "markdown" || !editor) throw new Error("No Markdown editor is active");
+      const length = editor.view.state.doc.length;
+      editor.view.dispatch({ selection: { anchor: Math.min(from, length), head: Math.min(to, length) } });
+      editor.view.focus();
     },
     openPath: (path) => openNote(path),
     executeCommand: async (id) => {
@@ -1096,6 +1124,7 @@ async function renderShell() {
       if (!command) throw new Error(`Unknown command: ${id}`);
       await command.run();
     },
+    renderMarkdown: (markdown) => renderPreview(markdown, { includeFrontmatter: false }),
     pluginInfo: (id) => {
       const statuses = pluginManager?.statuses() ?? [];
       return id == null ? statuses : statuses.find((plugin) => plugin.id === id) ?? null;
@@ -1125,7 +1154,7 @@ async function renderShell() {
       command: [command, ...args].map(shellArgument).join(" "), cwd: null, timeoutMs: 60_000,
     }),
     requestUrl: (request) => invoke("plugin_http_request", { request }),
-  }, renderPreferencesPlugins);
+  }, () => { renderPreferencesPlugins(); renderPluginRibbonActions(); renderPluginStatusItems(); });
   canvasView = new CanvasView(
     $("canvas-host"),
     (source) => {
@@ -3065,6 +3094,7 @@ async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
   if (vaultChangeTouchesFileTree(change, mdFilesAll.map((file) => file.path))) {
     await refreshTree();
   }
+  void pluginManager?.notifyVaultChange(change.paths).catch((error) => console.warn("[plugin vault event]", error));
   const changed = new Set(change.paths);
   for (const path of changed) {
     paneStateCache.delete(path);
@@ -5091,6 +5121,39 @@ function openFindCommand() {
       setViewMode("split");
       requestAnimationFrame(() => editor?.openFind());
     } else editor.openFind();
+  }
+}
+
+function renderPluginRibbonActions(): void {
+  const host = document.getElementById("plugin-ribbon-actions");
+  if (!host) return;
+  host.replaceChildren();
+  for (const action of pluginManager?.ribbonActions() ?? []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "activity-button plugin-ribbon-button";
+    button.title = action.title;
+    button.setAttribute("aria-label", action.title);
+    button.dataset.icon = action.icon ?? "";
+    button.innerHTML = '<svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3 21 12 12 21 3 12Z"/><circle cx="12" cy="12" r="2"/></svg>';
+    button.addEventListener("click", () => void action.run().catch((error) => console.error("Plugin ribbon action failed", error)));
+    host.append(button);
+  }
+}
+
+function renderPluginStatusItems(): void {
+  const host = document.getElementById("plugin-status-items");
+  if (!host) return;
+  host.replaceChildren();
+  for (const item of pluginManager?.statusItems() ?? []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "plugin-status-item";
+    button.textContent = item.text;
+    button.title = item.title;
+    button.hidden = !item.text;
+    button.addEventListener("click", () => void item.run().catch((error) => console.error("Plugin status action failed", error)));
+    host.append(button);
   }
 }
 
