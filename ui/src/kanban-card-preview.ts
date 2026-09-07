@@ -12,6 +12,7 @@ import { hydrateMarkdownImages } from "./image-embed";
 import { hydrateNoteEmbeds } from "./note-embed";
 import { hydrateMermaid } from "./mermaid";
 import { hydrateCsvFences } from "./csv-view";
+import { createNotePreviewHeader } from "./note-preview-header";
 import type { KanbanCard } from "./kanban";
 
 type OpenFile = { path: string; content: string };
@@ -193,10 +194,15 @@ async function renderNotePreview(
   openLink: (target: string) => void,
 ): Promise<void> {
   const title = file.path.split("/").pop()?.replace(/\.md$/i, "") || file.path;
-  const head = document.createElement("div");
-  head.className = "kanban-card-preview-head";
-  head.title = file.path;
-  head.textContent = title;
+  const head = createNotePreviewHeader({
+    className: "kanban-card-preview-head",
+    title,
+    path: file.path,
+    onOpen: () => {
+      dismissKanbanCardPreview();
+      openLink(file.path);
+    },
+  });
   const page = document.createElement("div");
   page.className = "kanban-card-preview-page preview";
   page.innerHTML = renderPreview(file.content);
@@ -217,12 +223,6 @@ async function renderNotePreview(
   hydrateTableOfContents(page);
   el.replaceChildren(head, page);
 
-  // Click title to open the note
-  head.style.cursor = "pointer";
-  head.addEventListener("click", () => {
-    dismissKanbanCardPreview();
-    openLink(file.path);
-  });
 }
 
 function ensurePopup(): HTMLElement {

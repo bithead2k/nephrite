@@ -3200,7 +3200,6 @@ body.kanban-dragging * {
 }
 
 .link-preview-head {
-  overflow: hidden;
   padding: 0.55rem 0.75rem;
   border-bottom: 1px solid var(--border);
   color: var(--accent);
@@ -3208,6 +3207,48 @@ body.kanban-dragging * {
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.note-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.note-preview-head-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-preview-open-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1.7rem;
+  height: 1.7rem;
+  margin-left: auto;
+  padding: 0.2rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.note-preview-open-button:hover,
+.note-preview-open-button:focus-visible {
+  border-color: var(--accent);
+  background: var(--bg-hover);
+  outline: none;
+}
+
+.note-preview-open-icon {
+  width: 1rem;
+  height: 1rem;
 }
 
 .link-preview-page {
@@ -3247,6 +3288,198 @@ body.kanban-dragging * {
   border-style: solid none none;
   border-color: #52657d transparent transparent;
   margin: 1.35em 0;
+}
+
+.preview .footnote-ref {
+  position: relative;
+  top: -0.35em;
+  margin-inline: 0.08em;
+  font-size: 0.72em;
+  line-height: 0;
+  vertical-align: baseline;
+}
+
+.preview .footnote-ref a,
+.preview .footnote-backref {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.preview .footnote-ref a:hover,
+.preview .footnote-ref a:focus-visible,
+.preview .footnote-backref:hover,
+.preview .footnote-backref:focus-visible {
+  text-decoration: underline;
+}
+
+.preview .footnotes {
+  margin-top: 2rem;
+  color: var(--muted);
+  font-size: 0.88em;
+}
+
+.preview .footnotes hr {
+  width: 30%;
+  margin: 0 0 0.8rem;
+}
+
+.preview .footnotes ol {
+  padding-left: 1.5rem;
+}
+
+.preview .footnote-item {
+  padding-left: 0.15rem;
+  scroll-margin-block: 25vh;
+}
+
+.preview .footnote-content {
+  display: inline;
+}
+
+.preview .footnote-content > :first-child {
+  display: inline;
+}
+
+.preview .footnote-content > :last-child {
+  margin-bottom: 0;
+}
+
+.preview .footnote-backrefs {
+  margin-left: 0.4em;
+  white-space: nowrap;
+}
+
+.preview .footnote-ref:focus,
+.preview .footnote-item:focus {
+  border-radius: 3px;
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 3px;
+}
+
+.preview .footnote-missing a {
+  color: #e9ad55;
+  text-decoration: wavy underline;
+  text-decoration-thickness: 1px;
+}
+
+.footnote-hover-preview {
+  position: fixed;
+  z-index: 2200;
+  width: min(28rem, calc(100vw - 24px));
+  max-height: min(18rem, calc(100vh - 24px));
+  overflow: auto;
+  padding: 0.7rem 0.85rem;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 96%, black);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 38%);
+  font-size: 0.86rem;
+}
+
+.footnote-hover-preview > strong {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.footnote-hover-preview .footnote-content > :first-child,
+.footnote-hover-preview .footnote-content > :last-child {
+  margin-block: 0;
+}
+
+.preview .footnote-warnings {
+  margin: 1rem 0;
+  padding: 0.7rem 0.85rem;
+  color: #e9ad55;
+  background: rgb(233 173 85 / 8%);
+  border: 1px solid rgb(233 173 85 / 35%);
+  border-radius: 7px;
+  font-size: 0.82rem;
+}
+
+.preview .footnote-warnings ul {
+  margin: 0.4rem 0 0;
+  padding-left: 1.25rem;
+}
+
+.footnote-composer {
+  position: fixed;
+  z-index: 2400;
+  width: min(34rem, calc(100vw - 24px));
+  padding: 0.7rem;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  border-radius: 9px;
+  box-shadow: 0 16px 42px rgb(0 0 0 / 45%);
+}
+
+.footnote-composer-header,
+.footnote-composer-footer {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.footnote-composer-header {
+  justify-content: space-between;
+  margin-bottom: 0.55rem;
+}
+
+.footnote-composer-close {
+  width: 1.8rem;
+  height: 1.8rem;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  font-size: 1.25rem;
+}
+
+.footnote-composer-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 5.5rem;
+  resize: vertical;
+  padding: 0.55rem 0.65rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  line-height: 1.4;
+}
+
+.footnote-composer-footer {
+  margin-top: 0.55rem;
+}
+
+.footnote-composer-footer span {
+  flex: 1;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.footnote-composer-footer .footnote-composer-warning {
+  color: #e9ad55;
+}
+
+.footnote-composer-style,
+.footnote-composer-save {
+  padding: 0.38rem 0.55rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.footnote-composer-save {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
 }
 
 .command-footer {

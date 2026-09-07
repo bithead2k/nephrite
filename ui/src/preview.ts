@@ -3,6 +3,10 @@ import { renderPropertiesHtml, splitFrontmatter } from "./frontmatter";
 import { blockHash, splitMarkdownBlocks } from "./preview-blocks";
 import { renderMarkdownMath } from "./math";
 import { applyPandocInlineCodeAttrs } from "./pandoc-attrs";
+import { prepareFootnoteRender, type FootnoteDefinition, type FootnoteWarning } from "./footnotes";
+
+let footnoteHover: HTMLElement | null = null;
+let footnoteHoverTimer: number | null = null;
 
 marked.setOptions({
   gfm: true,
@@ -39,12 +43,15 @@ export function renderPreview(
     html += props;
   }
 
+  const footnotes = prepareFootnoteRender(body);
   // Fence-aware blocks: trivial edits can replace a single .md-block node.
   try {
-    const blocks = splitMarkdownBlocks(body);
+    const blocks = splitMarkdownBlocks(footnotes.markdown);
     for (let index = 0; index < blocks.length; index++) {
       html += renderBlockHtml(blocks[index], index);
     }
+    html += renderFootnoteSection(footnotes.definitions);
+    html += renderFootnoteWarnings(footnotes.warnings);
   } catch {
     html += `<pre class="preview-error">${escapeHtml(body)}</pre>`;
   }
@@ -61,6 +68,7 @@ function renderTocMarkers(html: string): string {
 }
 
 export function hydrateTableOfContents(root: ParentNode): void {
+  hydrateFootnoteLinks(root);
   hideEmptyContentSections(root);
   const outlines = root.querySelectorAll<HTMLElement>(".table-of-contents");
   if (outlines.length === 0) return;
@@ -94,6 +102,62 @@ export function hydrateTableOfContents(root: ParentNode): void {
       });
     });
   });
+}
+
+export function hydrateFootnoteLinks(root: ParentNode): void {
+  root.querySelectorAll<HTMLAnchorElement>("a[data-footnote-target], a[data-footnote-backref]")
+    .forEach((link) => {
+      if (link.dataset.footnoteBound === "1") return;
+      link.dataset.footnoteBound = "1";
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        const targetId = link.dataset.footnoteTarget ?? link.dataset.footnoteBackref;
+        if (!targetId) return;
+        const target = root.querySelector<HTMLElement>(`#${targetId}`);
+        target?.scrollIntoView({ behavior: "smooth", block: "center" });
+        target?.focus({ preventScroll: true });
+      });
+      if (link.dataset.footnoteTarget) {
+        link.addEventListener("mouseenter", () => showFootnoteHover(root, link));
+        link.addEventListener("mouseleave", scheduleFootnoteHoverHide);
+        link.addEventListener("focus", () => showFootnoteHover(root, link));
+        link.addEventListener("blur", scheduleFootnoteHoverHide);
+      }
+    });
+}
+
+function showFootnoteHover(root: ParentNode, link: HTMLAnchorElement): void {
+  if (footnoteHoverTimer != null) window.clearTimeout(footnoteHoverTimer);
+  const targetId = link.dataset.footnoteTarget;
+  const content = targetId ? root.querySelector<HTMLElement>(`#${targetId} .footnote-content`) : null;
+  if (!content) return;
+  footnoteHover?.remove();
+  const popup = document.createElement("aside");
+  popup.className = "footnote-hover-preview";
+  popup.setAttribute("role", "tooltip");
+  popup.innerHTML = `<strong>Footnote ${escapeHtml(link.textContent?.trim() || "")}</strong>`;
+  popup.append(content.cloneNode(true));
+  popup.addEventListener("mouseenter", () => {
+    if (footnoteHoverTimer != null) window.clearTimeout(footnoteHoverTimer);
+  });
+  popup.addEventListener("mouseleave", scheduleFootnoteHoverHide);
+  document.body.append(popup);
+  const anchor = link.getBoundingClientRect();
+  const bounds = popup.getBoundingClientRect();
+  const margin = 10;
+  popup.style.left = `${Math.max(margin, Math.min(anchor.left, window.innerWidth - bounds.width - margin))}px`;
+  const below = anchor.bottom + 8;
+  popup.style.top = `${below + bounds.height <= window.innerHeight - margin ? below : Math.max(margin, anchor.top - bounds.height - 8)}px`;
+  footnoteHover = popup;
+}
+
+function scheduleFootnoteHoverHide(): void {
+  if (footnoteHoverTimer != null) window.clearTimeout(footnoteHoverTimer);
+  footnoteHoverTimer = window.setTimeout(() => {
+    footnoteHover?.remove();
+    footnoteHover = null;
+    footnoteHoverTimer = null;
+  }, 140);
 }
 
 /**
@@ -311,4 +375,33 @@ export function renderBlockHtml(block: string, index: number): string {
   } catch {
     return `<div class="md-block" data-block-index="${index}" data-block-hash="${blockHash(block)}"><pre class="preview-error">${escapeHtml(block)}</pre></div>`;
   }
+}
+
+function renderFootnoteSection(definitions: FootnoteDefinition[]): string {
+  if (!definitions.length) return "";
+  const items = definitions.map((definition) => {
+    const math = renderMarkdownMath(definition.markdown);
+    const withLinks = replaceWikilinksOutsideCode(math.markdown);
+    const rendered = marked.parse(withLinks, { async: false }) as string;
+    const content = applyPandocInlineCodeAttrs(
+      math.restore(renderTocMarkers(renderCallouts(rendered))),
+    );
+    const backlinks = definition.referenceIds.map((referenceId, index) =>
+      `<a class="footnote-backref" href="#${referenceId}" data-footnote-backref="${referenceId}" ` +
+      `aria-label="Return to footnote ${definition.number} reference${definition.referenceIds.length > 1 ? ` ${index + 1}` : ""}">↩</a>`,
+    ).join(" ");
+    return `<li id="fn-${definition.number}" class="footnote-item" tabindex="-1">` +
+      `<div class="footnote-content">${content}</div>` +
+      `<span class="footnote-backrefs">${backlinks}</span></li>`;
+  }).join("");
+  return `<section class="footnotes" aria-label="Footnotes"><hr><ol>${items}</ol></section>`;
+}
+
+function renderFootnoteWarnings(warnings: FootnoteWarning[]): string {
+  if (!warnings.length) return "";
+  const items = warnings.map((warning) =>
+    `<li class="footnote-warning footnote-warning-${warning.kind}">${escapeHtml(warning.message)}</li>`,
+  ).join("");
+  return `<aside class="footnote-warnings" role="status" aria-label="Footnote warnings">` +
+    `<strong>Footnote warnings</strong><ul>${items}</ul></aside>`;
 }

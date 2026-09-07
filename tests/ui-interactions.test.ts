@@ -59,6 +59,9 @@ import {
 } from "../ui/src/preview-print";
 import { bindImmediateKanbanDrag } from "../ui/src/kanban-drag";
 import { bindImmediateTreeDrag } from "../ui/src/tree-drag";
+import { createNotePreviewHeader } from "../ui/src/note-preview-header";
+import { openFootnoteComposer } from "../ui/src/footnote-composer";
+import { footnoteEditTarget } from "../ui/src/footnotes";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -83,6 +86,115 @@ Object.defineProperties(globalThis, {
 
 dom.window.HTMLElement.prototype.scrollIntoView = () => {};
 dom.window.alert = () => {};
+
+test("note preview header opens its underlying note from the upper-right action", () => {
+  let opened = 0;
+  const head = createNotePreviewHeader({
+    className: "link-preview-head",
+    title: "Bible Reading",
+    path: "Journal/Bible Reading.md",
+    onOpen: () => { opened += 1; },
+  });
+
+  assert.equal(head.classList.contains("note-preview-head"), true);
+  assert.equal(head.querySelector(".note-preview-head-title")?.textContent, "Bible Reading");
+  const button = head.querySelector<HTMLButtonElement>(".note-preview-open-button");
+  assert.equal(button?.textContent, "");
+  assert.ok(button?.querySelector("svg.note-preview-open-icon"));
+  assert.equal(button?.getAttribute("aria-label"), "Open Bible Reading in editor");
+  button?.click();
+  assert.equal(opened, 1);
+});
+
+test("footnotes render as linked superscripts with return links", () => {
+  const preview = document.createElement("main");
+  preview.innerHTML = renderPreview([
+    "A claim[^source] with a repeated reference[^source].",
+    "",
+    "[^source]: Supporting detail",
+    "  continued on another line.",
+  ].join("\n"));
+  document.body.append(preview);
+  hydrateTableOfContents(preview);
+
+  const references = preview.querySelectorAll<HTMLElement>("sup.footnote-ref");
+  const definition = preview.querySelector<HTMLElement>("#fn-1");
+  assert.equal(references.length, 2);
+  assert.equal(references[0].textContent, "1");
+  assert.equal(references[1].textContent, "1");
+  assert.match(definition?.textContent ?? "", /Supporting detail.*continued on another line/);
+  assert.ok(definition?.querySelector("br"));
+  assert.equal(definition?.querySelectorAll(".footnote-backref").length, 2);
+
+  let definitionScrolled = 0;
+  let referenceScrolled = 0;
+  if (definition) definition.scrollIntoView = () => { definitionScrolled += 1; };
+  references[0].scrollIntoView = () => { referenceScrolled += 1; };
+  references[0].querySelector<HTMLAnchorElement>("a")?.click();
+  assert.equal(definitionScrolled, 1);
+  assert.equal(document.activeElement, definition);
+  definition?.querySelector<HTMLAnchorElement>(".footnote-backref")?.click();
+  assert.equal(referenceScrolled, 1);
+  assert.equal(document.activeElement, references[0]);
+  preview.remove();
+});
+
+test("footnote-looking text in code remains literal", () => {
+  const preview = document.createElement("main");
+  preview.innerHTML = renderPreview([
+    "`[^code]` and a real note[^real].",
+    "",
+    "```text",
+    "[^fenced]: not a definition",
+    "```",
+    "",
+    "[^real]: Real detail",
+  ].join("\n"));
+  assert.equal(preview.querySelectorAll(".footnote-ref").length, 1);
+  assert.match(preview.querySelector("code")?.textContent ?? "", /\[\^code\]/);
+  assert.match(preview.textContent ?? "", /\[\^fenced\]: not a definition/);
+});
+
+test("inline footnotes render with hover previews", () => {
+  const preview = document.createElement("main");
+  preview.innerHTML = renderPreview("Claim.^[An *inline* detail with [a link](https://example.com).]");
+  document.body.append(preview);
+  hydrateTableOfContents(preview);
+  const marker = preview.querySelector<HTMLAnchorElement>(".footnote-ref a");
+  assert.equal(marker?.textContent, "1");
+  assert.equal(preview.querySelector(".footnote-content em")?.textContent, "inline");
+  marker?.dispatchEvent(new dom.window.MouseEvent("mouseenter"));
+  const hover = document.querySelector<HTMLElement>(".footnote-hover-preview");
+  assert.match(hover?.textContent ?? "", /An inline detail/);
+  assert.equal(hover?.querySelector<HTMLAnchorElement>('a[href="https://example.com"]')?.textContent, "a link");
+  hover?.remove();
+  preview.remove();
+});
+
+test("footnote warnings identify broken document references", () => {
+  const preview = document.createElement("main");
+  preview.innerHTML = renderPreview("Used[^same] missing[^gone].\n\n[^same]: First\n[^same]: Second\n[^orphan]: Unused");
+  const warnings = preview.querySelector(".footnote-warnings")?.textContent ?? "";
+  assert.match(warnings, /same.*2 definitions/);
+  assert.match(warnings, /gone.*no definition/);
+  assert.match(warnings, /orphan.*never referenced/);
+  assert.ok(preview.querySelector(".footnote-missing"));
+});
+
+test("marker-side composer saves with Ctrl+Enter and exposes both styles", async () => {
+  const source = "Claim here.";
+  const resultPromise = openFootnoteComposer(footnoteEditTarget(source, 5), null);
+  const composer = document.querySelector<HTMLFormElement>(".footnote-composer");
+  const input = composer?.querySelector<HTMLTextAreaElement>("textarea");
+  const style = composer?.querySelector<HTMLSelectElement>("select");
+  assert.ok(composer && input && style);
+  assert.equal(style.hidden, false);
+  style.value = "reference";
+  input.value = "A source note";
+  input.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }));
+  assert.deepEqual(await resultPromise, { content: "A source note", style: "reference" });
+  assert.equal(document.querySelector(".footnote-composer"), null);
+});
 
 test("empty rendered sections and journal goals collapse and stay out of the TOC", () => {
   const preview = document.createElement("main");

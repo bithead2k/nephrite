@@ -93,6 +93,8 @@ import {
   withoutScrollSync,
 } from "./scroll-sync";
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
+import { footnoteEditTarget, footnoteNavigationTarget, planFootnoteEdit } from "./footnotes";
+import { openFootnoteComposer } from "./footnote-composer";
 import {
   beginKanbanDragPreviewSuppression,
   bindKanbanCardPreview,
@@ -950,6 +952,7 @@ async function renderShell() {
   $("btn-template").addEventListener("click", () => void showTemplatePanel());
   document.addEventListener("keydown", (event) => {
     if (event.defaultPrevented) return;
+    if (event.target instanceof Element && event.target.closest(".hotkey-row, .footnote-composer")) return;
     const commands = commandCatalog(false);
     const id = shortcuts.match(event, commands.map((command) => command.id));
     if (!id) return;
@@ -5161,6 +5164,45 @@ function renderPluginStatusItems(): void {
   }
 }
 
+async function insertFootnoteAtCursor(): Promise<void> {
+  if (!editor || !currentPath || currentFileKind !== "markdown") {
+    void uiAlert("Open a Markdown note to insert a footnote.");
+    return;
+  }
+  const activeEditor = editor;
+  const markdown = activeEditor.getDoc();
+  const target = footnoteEditTarget(markdown, activeEditor.getSelectionRange().to);
+  const result = await openFootnoteComposer(target, activeEditor.cursorCoords(target.anchor));
+  if (!result) {
+    activeEditor.focus();
+    return;
+  }
+  if (activeEditor.getDoc() !== markdown) {
+    void uiAlert("The note changed while the footnote editor was open. Open it again to avoid overwriting newer text.");
+    return;
+  }
+  const edit = planFootnoteEdit(markdown, target, result.content, result.style);
+  activeEditor.applyChanges(edit.changes, edit.cursor);
+  activeEditor.setCursor(edit.cursor);
+  activeEditor.enterInsertMode();
+  setTransientStatus(edit.description, "#5ecf9a");
+}
+
+function navigateFootnote(action: "next" | "previous" | "definition" | "marker"): void {
+  if (!editor || !currentPath || currentFileKind !== "markdown") {
+    void uiAlert("Open a Markdown note to navigate its footnotes.");
+    return;
+  }
+  const target = footnoteNavigationTarget(editor.getDoc(), editor.getCursor(), action);
+  if (target == null) {
+    setTransientStatus(action === "definition" ? "This footnote has no definition" : "No footnotes in this note", "#e9ad55");
+    return;
+  }
+  editor.setCursor(target);
+  editor.focus();
+  setTransientStatus(`Footnote ${action}`, "#7bb7e8");
+}
+
 function commandCatalog(includeFiles: boolean): AppCommand[] {
   const commands: AppCommand[] = [
     { id: "save", title: "Save current file", keywords: "write", run: () => saveFile(false) },
@@ -5194,6 +5236,16 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     { id: "bookmarks", title: "Open bookmarks", run: showBookmarksPanel },
     { id: "git", title: "Open Git history", keywords: "versions source control", run: showGitPanel },
     { id: "templates", title: "Apply template", keywords: "templater automation", run: showTemplatePanel },
+    {
+      id: "insert-footnote",
+      title: "Insert footnote",
+      keywords: "markdown inline reference definition citation edit",
+      run: () => void insertFootnoteAtCursor(),
+    },
+    { id: "footnote-next", title: "Footnote: Next marker", keywords: "citation navigate", run: () => navigateFootnote("next") },
+    { id: "footnote-previous", title: "Footnote: Previous marker", keywords: "citation navigate", run: () => navigateFootnote("previous") },
+    { id: "footnote-definition", title: "Footnote: Go to definition", keywords: "citation navigate down", run: () => navigateFootnote("definition") },
+    { id: "footnote-marker", title: "Footnote: Return to marker", keywords: "citation navigate back up", run: () => navigateFootnote("marker") },
     { id: "attendance", title: "Insert attendance list", keywords: "people company tag roster check-in", run: () => void showAttendancePanel() },
     { id: "today", title: "Open today's journal", keywords: "daily note", run: openToday },
     { id: "daily-calendar", title: "Daily notes calendar", keywords: "journal month", run: showDailyCalendar },

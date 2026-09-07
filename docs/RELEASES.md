@@ -6,6 +6,8 @@ otherwise.
 
 ## Release notes
 
+- [0.12.0](release-0.12.md) — dramatically improved footnotes and direct
+  navigation from note-preview popups.
 - [0.11.0](release-0.11.md) — journal visibility, preview printing, faster
   drag interactions, and reusable context menus.
 - [0.10.0](release-0.10.md) — faster pane switching, retained pane state,

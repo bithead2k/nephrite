@@ -3,6 +3,8 @@
  * Full-document parse remains the fallback when structure shifts.
  */
 
+import { hasFootnoteSyntax } from "./footnotes";
+
 export type BlockPlan =
   | { kind: "full"; reason: string }
   | { kind: "noop" }
@@ -154,6 +156,9 @@ export function planPreviewUpdate(
 
   const prev = split(previous);
   const nxt = split(next);
+  if (prev.body !== nxt.body && (hasFootnoteSyntax(prev.body) || hasFootnoteSyntax(nxt.body))) {
+    return { kind: "full", reason: "footnotes" };
+  }
   const bodyPlan = planBlockUpdate(prev.body, nxt.body);
 
   if (bodyPlan.kind === "full") return bodyPlan;

@@ -7,6 +7,11 @@ export const DEFAULT_SHORTCUTS: ShortcutMap = {
   search: "Mod+Shift+F",
   find: "Mod+F",
   templates: "Mod+Y",
+  "insert-footnote": "Alt+F",
+  "footnote-next": "Alt+]",
+  "footnote-previous": "Alt+[",
+  "footnote-definition": "Alt+ArrowDown",
+  "footnote-marker": "Alt+ArrowUp",
   "reopen-tab": "Mod+Shift+T",
   "refresh-pane": "F5",
 };

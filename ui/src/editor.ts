@@ -849,6 +849,19 @@ export class NephriteEditor {
     this.view.dispatch({ selection: { anchor }, scrollIntoView: true });
   }
 
+  cursorCoords(position = this.getCursor()): DOMRect | null {
+    const anchor = Math.max(0, Math.min(position, this.view.state.doc.length));
+    const coords = this.view.coordsAtPos(anchor);
+    return coords ? new DOMRect(coords.left, coords.top, coords.right - coords.left, coords.bottom - coords.top) : null;
+  }
+
+  enterInsertMode() {
+    this.view.focus();
+    if (!this.vimOn) return;
+    const cm = getCM(this.view);
+    if (cm && !cm.state.vim?.insertMode) Vim.handleKey(cm as CodeMirrorV, "a", "user");
+  }
+
   /** Apply a surgical source edit while retaining the current selection. */
   replaceRange(from: number, to: number, insert: string) {
     if (from < 0 || to < from || to > this.view.state.doc.length) return;

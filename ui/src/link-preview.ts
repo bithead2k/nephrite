@@ -12,6 +12,7 @@ import { hydrateMarkdownImages } from "./image-embed";
 import { hydrateNoteEmbeds } from "./note-embed";
 import { hydrateMermaid } from "./mermaid";
 import { hydrateCsvFences } from "./csv-view";
+import { createNotePreviewHeader } from "./note-preview-header";
 import type { OpenFile } from "./types";
 
 type BindOptions = {
@@ -117,10 +118,15 @@ async function showPreview(
     if (id !== requestId || activeLink !== link) return;
     popupFromPath = file.path;
     const title = file.path.split("/").pop()?.replace(/\.md$/i, "") || file.path;
-    const head = document.createElement("div");
-    head.className = "link-preview-head";
-    head.title = file.path;
-    head.textContent = title;
+    const head = createNotePreviewHeader({
+      className: "link-preview-head",
+      title,
+      path: file.path,
+      onOpen: () => {
+        dismissLinkPreview();
+        options.openLink(file.path);
+      },
+    });
     const page = document.createElement("div");
     page.className = "link-preview-page preview";
     page.innerHTML = renderPreview(file.content);

@@ -84,7 +84,15 @@ import {
   updateTaskMetadataLine,
 } from "../ui/src/task-dashboard";
 import { filterCommands } from "../ui/src/command-bar";
-import { normalizeShortcut } from "../ui/src/shortcuts";
+import { DEFAULT_SHORTCUTS, normalizeShortcut } from "../ui/src/shortcuts";
+import {
+  footnoteEditTarget,
+  footnoteNavigationTarget,
+  nextFootnoteId,
+  planFootnoteEdit,
+  planFootnoteInsertion,
+  scanFootnotes,
+} from "../ui/src/footnotes";
 import {
   automationVariables,
   expandAutomationText,
@@ -1538,6 +1546,89 @@ test("shortcut assignments normalize cross-platform modifier aliases", () => {
   assert.equal(normalizeShortcut("cmd+p"), "Meta+P");
   assert.equal(normalizeShortcut("mod + alt + k"), "Mod+Alt+K");
   assert.equal(normalizeShortcut("F5"), "F5");
+});
+
+test("Alt+F is the available default for inserting a footnote", () => {
+  assert.equal(DEFAULT_SHORTCUTS["insert-footnote"], "Alt+F");
+  assert.deepEqual(
+    Object.entries(DEFAULT_SHORTCUTS)
+      .filter(([, shortcut]) => normalizeShortcut(shortcut) === "Alt+F")
+      .map(([id]) => id),
+    ["insert-footnote"],
+  );
+});
+
+test("footnote insertion allocates the next number and appends its definition", () => {
+  const source = "Alpha[^1]\n\n[^1]: Existing\n\nOmega";
+  assert.equal(nextFootnoteId(source), 2);
+  const plan = planFootnoteInsertion(source, 5);
+  assert.deepEqual(plan.changes, [
+    { from: 5, to: 5, insert: "[^2]" },
+    { from: source.length, to: source.length, insert: "\n\n[^2]: " },
+  ]);
+  assert.equal(plan.cursor, source.length + "[^2]\n\n[^2]: ".length);
+});
+
+test("footnote insertion at EOF remains one valid editor change", () => {
+  const source = "Claim.";
+  const plan = planFootnoteInsertion(source, source.length);
+  assert.deepEqual(plan.changes, [
+    { from: source.length, to: source.length, insert: "[^1]\n\n[^1]: " },
+  ]);
+  assert.equal(plan.cursor, source.length + "[^1]\n\n[^1]: ".length);
+});
+
+test("footnote edits force a full preview render so references stay synchronized", () => {
+  const before = "Claim[^source].\n\n[^source]: Original";
+  const after = "Claim[^source].\n\n[^source]: Updated";
+  assert.deepEqual(planPreviewUpdate(before, after, splitFrontmatter), {
+    kind: "full",
+    reason: "footnotes",
+  });
+});
+
+test("inline footnotes scan, edit, and navigate without leaving the paragraph", () => {
+  const source = "First^[inline *note*] and second[^named].\n\n[^named]: Named note";
+  const scanned = scanFootnotes(source);
+  assert.deepEqual(scanned.references.map(({ kind, label }) => ({ kind, label })), [
+    { kind: "inline", label: "inline-1" },
+    { kind: "reference", label: "named" },
+  ]);
+  assert.deepEqual(scanned.warnings, []);
+
+  const inline = footnoteEditTarget(source, source.indexOf("inline"));
+  const edit = planFootnoteEdit(source, inline, "updated note");
+  assert.deepEqual(edit.changes, [{ from: source.indexOf("^["), to: source.indexOf("]") + 1, insert: "^[updated note]" }]);
+  assert.equal(edit.cursor, source.indexOf("^[") + "^[updated note]".length);
+  assert.equal(footnoteNavigationTarget(source, 0, "next"), source.indexOf("^["));
+  assert.equal(footnoteNavigationTarget(source, source.indexOf("^["), "next"), source.indexOf("[^named]"));
+  assert.equal(footnoteNavigationTarget(source, source.indexOf("[^named]"), "definition"), source.indexOf("[^named]:"));
+  assert.equal(footnoteNavigationTarget(source, source.indexOf("[^named]:"), "marker"), source.indexOf("[^named]"));
+});
+
+test("the footnote composer plans inline by default and reference style on request", () => {
+  const source = "A useful claim.";
+  const target = footnoteEditTarget(source, 1);
+  assert.deepEqual(planFootnoteEdit(source, target, "Small aside"), {
+    changes: [{ from: 1, to: 1, insert: "^[Small aside]" }],
+    cursor: 1 + "^[Small aside]".length,
+    description: "Inserted inline footnote",
+  });
+  const reference = planFootnoteEdit(source, target, "Longer source", "reference");
+  assert.deepEqual(reference.changes, [
+    { from: 1, to: 1, insert: "[^1]" },
+    { from: source.length, to: source.length, insert: "\n\n[^1]: Longer source" },
+  ]);
+  assert.equal(reference.cursor, 5);
+});
+
+test("footnote diagnostics report missing duplicate and unused definitions", () => {
+  const source = "Used[^dup] and absent[^missing].\n\n[^dup]: one\n[^dup]: two\n[^unused]: orphan";
+  assert.deepEqual(scanFootnotes(source).warnings.map(({ kind, label }) => `${kind}:${label}`).sort(), [
+    "duplicate:dup",
+    "missing:missing",
+    "unused:unused",
+  ]);
 });
 
 test("F5 refresh targets the focused pane", () => {
