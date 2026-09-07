@@ -29,9 +29,21 @@ let activeCard: HTMLElement | null = null;
 let popupOpenLink: ((target: string) => void) | null = null;
 let scrollSuppressUntil = 0;
 let scrollSuppressTimer: ReturnType<typeof setTimeout> | null = null;
+let dragSuppressed = false;
 
 export function isKanbanPreviewSuppressed(now = performance.now()): boolean {
-  return now < scrollSuppressUntil;
+  return dragSuppressed || now < scrollSuppressUntil;
+}
+
+/** A drag must never launch the expensive linked-note hover renderer. */
+export function beginKanbanDragPreviewSuppression(): void {
+  dragSuppressed = true;
+  dismissKanbanCardPreview();
+}
+
+export function endKanbanDragPreviewSuppression(cooldownMs = 500): void {
+  dragSuppressed = false;
+  suppressKanbanCardPreview(cooldownMs);
 }
 
 /** Drop an in-flight hover preview and ignore new hovers until scrolling stops. */

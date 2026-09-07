@@ -13,7 +13,8 @@ import {
   type CtxTarget,
 } from "../ui/src/context-menu";
 import { hydrateNoteEmbeds } from "../ui/src/note-embed";
-import { renderPreview } from "../ui/src/preview";
+import { hydrateTableOfContents, renderBlockHtml, renderPreview } from "../ui/src/preview";
+import { splitMarkdownBlocks } from "../ui/src/preview-blocks";
 import { applyAppearanceFonts, normalizeAppearanceFonts } from "../ui/src/appearance";
 import { pluginIframeDocument, type PluginDescriptor } from "../ui/src/plugin-host";
 import { installObsidianDom } from "../ui/src/obsidian-dom";
@@ -48,6 +49,16 @@ import { slashCompletionMatch } from "../ui/src/slash-commands";
 import { hydrateCsvFences, parseCsv } from "../ui/src/csv-view";
 import { parseSimpleYaml } from "../ui/src/structured-view";
 import { isAudioPath, isBasePath, isCsvPath, isStructuredPath, isVideoPath } from "../ui/src/file-kinds";
+import {
+  bindPreviewPrintMenu,
+  accessiblePrintColor,
+  printablePreviewHtml,
+  previewPrintTitle,
+  PRINT_PAGE_CSS,
+  stagePrintDocument,
+} from "../ui/src/preview-print";
+import { bindImmediateKanbanDrag } from "../ui/src/kanban-drag";
+import { bindImmediateTreeDrag } from "../ui/src/tree-drag";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -72,6 +83,151 @@ Object.defineProperties(globalThis, {
 
 dom.window.HTMLElement.prototype.scrollIntoView = () => {};
 dom.window.alert = () => {};
+
+test("empty rendered sections and journal goals collapse and stay out of the TOC", () => {
+  const preview = document.createElement("main");
+  preview.innerHTML = renderPreview([
+    "[toc]",
+    "",
+    "# Filled",
+    "Visible text",
+    "",
+    "# Interstitial",
+    "",
+    "<hr>",
+    "",
+    "# Later",
+    "More text",
+    "",
+    "**Daily goals:**",
+    "",
+    "- [ ] ",
+    "- [ ] ",
+    "",
+    "**Stretch Goals:**",
+    "",
+    "- [ ] ",
+  ].join("\n"));
+  hydrateTableOfContents(preview);
+
+  const headings = [...preview.querySelectorAll<HTMLElement>("h1")];
+  assert.equal(headings.find((heading) => heading.textContent === "Interstitial")?.closest(".md-block")?.hidden, true);
+  assert.deepEqual(
+    [...preview.querySelectorAll(".table-of-contents a")].map((link) => link.textContent),
+    ["Filled", "Later"],
+  );
+  for (const label of ["Daily goals:", "Stretch Goals:"]) {
+    const marker = [...preview.querySelectorAll("strong")].find((strong) => strong.textContent === label);
+    assert.equal(marker?.closest<HTMLElement>("p")?.hidden, true);
+  }
+  assert.equal([...preview.querySelectorAll("ul")].every((list) => list.hidden), true);
+});
+
+test("empty query mounts collapse but query errors remain visible", () => {
+  const preview = document.createElement("main");
+  preview.innerHTML = '<div class="dv-block"></div><div class="dv-block"><pre class="dv-error">Query failed</pre></div>';
+  hydrateTableOfContents(preview);
+  const blocks = preview.querySelectorAll<HTMLElement>(".dv-block");
+  assert.equal(blocks[0].hidden, true);
+  assert.equal(blocks[1].hidden, false);
+  blocks[0].textContent = "Birthday result";
+  hydrateTableOfContents(preview);
+  assert.equal(blocks[0].hidden, false);
+});
+
+test("an incrementally replaced goal list restores its hidden section label", () => {
+  const empty = "**Daily goals:**\n\n- [ ] \n- [ ] ";
+  const filled = "**Daily goals:**\n\n- [ ] Call Ada\n- [ ] ";
+  const preview = document.createElement("main");
+  preview.innerHTML = renderPreview(empty);
+  hydrateTableOfContents(preview);
+  const label = preview.querySelector<HTMLElement>("strong")?.closest<HTMLElement>("p");
+  assert.equal(label?.hidden, true);
+
+  const filledBlocks = splitMarkdownBlocks(filled);
+  const currentList = preview.querySelector<HTMLElement>('.md-block[data-block-index="1"]');
+  assert.ok(currentList);
+  const replacement = document.createElement("template");
+  replacement.innerHTML = renderBlockHtml(filledBlocks[1], 1);
+  currentList.replaceWith(replacement.content.firstElementChild!);
+  hydrateTableOfContents(preview);
+
+  assert.equal(label?.hidden, false);
+  assert.match(preview.textContent ?? "", /Call Ada/);
+});
+
+function pointerEvent(
+  type: string,
+  init: MouseEventInit & { pointerId?: number; isPrimary?: boolean } = {},
+): PointerEvent {
+  const event = new dom.window.MouseEvent(type, { bubbles: true, cancelable: true, ...init });
+  Object.defineProperties(event, {
+    pointerId: { value: init.pointerId ?? 1 },
+    isPrimary: { value: init.isPrimary ?? true },
+  });
+  return event as unknown as PointerEvent;
+}
+
+test("kanban drag acquires after three pixels and activates a lane synchronously", () => {
+  document.body.innerHTML = `
+    <section class="kanban-col" data-col="0"><div class="kanban-cards"><article class="kanban-card"><button>Card</button></article></div></section>
+    <section class="kanban-col" data-col="1"><div class="kanban-cards" id="target"></div></section>`;
+  const card = document.querySelector<HTMLElement>(".kanban-card");
+  const target = document.querySelector<HTMLElement>("#target");
+  assert.ok(card && target);
+  Object.defineProperty(document, "elementFromPoint", {
+    configurable: true,
+    value: () => target,
+  });
+  const drops: Array<[number, number, number]> = [];
+  let acquired = 0;
+  bindImmediateKanbanDrag(card, { fromCol: 0, fromIdx: 2 }, {
+    onAcquire: () => { acquired += 1; },
+    onDrop: (origin, toCol) => drops.push([origin.fromCol, origin.fromIdx, toCol]),
+  });
+
+  card.querySelector("button")?.dispatchEvent(pointerEvent("pointerdown", {
+    button: 0,
+    clientX: 10,
+    clientY: 10,
+  }));
+  window.dispatchEvent(pointerEvent("pointermove", { clientX: 12, clientY: 10 }));
+  assert.equal(card.classList.contains("dragging"), false);
+  window.dispatchEvent(pointerEvent("pointermove", { clientX: 13, clientY: 10 }));
+  assert.equal(acquired, 1);
+  assert.equal(card.classList.contains("dragging"), true);
+  assert.ok(document.querySelector(".kanban-drag-ghost"));
+  assert.equal(target.classList.contains("drag-over"), true);
+  window.dispatchEvent(pointerEvent("pointerup", { clientX: 13, clientY: 10 }));
+  assert.deepEqual(drops, [[0, 2, 1]]);
+  assert.equal(target.classList.contains("drag-over"), false);
+  assert.equal(document.querySelector(".kanban-drag-ghost"), null);
+  assert.equal(card.draggable, false);
+});
+
+test("vault tree drag acquires immediately and highlights a folder target", () => {
+  document.body.innerHTML = `
+    <div id="file-tree"><button class="tree-file" data-path="A.md">A</button>
+    <button class="tree-folder" data-path="Archive">Archive</button></div>`;
+  const file = document.querySelector<HTMLElement>(".tree-file");
+  const folder = document.querySelector<HTMLElement>(".tree-folder");
+  assert.ok(file && folder);
+  Object.defineProperty(document, "elementFromPoint", {
+    configurable: true,
+    value: () => folder,
+  });
+  const drops: Array<[string, string]> = [];
+  bindImmediateTreeDrag(file, "A.md", {
+    onDrop: (from, target) => drops.push([from, target]),
+  });
+  file.dispatchEvent(pointerEvent("pointerdown", { button: 0, clientX: 5, clientY: 5 }));
+  window.dispatchEvent(pointerEvent("pointermove", { clientX: 8, clientY: 5 }));
+  assert.equal(file.classList.contains("dragging"), true);
+  assert.equal(folder.classList.contains("tree-drop"), true);
+  window.dispatchEvent(pointerEvent("pointerup", { clientX: 8, clientY: 5 }));
+  assert.deepEqual(drops, [["A.md", "Archive"]]);
+  assert.equal(folder.classList.contains("tree-drop"), false);
+});
 
 test("a bundled CommonJS Obsidian plugin receives the inherited app bootstrap", () => {
   const descriptor: PluginDescriptor = {
@@ -204,6 +360,114 @@ test("a mounted file-tab menu exposes file actions without redundant open action
   rename.click();
   assert.deepEqual(selected, [{ action: "rename", target }]);
   assert.equal(menu.classList.contains("hidden"), true);
+});
+
+test("right-clicking a preview offers to print the current rendered document", () => {
+  document.body.replaceChildren();
+  const preview = document.createElement("div");
+  preview.innerHTML = "<h1>First note</h1>";
+  document.body.append(preview);
+  const printed: Array<{ root: HTMLElement; path: string }> = [];
+  bindPreviewPrintMenu(preview, "journals/2026_08_19.md", (root, path) => {
+    printed.push({ root, path });
+  });
+
+  preview.dispatchEvent(new MouseEvent("contextmenu", {
+    bubbles: true,
+    cancelable: true,
+    clientX: 20,
+    clientY: 30,
+  }));
+  const print = [...document.querySelectorAll<HTMLButtonElement>(".ctx-item")]
+    .find((button) => button.textContent === "Print current document…");
+  assert.ok(print);
+  print.click();
+  assert.deepEqual(printed, [{ root: preview, path: "journals/2026_08_19.md" }]);
+
+  bindPreviewPrintMenu(preview, "journals/2026_08_20.md", (root, path) => {
+    printed.push({ root, path });
+  });
+  preview.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+  const updatedPrint = [...document.querySelectorAll<HTMLButtonElement>(".ctx-item")]
+    .find((button) => button.textContent === "Print current document…");
+  assert.ok(updatedPrint);
+  updatedPrint.click();
+  assert.equal(printed.at(-1)?.path, "journals/2026_08_20.md");
+});
+
+test("printable preview defaults frontmatter off and can include it explicitly", () => {
+  const preview = document.createElement("div");
+  preview.innerHTML = [
+    '<details class="props-block"><summary>Properties</summary><div>reading_date</div></details>',
+    '<div class="dv-block"><table><tbody><tr><td>Live result</td></tr></tbody></table></div>',
+    '<input type="checkbox">',
+    '<div class="hidden">stale result</div>',
+  ].join("");
+  const checkbox = preview.querySelector<HTMLInputElement>("input");
+  assert.ok(checkbox);
+  checkbox.checked = true;
+
+  const bodyOnly = printablePreviewHtml(preview);
+  assert.doesNotMatch(bodyOnly, /props-block/);
+  const html = printablePreviewHtml(preview, { includeFrontmatter: true });
+  assert.match(html, /<details class="props-block"[^>]*open=""/);
+  assert.match(html, /Live result/);
+  assert.match(html, /checked=""/);
+  assert.doesNotMatch(html, /stale result/);
+  assert.equal(previewPrintTitle("People/Ada Lovelace.md"), "Ada Lovelace");
+});
+
+test("print colors preserve hue while making screen colors paper-readable", () => {
+  assert.equal(accessiblePrintColor("rgb(20, 90, 70)"), "rgb(20, 90, 70)");
+  const brightGreen = accessiblePrintColor("rgb(90, 240, 170)");
+  assert.ok(brightGreen);
+  assert.notEqual(brightGreen, "rgb(0, 0, 0)");
+  assert.notEqual(brightGreen, "rgb(90, 240, 170)");
+});
+
+test("printing stages only the preview in the top-level document", () => {
+  document.body.replaceChildren();
+  document.title = "Nephrite";
+  const app = document.createElement("main");
+  app.textContent = "application chrome";
+  document.body.append(app);
+
+  const staged = stagePrintDocument(
+    document,
+    "Ada Lovelace",
+    '<h1>Ada</h1><section style="color: rgb(210, 255, 225); background-color: rgb(5, 30, 20)">Rendered query result</section><table><tbody><tr><td>one</td></tr><tr><td>two</td></tr></tbody></table><aside class="callout" style="background-color: rgb(5, 20, 45)"><div class="callout-title" style="color: rgb(80, 150, 255); background-color: rgb(20, 50, 90)">Info</div></aside>',
+    ".preview { color: black; }",
+  );
+  assert.equal(document.title, "Ada Lovelace");
+  assert.equal(document.body.classList.contains("nephrite-printing"), true);
+  assert.match(staged.root.innerHTML, /Rendered query result/);
+  const paperSection = staged.root.querySelector<HTMLElement>("section");
+  assert.ok(paperSection);
+  assert.notEqual(paperSection.style.color, "rgb(210, 255, 225)");
+  assert.notEqual(paperSection.style.backgroundColor, "rgb(5, 30, 20)");
+  const style = document.querySelector<HTMLStyleElement>("style[data-nephrite-print-stage]");
+  assert.ok(style);
+  assert.match(style.textContent ?? "", /body\.nephrite-printing/);
+  assert.match(style.textContent ?? "", /\.preview \{ color: black; \}/);
+  assert.match(style.textContent ?? "", /color-scheme: light/);
+  assert.match(PRINT_PAGE_CSS, /@page \{ margin: 0\.5in 0; \}/);
+  assert.match(PRINT_PAGE_CSS, /padding-left: 0\.5in !important;/);
+  assert.match(PRINT_PAGE_CSS, /padding-right: 0\.5in !important;/);
+  assert.match(PRINT_PAGE_CSS, /font-size: 10pt/);
+  const rows = staged.root.querySelectorAll<HTMLTableCellElement>("tbody td");
+  assert.equal(rows[0]?.style.backgroundColor, "rgb(255, 255, 255)");
+  assert.equal(rows[1]?.style.backgroundColor, "rgb(241, 244, 243)");
+  assert.equal(
+    staged.root.querySelector<HTMLElement>(".callout-title")?.style.backgroundColor,
+    "rgb(255, 255, 255)",
+  );
+
+  staged.cleanup();
+  assert.equal(document.title, "Nephrite");
+  assert.equal(document.body.classList.contains("nephrite-printing"), false);
+  assert.equal(document.querySelector(".nephrite-print-stage"), null);
+  assert.equal(document.querySelector("style[data-nephrite-print-stage]"), null);
+  assert.equal(document.body.contains(app), true);
 });
 
 test("the mounted command bar filters and executes the keyboard-selected command", () => {

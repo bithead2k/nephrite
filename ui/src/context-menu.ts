@@ -117,7 +117,10 @@ function itemsFor(target: CtxTarget): MenuItem[] {
 let menuEl: HTMLDivElement | null = null;
 
 function ensureMenu(): HTMLDivElement {
-  if (menuEl) return menuEl;
+  if (menuEl) {
+    if (!menuEl.isConnected) document.body.appendChild(menuEl);
+    return menuEl;
+  }
   menuEl = document.createElement("div");
   menuEl.className = "ctx-menu hidden";
   menuEl.setAttribute("role", "menu");

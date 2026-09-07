@@ -61,11 +61,13 @@ function renderTocMarkers(html: string): string {
 }
 
 export function hydrateTableOfContents(root: ParentNode): void {
+  hideEmptyContentSections(root);
   const outlines = root.querySelectorAll<HTMLElement>(".table-of-contents");
   if (outlines.length === 0) return;
 
   const counts = new Map<string, number>();
-  const headings = Array.from(root.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6"));
+  const headings = Array.from(root.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6"))
+    .filter((heading) => heading.textContent?.trim() && !heading.closest("[hidden]"));
   const entries = headings.map((heading) => {
     const label = heading.textContent?.trim() || "Section";
     const base = slugify(label) || "section";
@@ -92,6 +94,105 @@ export function hydrateTableOfContents(root: ParentNode): void {
       });
     });
   });
+}
+
+/**
+ * Collapse preview-only sections whose rendered body has no content. This runs
+ * after query hydration, so an empty Dataview result is treated as empty while
+ * errors and real results remain visible. Source Markdown is never changed.
+ */
+export function hideEmptyContentSections(root: ParentNode): void {
+  root.querySelectorAll<HTMLElement>('[data-empty-section-hidden="true"]').forEach((element) => {
+    element.hidden = false;
+    delete element.dataset.emptySectionHidden;
+  });
+
+  root.querySelectorAll<HTMLElement>(".dv-block").forEach((block) => {
+    setEmptySectionHidden(block, !hasRenderedContent(block));
+  });
+
+  hideEmptyGoalLists(root);
+
+  const headings = Array.from(root.querySelectorAll<HTMLElement>("h1, h2, h3, h4, h5, h6"));
+  const children = directElementChildren(root);
+  const sections = headings.map((heading) => ({
+    heading,
+    level: Number(heading.tagName.slice(1)),
+    block: directChildContaining(root, heading),
+  }));
+
+  // Work from the bottom up so an empty child section cannot make its parent
+  // appear populated merely because it contains another heading.
+  for (let index = sections.length - 1; index >= 0; index--) {
+    const section = sections[index];
+    if (!section.block) continue;
+    const start = children.indexOf(section.block);
+    if (start < 0) continue;
+    let end = children.length;
+    for (let next = index + 1; next < sections.length; next++) {
+      if (sections[next].level <= section.level && sections[next].block) {
+        end = children.indexOf(sections[next].block!);
+        break;
+      }
+    }
+    if (end < start) continue;
+    const hasContent = children.slice(start, end).some((block) => hasRenderedContent(block));
+    if (!hasContent) {
+      children.slice(start, end).forEach((block) => setEmptySectionHidden(block, true));
+    }
+  }
+}
+
+function hideEmptyGoalLists(root: ParentNode): void {
+  const flow = Array.from(root.querySelectorAll<HTMLElement>(
+    "strong, ul, ol, h1, h2, h3, h4, h5, h6",
+  ));
+  for (let index = 0; index < flow.length; index++) {
+    const marker = flow[index];
+    if (marker.tagName !== "STRONG") continue;
+    const label = (marker.textContent ?? "").trim().replace(/:\s*$/, "").toLowerCase();
+    if (label !== "daily goals" && label !== "stretch goals") continue;
+
+    let list: HTMLElement | null = null;
+    for (let next = index + 1; next < flow.length; next++) {
+      const candidate = flow[next];
+      if (/^H[1-6]$/.test(candidate.tagName) || candidate.tagName === "STRONG") break;
+      if (candidate.tagName === "UL" || candidate.tagName === "OL") {
+        list = candidate;
+        break;
+      }
+    }
+    if (!list || hasRenderedContent(list)) continue;
+    setEmptySectionHidden(marker.closest<HTMLElement>("p") ?? marker, true);
+    setEmptySectionHidden(list, true);
+  }
+}
+
+function hasRenderedContent(element: HTMLElement): boolean {
+  const clone = element.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll(
+    "h1, h2, h3, h4, h5, h6, hr, nav.table-of-contents, [hidden], input[type=checkbox]",
+  ).forEach((ignored) => ignored.remove());
+  if ((clone.textContent ?? "").trim()) return true;
+  return Boolean(clone.querySelector(
+    "img, video, audio, canvas, svg, iframe, table, .excalidraw-embed, .mermaid",
+  ));
+}
+
+function directElementChildren(root: ParentNode): HTMLElement[] {
+  return Array.from(root.childNodes).filter((node): node is HTMLElement => node.nodeType === 1);
+}
+
+function directChildContaining(root: ParentNode, element: HTMLElement): HTMLElement | null {
+  let current: HTMLElement | null = element;
+  while (current && current.parentNode !== root) current = current.parentElement;
+  return current;
+}
+
+function setEmptySectionHidden(element: HTMLElement, hidden: boolean): void {
+  if (!hidden) return;
+  element.hidden = true;
+  element.dataset.emptySectionHidden = "true";
 }
 
 function slugify(value: string): string {

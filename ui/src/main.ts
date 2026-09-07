@@ -7,6 +7,13 @@ import { hydrateTableOfContents, renderBlockHtml, renderPreview } from "./previe
 import { planPreviewUpdate } from "./preview-blocks";
 import { PreviewWorkerClient } from "./preview-worker-client";
 import { patchPreviewHtml } from "./preview-patch";
+import {
+  bindPreviewPrintMenu,
+  printablePreviewHtml,
+  previewPrintTitle,
+  PRINT_PREVIEW_LABEL,
+  stagePrintDocument,
+} from "./preview-print";
 import { findBooleanPropertyEdit, findScalarPropertyEdit, renderPropertiesHtml, splitFrontmatter, yamlToRows, type PropertyType } from "./frontmatter";
 import { splitWikilinkTarget } from "./wikilinks";
 import {
@@ -86,7 +93,15 @@ import {
   withoutScrollSync,
 } from "./scroll-sync";
 import { bindLinkPreviews, dismissLinkPreview } from "./link-preview";
-import { bindKanbanCardPreview, bindKanbanScrollPreviewGuard, dismissKanbanCardPreview } from "./kanban-card-preview";
+import {
+  beginKanbanDragPreviewSuppression,
+  bindKanbanCardPreview,
+  bindKanbanScrollPreviewGuard,
+  dismissKanbanCardPreview,
+  endKanbanDragPreviewSuppression,
+} from "./kanban-card-preview";
+import { bindImmediateKanbanDrag, type KanbanDragOrigin } from "./kanban-drag";
+import { bindImmediateTreeDrag } from "./tree-drag";
 import { clearKanbanCoverCache, hydrateKanbanCardCovers } from "./kanban-cover";
 import { findNextTaskStatusEdit, hydratePreviewTaskMarkers } from "./tasks";
 import {
@@ -1714,6 +1729,10 @@ async function renderRightPane(text: string, revision: number) {
           htmlCommitMs: Number((performance.now() - commitStarted).toFixed(1)),
           roundTripMs: Number((performance.now() - requestedAt).toFixed(1)),
         });
+        // A changed goal/list block can make a previously empty sibling label
+        // visible. Refresh at the preview root instead of only binding the new
+        // block so cross-block section state and the TOC update immediately.
+        hydrateTableOfContents(previewEl);
         // Bind only; skip full dynamic re-run unless a dirty block has code fences.
         bindPreviewContent(previewEl, path, revision);
         // Scoped dynamics: only re-execute fences inside the replaced .md-block nodes.
@@ -1944,6 +1963,7 @@ function bindPreviewContent(
   const live = liveOverride ?? (() =>
     revision == null || isPreviewRevisionCurrent(path, revision));
   if (!live()) return;
+  bindPreviewPrintMenu(root, path, printRenderedPreview);
   bindPropertiesFoldState(root, path);
   bindQueryUriLinks(root);
   bindExternalLinks(root);
@@ -2066,8 +2086,10 @@ function bindPreviewHeadingExtract(root: HTMLElement, path: string) {
       }
       showItemMenu(event.clientX, event.clientY, [
         { id: "extract-heading", label: "Extract Heading" },
+        { id: "print-document", label: PRINT_PREVIEW_LABEL },
       ], (id) => {
         if (id === "extract-heading") void extractHeadingSectionToNote(section);
+        if (id === "print-document") void printRenderedPreview(root, path);
       });
     });
   });
@@ -2216,26 +2238,9 @@ async function applyPluginPreviewProcessors(html: string, path: string): Promise
   return template.innerHTML;
 }
 
-function acceptKanbanDrop(event: DragEvent, toCol: number): void {
-  event.preventDefault();
-  const raw =
-    event.dataTransfer?.getData("application/x-nephrite-kanban") ||
-    event.dataTransfer?.getData("text/plain") ||
-    "";
-  if (!raw || !kanbanBoard) {
-    setHookStatus("Drop ignored (no drag payload)", true);
-    return;
-  }
-  let fromCol = -1;
-  let fromIdx = -1;
-  try {
-    const parsed = JSON.parse(raw) as { fromCol: number; fromIdx: number };
-    fromCol = parsed.fromCol;
-    fromIdx = parsed.fromIdx;
-  } catch {
-    setHookStatus("Drop ignored (bad payload)", true);
-    return;
-  }
+function moveKanbanCardToColumn(origin: KanbanDragOrigin, toCol: number): void {
+  if (!kanbanBoard) return;
+  const { fromCol, fromIdx } = origin;
   if (fromCol === toCol) return;
   const toIdx = kanbanBoard.columns[toCol].cards.length;
   const card = kanbanBoard.columns[fromCol]?.cards[fromIdx];
@@ -2259,18 +2264,21 @@ function acceptKanbanDrop(event: DragEvent, toCol: number): void {
     columns: prevCols,
     phase: "leave",
   };
+  // Start leave hooks in the documented order, but never hold the interaction
+  // hostage while a user script or plugin performs asynchronous work.
+  const leaveHooks = fireKanbanCardLeft(leaveEv);
+  const nextCols = moveCard(prevCols, fromCol, fromIdx, toCol, toIdx);
+  kanbanBoard = { ...kanbanBoard, columns: nextCols };
+  renderKanbanBoard(kanbanBoard);
+  persistKanban();
+  const landEv: KanbanCardMovedEvent = {
+    ...leaveEv,
+    columns: nextCols,
+    phase: "land",
+  };
   void (async () => {
     try {
-      await fireKanbanCardLeft(leaveEv);
-      const nextCols = moveCard(prevCols, fromCol, fromIdx, toCol, toIdx);
-      kanbanBoard = { ...kanbanBoard!, columns: nextCols };
-      persistKanban();
-      renderKanbanBoard(kanbanBoard);
-      const landEv: KanbanCardMovedEvent = {
-        ...leaveEv,
-        columns: nextCols,
-        phase: "land",
-      };
+      await leaveHooks;
       await fireKanbanCardMoved(landEv);
       setHookStatus(`Hooks done: ${card.label.slice(0, 40)} → ${toName}`);
     } catch (err) {
@@ -2372,30 +2380,9 @@ function renderKanbanBoard(board: KanbanBoard) {
     list.dataset.col = String(colIdx);
     bindKanbanScrollPreviewGuard(list);
 
-    list.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      list.classList.add("drag-over");
-    });
-    list.addEventListener("dragleave", () => list.classList.remove("drag-over"));
-    colEl.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      if (colEl.classList.contains("kanban-col-collapsed")) colEl.classList.add("drag-over");
-    });
-    colEl.addEventListener("dragleave", (e) => {
-      if (e.relatedTarget instanceof Node && colEl.contains(e.relatedTarget)) return;
-      colEl.classList.remove("drag-over");
-      list.classList.remove("drag-over");
-    });
-    colEl.addEventListener("drop", (e) => {
-      list.classList.remove("drag-over");
-      colEl.classList.remove("drag-over");
-      acceptKanbanDrop(e, colIdx);
-    });
-
     col.cards.forEach((card, cardIdx) => {
       const cardEl = document.createElement("article");
       cardEl.className = "kanban-card" + (card.checked ? " done" : "");
-      cardEl.draggable = true;
       cardEl.dataset.col = String(colIdx);
       cardEl.dataset.idx = String(cardIdx);
       cardEl.dataset.searchMatch = "false";
@@ -2410,15 +2397,11 @@ function renderKanbanBoard(board: KanbanBoard) {
         if (card.link) void openWikilink(card.link);
       });
 
-      cardEl.addEventListener("dragstart", (e) => {
-        const payload = JSON.stringify({ fromCol: colIdx, fromIdx: cardIdx });
-        // text/plain required — many engines blank custom MIME types on drop
-        e.dataTransfer?.setData("text/plain", payload);
-        e.dataTransfer?.setData("application/x-nephrite-kanban", payload);
-        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-        cardEl.classList.add("dragging");
+      bindImmediateKanbanDrag(cardEl, { fromCol: colIdx, fromIdx: cardIdx }, {
+        onPress: beginKanbanDragPreviewSuppression,
+        onRelease: () => endKanbanDragPreviewSuppression(),
+        onDrop: moveKanbanCardToColumn,
       });
-      cardEl.addEventListener("dragend", () => cardEl.classList.remove("dragging"));
 
       cardEl.appendChild(label);
       bindKanbanCardPreview(cardEl, card, {
@@ -3225,17 +3208,6 @@ function renderTree() {
 
 function installTreeHostListeners(host: HTMLElement): void {
   if (!claimOneTimeBinding(host.dataset, "hostListenersBound")) return;
-  host.addEventListener("dragover", (event) => {
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  });
-  host.addEventListener("drop", (event) => {
-    if (event.target !== host) return;
-    event.preventDefault();
-    const from = event.dataTransfer?.getData("application/x-nephrite-path")
-      || event.dataTransfer?.getData("text/plain");
-    if (from) void moveVaultPath(from, baseName(from));
-  });
   host.addEventListener("contextmenu", (event) => {
     if (event.target !== host) return;
     event.preventDefault();
@@ -3265,27 +3237,13 @@ function bindCtx(el: HTMLElement, target: CtxTarget) {
 }
 
 function bindTreeDrag(el: HTMLElement, path: string, kind: "file" | "folder") {
-  el.draggable = true;
-  el.addEventListener("dragstart", (event) => {
-    event.dataTransfer?.setData("text/plain", path);
-    event.dataTransfer?.setData("application/x-nephrite-path", path);
-    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  el.dataset.path = path;
+  bindImmediateTreeDrag(el, path, {
+    onDrop: (from, folder) => {
+      void moveVaultPath(from, folder ? joinPath(folder, baseName(from)) : baseName(from));
+    },
   });
-  if (kind !== "folder") return;
-  el.addEventListener("dragover", (event) => {
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-    el.classList.add("tree-drop");
-  });
-  el.addEventListener("dragleave", () => el.classList.remove("tree-drop"));
-  el.addEventListener("drop", (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    el.classList.remove("tree-drop");
-    const from = event.dataTransfer?.getData("application/x-nephrite-path")
-      || event.dataTransfer?.getData("text/plain");
-    if (from) void moveVaultPath(from, joinPath(path, baseName(from)));
-  });
+  el.dataset.treeKind = kind;
 }
 
 async function moveVaultPath(from: string, to: string) {
@@ -5034,10 +4992,10 @@ function promptIncludeFrontmatter(): Promise<boolean | null> {
     host.setAttribute("aria-labelledby", "export-pdf-title");
     host.innerHTML = `
       <div class="export-pdf-card">
-        <h2 id="export-pdf-title">Export to PDF</h2>
-        <p>Uses the system print dialog — choose “Save as PDF” as the printer. Page CSS from Preferences is applied.</p>
+        <h2 id="export-pdf-title">Print document</h2>
+        <p>Uses the system print dialog. The rendered page is adapted to a readable paper palette.</p>
         <label class="export-pdf-check">
-          <input type="checkbox" id="export-pdf-frontmatter" checked />
+          <input type="checkbox" id="export-pdf-frontmatter" />
           <span>Include YAML frontmatter (Properties)</span>
         </label>
         <div class="export-pdf-actions">
@@ -5072,43 +5030,52 @@ function promptIncludeFrontmatter(): Promise<boolean | null> {
   });
 }
 
+let pendingPrintCleanup: (() => void) | null = null;
+
 function printHtmlAsPdf(title: string, bodyHtml: string, css: string) {
-  const iframe = document.createElement("iframe");
-  iframe.setAttribute("aria-hidden", "true");
-  iframe.style.cssText =
-    "position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;pointer-events:none";
-  document.body.appendChild(iframe);
-  const doc = iframe.contentDocument;
-  const win = iframe.contentWindow;
-  if (!doc || !win) {
-    iframe.remove();
-    setTransientStatus("Could not open print view", "#e07070");
+  pendingPrintCleanup?.();
+  const staged = stagePrintDocument(document, title, bodyHtml, css);
+  let fallback = 0;
+  const cleanup = () => {
+    window.removeEventListener("afterprint", cleanup);
+    if (fallback) window.clearTimeout(fallback);
+    staged.cleanup();
+    if (pendingPrintCleanup === cleanup) pendingPrintCleanup = null;
+  };
+  pendingPrintCleanup = cleanup;
+  window.addEventListener("afterprint", cleanup, { once: true });
+  // A long fallback only guards webviews that omit afterprint; the staged page
+  // is screen-hidden and must remain alive while the native dialog/spooler reads it.
+  fallback = window.setTimeout(cleanup, 5 * 60_000);
+  requestAnimationFrame(() => {
+    window.setTimeout(() => {
+      try {
+        window.focus();
+        window.print();
+      } catch (error) {
+        cleanup();
+        setTransientStatus(`Could not open print dialog: ${String(error)}`, "#e07070");
+      }
+    }, 50);
+  });
+}
+
+async function printRenderedPreview(root: HTMLElement, path: string) {
+  if (!path) {
+    setTransientStatus("Open a document to print", "#e07070");
     return;
   }
-  const safeTitle = title.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  doc.open();
-  doc.write(
-    `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${safeTitle}</title>` +
-      `<style>${css}</style></head>` +
-      `<body class="preview print-export">${bodyHtml}</body></html>`,
+  const include = await promptIncludeFrontmatter();
+  if (include == null) return;
+  printHtmlAsPdf(
+    previewPrintTitle(path),
+    printablePreviewHtml(root, { includeFrontmatter: include }),
+    collectExportCss(),
   );
-  doc.close();
-  const trigger = () => {
-    try {
-      win.focus();
-      win.print();
-    } finally {
-      window.setTimeout(() => iframe.remove(), 1500);
-    }
-  };
-  // Images/fonts may still be settling; print after a paint.
-  if (doc.readyState === "complete") {
-    requestAnimationFrame(() => setTimeout(trigger, 50));
-  } else {
-    iframe.addEventListener("load", () => requestAnimationFrame(() => setTimeout(trigger, 50)), {
-      once: true,
-    });
-  }
+  setTransientStatus(
+    include ? "Print dialog opened (with frontmatter)" : "Print dialog opened (body only)",
+    "#5ecf9a",
+  );
 }
 
 async function exportCurrentPagePdf() {
