@@ -151,7 +151,7 @@ Single version: **`PROJECT_VERSION`** (`MAJOR.MINOR`). See [docs/versioning.md](
 - [docs/decisions.md](docs/decisions.md) — engineering decisions  
 - [docs/compatibility.md](docs/compatibility.md) — Obsidian compatibility surface  
 - [docs/vault-schema.md](docs/vault-schema.md) — index design  
-- [docs/release-0.2.md](docs/release-0.2.md) — 0.2 feature details
+- [docs/RELEASES.md](docs/RELEASES.md) — release history and version notes
 
 ## Safety test
 
