@@ -16,7 +16,7 @@ use crate::error::{IndexError, Result};
 /// Cargo workspace version should match as `MAJOR.MINOR.0`.
 pub const PROJECT_VERSION: Version = Version {
     major: 0,
-    minor: 13,
+    minor: 14,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
