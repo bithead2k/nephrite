@@ -2,6 +2,7 @@ mod page_sql;
 mod plugins;
 mod postgres_compat;
 mod state;
+mod sync;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
@@ -19,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State};
+use sync::{SyncConfigureRequest, SyncLoginRequest, SyncManager, SyncSnapshot};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -923,6 +925,14 @@ pub struct VaultChangeEvent {
     pub paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFilenameWarning {
+    pub path: String,
+    pub participants: Vec<String>,
+    pub reason: String,
+}
+
 /// Archive-bit pass: only dirty watcher paths. On-screen dirty files go last.
 /// Already-current files (mtime/size match) are a no-op so a save echo cannot
 /// reparse the open editor note.
@@ -985,6 +995,121 @@ fn event_dirty_paths(root: &Path, event: &Event) -> HashSet<String> {
         }
     }
     dirty
+}
+
+fn sync_filename_issue(relative: &str) -> Option<(Vec<String>, String)> {
+    let mut participants = HashSet::new();
+    let mut reasons = Vec::new();
+    for component in relative.split('/') {
+        let invalid = component
+            .chars()
+            .filter(|character| "\\:*?\"<>|".contains(*character) || character.is_control())
+            .collect::<Vec<_>>();
+        if invalid.contains(&':') {
+            participants.insert("ob on Linux/macOS".to_string());
+            participants.insert("Obsidian Sync on Windows/Android".to_string());
+        }
+        if invalid
+            .iter()
+            .any(|character| "*?\"<>".contains(*character))
+        {
+            participants.insert("Obsidian Sync on Windows/Android".to_string());
+        }
+        if invalid
+            .iter()
+            .any(|character| "\\|".contains(*character) || character.is_control())
+        {
+            participants.insert("Obsidian Sync on Windows".to_string());
+        }
+        if !invalid.is_empty() {
+            let characters = invalid
+                .iter()
+                .map(|character| character.escape_default().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            reasons.push(format!(
+                "“{component}” contains unsupported character(s): {characters}."
+            ));
+        }
+        if component.ends_with('.') || component.ends_with(' ') {
+            participants.insert("Obsidian Sync on Windows".to_string());
+            reasons.push(format!("“{component}” ends with a dot or space."));
+        }
+        let device_name = component.split('.').next().unwrap_or(component);
+        let reserved = matches!(
+            device_name.to_ascii_uppercase().as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        );
+        if reserved {
+            participants.insert("Obsidian Sync on Windows".to_string());
+            reasons.push(format!(
+                "“{component}” uses a Windows reserved device name."
+            ));
+        }
+        if component.encode_utf16().count() > 255 {
+            participants.insert("Obsidian Sync on Windows".to_string());
+            reasons.push(format!(
+                "“{component}” exceeds Windows' 255-character component limit."
+            ));
+        }
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    let mut participants = participants.into_iter().collect::<Vec<_>>();
+    participants.sort();
+    Some((participants, reasons.join(" ")))
+}
+
+fn sync_filename_warnings(root: &Path, event: &Event) -> Vec<SyncFilenameWarning> {
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    ) {
+        return Vec::new();
+    }
+    event
+        .paths
+        .iter()
+        .filter(|path| path.exists())
+        .filter_map(|path| {
+            let relative = path
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative.starts_with(".nephrite/") || relative.starts_with(".git/") {
+                return None;
+            }
+            let (participants, reason) = sync_filename_issue(&relative)?;
+            Some(SyncFilenameWarning {
+                path: relative,
+                participants,
+                reason,
+            })
+        })
+        .collect()
 }
 
 /// Watcher path → vault-relative file. Directories are not expanded; inotify
@@ -1083,6 +1208,7 @@ fn start_vault_watcher(
                 Err(_) => return,
             };
             let mut dirty = event_dirty_paths(&root, &first);
+            let mut filename_warnings = sync_filename_warnings(&root, &first);
             let mut deadline = Instant::now() + WATCH_DEBOUNCE;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1091,6 +1217,7 @@ fn start_vault_watcher(
                 }
                 match receiver.recv_timeout(remaining) {
                     Ok(Ok(event)) => {
+                        filename_warnings.extend(sync_filename_warnings(&root, &event));
                         let extra = event_dirty_paths(&root, &event);
                         if !extra.is_empty() {
                             dirty.extend(extra);
@@ -1101,6 +1228,11 @@ fn start_vault_watcher(
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
+            }
+            filename_warnings.sort_by(|left, right| left.path.cmp(&right.path));
+            filename_warnings.dedup_by(|left, right| left.path == right.path);
+            if !filename_warnings.is_empty() {
+                let _ = app.emit("sync-filename-warning", filename_warnings);
             }
             if !apply_archive_bits(
                 &app,
@@ -1114,6 +1246,27 @@ fn start_vault_watcher(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod sync_filename_tests {
+    use super::sync_filename_issue;
+
+    #[test]
+    fn portable_sync_names_accept_normal_vault_paths() {
+        assert!(sync_filename_issue("meetings/KJ 1-1 - 2023-02-27.md").is_none());
+    }
+
+    #[test]
+    fn portable_sync_names_explain_colons_and_windows_names() {
+        let (participants, reason) = sync_filename_issue("meetings/K:J 1:1.md").unwrap();
+        assert!(participants.iter().any(|name| name.starts_with("ob ")));
+        assert!(reason.contains(':'));
+
+        let (participants, reason) = sync_filename_issue("archive/CON.md").unwrap();
+        assert_eq!(participants, ["Obsidian Sync on Windows"]);
+        assert!(reason.contains("reserved device name"));
+    }
 }
 
 /// Toolbar refresh reindexes on-screen pages only. The watcher owns dirty bits.
@@ -5897,14 +6050,79 @@ fn shell_command(
     }
 }
 
+#[tauri::command]
+fn sync_state(state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    let root = vault_root(&state)?;
+    Ok(sync::snapshot(&root, &state.sync))
+}
+
+#[tauri::command]
+fn sync_install_ob(state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    let root = vault_root(&state)?;
+    sync::install_ob()?;
+    Ok(sync::snapshot(&root, &state.sync))
+}
+
+#[tauri::command]
+fn sync_login(
+    request: SyncLoginRequest,
+    state: State<'_, AppState>,
+) -> Result<SyncSnapshot, String> {
+    let root = vault_root(&state)?;
+    sync::login(request)?;
+    Ok(sync::snapshot(&root, &state.sync))
+}
+
+#[tauri::command]
+fn sync_configure(
+    request: SyncConfigureRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SyncSnapshot, String> {
+    let root = vault_root(&state)?;
+    sync::configure(app, &root, &state.sync, request)?;
+    Ok(sync::snapshot(&root, &state.sync))
+}
+
+#[tauri::command]
+fn sync_set_continuous(
+    continuous: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SyncSnapshot, String> {
+    let root = vault_root(&state)?;
+    sync::set_continuous(app, &root, &state.sync, continuous)?;
+    Ok(sync::snapshot(&root, &state.sync))
+}
+
+#[tauri::command]
+fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    let root = vault_root(&state)?;
+    sync::sync_once(app, &root, &state.sync)?;
+    Ok(sync::snapshot(&root, &state.sync))
+}
+
+#[tauri::command]
+fn sync_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    let root = vault_root(&state)?;
+    state.sync.stop(Some(&app));
+    let settings = sync::load_settings(&root);
+    let snapshot = sync::snapshot(&root, &state.sync);
+    if settings.continuous && snapshot.settings_saved && snapshot.configured {
+        state.sync.start(app, root.clone(), true)?;
+    }
+    Ok(sync::snapshot(&root, &state.sync))
+}
+
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             index: Arc::new(Mutex::new(None)),
             visible: Arc::new(VisiblePages::new()),
             watcher_generation: Arc::new(AtomicU64::new(0)),
+            sync: SyncManager::default(),
         })
         .invoke_handler(tauri::generate_handler![
             project_version,
@@ -5974,9 +6192,21 @@ pub fn run() {
             git_continue,
             git_abort,
             render_vim_powerline,
+            sync_state,
+            sync_install_ob,
+            sync_login,
+            sync_configure,
+            sync_set_continuous,
+            sync_now,
+            sync_open_vault,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Nephrite");
+        .build(tauri::generate_context!())
+        .expect("error while building Nephrite");
+    app.run(|handle, event| {
+        if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+            handle.state::<AppState>().sync.stop(None);
+        }
+    });
 }
 
 #[cfg(test)]

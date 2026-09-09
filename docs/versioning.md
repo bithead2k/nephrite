@@ -58,8 +58,8 @@ When the app crate exists, it imports or re-exports the same `PROJECT_VERSION`�
 
 ## Current release
 
-**`PROJECT_VERSION` = `0.12`** — the current public milestone. This is a minor
-upgrade from 0.11, so opening an existing 0.11 index does not force a full rebuild.
+**`PROJECT_VERSION` = `0.13`** — the current public milestone. This is a minor
+upgrade from 0.12, so opening an existing 0.12 index does not force a full rebuild.
 Named feature backfills (for example typed Dataview inline fields) still run
 when pending and resume if interrupted.
 When the earlier 0.2 milestone opened an index written by the internal 2.0

@@ -1,3 +1,4 @@
+use crate::sync::SyncManager;
 use nephrite_index::VaultIndex;
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -32,4 +33,5 @@ pub struct AppState {
     /// Incrementing this value retires the watcher for the previously opened
     /// vault without requiring a blocking thread join on the UI command.
     pub watcher_generation: Arc<AtomicU64>,
+    pub sync: SyncManager,
 }

@@ -652,6 +652,25 @@ test("the persistent Powerline command prompt stays mounted and executes command
   assert.equal(input.value, "");
 });
 
+test("the persistent command bar shows provider-neutral sync activity and success", () => {
+  document.body.replaceChildren();
+  const host = document.createElement("footer");
+  document.body.append(host);
+  let opened = 0;
+  const prompt = renderPersistentCommandBar(host, () => [], undefined, () => { opened += 1; });
+  const status = host.querySelector<HTMLButtonElement>(".command-bar-sync-status");
+  assert.ok(status);
+  assert.equal(status.hidden, true);
+  prompt.setSyncStatus({ phase: "syncing", message: "Uploading notes", active: true, synced: false });
+  assert.equal(status.hidden, false);
+  assert.equal(status.classList.contains("sync-syncing"), true);
+  status.click();
+  assert.equal(opened, 1);
+  prompt.setSyncStatus({ phase: "synced", message: "Fully synced", active: true, synced: true });
+  assert.equal(status.classList.contains("sync-synced"), true);
+  assert.equal(status.title, "Fully synced");
+});
+
 test("a leading bang clears the prompt, executes shell code, and displays its output", async () => {
   document.body.replaceChildren();
   const host = document.createElement("footer");

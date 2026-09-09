@@ -44,6 +44,12 @@ export type VaultChangeEvent = {
   paths: string[];
 };
 
+export type SyncFilenameWarning = {
+  path: string;
+  participants: string[];
+  reason: string;
+};
+
 export type OpenFile = {
   path: string;
   content: string;

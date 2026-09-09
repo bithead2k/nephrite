@@ -1,6 +1,6 @@
 # Nephrite
 
-**PROJECT_VERSION 0.12** — knowledge that doesn’t fracture.
+**PROJECT_VERSION 0.13** — knowledge that doesn’t fracture.
 
 Open-source, local-first knowledge app. Markdown is storage; the SQLite index is disposable. Opens an existing Obsidian vault without import or conversion.
 
@@ -40,6 +40,10 @@ Markdown on disk is still the store. Indexes and viewers are disposable.
 - **Git:** press **Git** for staging, conflict resolution, upstream status,
   branches, commit details, per-file history, and confirmed version restores.
   Full-file merge UI is started, not a `git mergetool` replacement.
+- **Obsidian Sync:** install, authenticate, configure, and run Obsidian Headless
+  from Nephrite. Continuous sync follows the application lifecycle, the command
+  bar reports live status, and settings compare Obsidian, `ob`, and Nephrite
+  policies. Non-portable filenames are identified when they are created.
 - **Dataview:** DQL and DataviewJS over the index (`dv.pages`, tables, lists,
   tasks, calendars, `dv.view`). Scripts that poke undocumented Obsidian
   internals are not a compatibility target.
@@ -106,10 +110,9 @@ Markdown on disk is still the store. Indexes and viewers are disposable.
 - Attachment inventory, SQL console over the index, nested YAML properties,
   and plugin settings tabs (`addSettingTab` / `Setting`).
 
-Not in core, on purpose: mobile, official sync, a WYSIWYG/block editor,
+Not in core, on purpose: mobile, a WYSIWYG/block editor,
 persisting GFM table column widths, and unsandboxed Node/Electron
-plugin APIs. Use the files (or Unison) for sync. Point databases at `pgsql` +
-Dataview, not another query language.
+plugin APIs. Point databases at `pgsql` + Dataview, not another query language.
 
 ## Requirements
 

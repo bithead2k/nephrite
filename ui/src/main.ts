@@ -168,6 +168,7 @@ import {
   type PluginViewResult,
 } from "./plugin-host";
 import { renderPluginManager } from "./plugin-manager";
+import { loadSyncState, renderSyncPanel, type SyncSnapshot, type SyncStatus } from "./sync-ui";
 import {
   DEFAULT_TASK_VIEW,
   DEFAULT_TASK_SCOPE,
@@ -215,6 +216,7 @@ import type {
   UserVimrc,
   VaultInfo,
   VaultChangeEvent,
+  SyncFilenameWarning,
   VaultOpenPlan,
   VaultOpenProgress,
   ViewMode,
@@ -338,6 +340,7 @@ let refreshInProgress = false;
 let activeOpenPlan: VaultOpenPlan | null = null;
 let vaultChangeQueue: Promise<void> = Promise.resolve();
 let commandPrompt: PersistentCommandBar | null = null;
+let syncSnapshot: SyncSnapshot | null = null;
 let expanded = loadExpanded();
 let treeRoot: TreeNode = { name: "", path: "", kind: "dir", children: [] };
 let kanbanBoard: KanbanBoard | null = null;
@@ -790,6 +793,15 @@ async function renderShell() {
               <button type="button" id="preferences-automation-reload">Reload .nephrite/automations.json</button>
               <button type="button" id="preferences-automation-create">Create example configuration</button>
             </section>
+            <section class="preferences-section">
+              <strong>Sync</strong>
+              <small id="preferences-sync-status">Open a vault to configure sync.</small>
+              <label class="preference-toggle">
+                <input type="checkbox" id="sync-continuous-toggle" disabled />
+                <span>Continuous sync</span>
+              </label>
+              <button type="button" id="preferences-sync-manage">Sync settings…</button>
+            </section>
             <button type="button" id="preferences-hotkeys" class="preferences-action"><span>Keyboard shortcuts…</span></button>
             <button type="button" id="btn-refresh" class="preferences-action" disabled>${activityIcon("refresh")}<span>Rescan Vault</span></button>
           </div>
@@ -894,6 +906,7 @@ async function renderShell() {
     $("persistent-command-bar"),
     () => commandCatalog(true).filter((command) => command.id !== "command"),
     (command) => shFull(command),
+    () => void showSyncPanel(),
   );
 
   $("btn-open").addEventListener("click", () => {
@@ -985,6 +998,18 @@ async function renderShell() {
   });
   $("preferences-automation-reload").addEventListener("click", () => void reloadAutomations(true));
   $("preferences-automation-create").addEventListener("click", () => void createExampleAutomationConfig());
+  $("preferences-sync-manage").addEventListener("click", () => void showSyncPanel());
+  $("sync-continuous-toggle").addEventListener("change", (event) => {
+    const toggle = event.currentTarget as HTMLInputElement;
+    toggle.disabled = true;
+    void invoke<SyncSnapshot>("sync_set_continuous", { continuous: toggle.checked })
+      .then(applySyncSnapshot)
+      .catch((error) => {
+        toggle.checked = !toggle.checked;
+        void uiAlert(`Could not change continuous sync: ${String(error)}`);
+      })
+      .finally(() => { toggle.disabled = !syncSnapshot?.configured; });
+  });
   $("preferences-hotkeys").addEventListener("click", showHotkeysPanel);
   $("preferences-close").addEventListener("click", closePreferences);
   $("preview-css-save").addEventListener("click", savePreviewCssFromEditor);
@@ -1361,6 +1386,7 @@ function togglePreferences() {
   if (opening) {
     loadPreviewCssEditor();
     loadAppearanceFontInputs();
+    void refreshSyncState();
   }
   $("btn-preferences").setAttribute("aria-expanded", opening ? "true" : "false");
   $("btn-preferences").classList.toggle("active", opening);
@@ -2888,6 +2914,11 @@ async function openVaultPath(path: string) {
   await loadDailyNotesSettings();
   await reloadPlugins(info.root);
   await reloadAutomations();
+  try {
+    applySyncSnapshot(await invoke<SyncSnapshot>("sync_open_vault"));
+  } catch (error) {
+    applySyncStatus({ provider: "obsidian_headless", phase: "error", message: `Sync startup failed: ${String(error)}`, active: false, synced: false });
+  }
   // Restore tabs + active note + right pane from last session for this vault.
   await restoreSession(path);
   await runAutomationLifecycle("onVaultOpen");
@@ -3017,6 +3048,18 @@ async function installVaultChangeListener() {
     }),
     listen<VaultOpenProgress>("vault-open-progress", (event) => {
       updateIndexProgress(event.payload);
+    }),
+    listen<SyncStatus>("sync-status-changed", (event) => {
+      applySyncStatus(event.payload);
+    }),
+    listen<SyncFilenameWarning[]>("sync-filename-warning", (event) => {
+      const details = event.payload.map((warning) =>
+        `${warning.path}\nCannot sync with: ${warning.participants.join(", ")}\n${warning.reason}`,
+      );
+      void uiAlert(
+        `This name is not portable across the configured sync clients:\n\n${details.join("\n\n")}`,
+        { title: "File cannot sync everywhere" },
+      );
     }),
   ]);
 }
@@ -5164,6 +5207,39 @@ function renderPluginStatusItems(): void {
   }
 }
 
+function applySyncStatus(status: SyncStatus): void {
+  if (syncSnapshot) syncSnapshot.status = status;
+  commandPrompt?.setSyncStatus(status);
+  const label = document.getElementById("preferences-sync-status");
+  if (label) label.textContent = status.message;
+}
+
+function applySyncSnapshot(snapshot: SyncSnapshot): void {
+  syncSnapshot = snapshot;
+  applySyncStatus(snapshot.status);
+  const toggle = document.getElementById("sync-continuous-toggle") as HTMLInputElement | null;
+  if (toggle) {
+    toggle.checked = snapshot.settings.continuous;
+    toggle.disabled = !snapshot.configured || !snapshot.settingsSaved;
+  }
+}
+
+async function refreshSyncState(): Promise<void> {
+  if (!vaultOpen) return;
+  try { applySyncSnapshot(await loadSyncState()); }
+  catch (error) { applySyncStatus({ provider: "obsidian_headless", phase: "error", message: `Sync unavailable: ${String(error)}`, active: false, synced: false }); }
+}
+
+async function showSyncPanel(): Promise<void> {
+  if (!vaultOpen) {
+    void uiAlert("Open an Obsidian vault before configuring sync.");
+    return;
+  }
+  const body = openFeaturePanel("Sync");
+  await renderSyncPanel(body, (status) => applySyncStatus(status));
+  await refreshSyncState();
+}
+
 async function insertFootnoteAtCursor(): Promise<void> {
   if (!editor || !currentPath || currentFileKind !== "markdown") {
     void uiAlert("Open a Markdown note to insert a footnote.");
@@ -5266,6 +5342,8 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
       editor?.setVim(vimOn);
     } },
     { id: "preferences", title: "Open preferences", keywords: "settings", run: togglePreferences },
+    { id: "sync-settings", title: "Sync settings", keywords: "obsidian headless provider continuous", run: () => void showSyncPanel() },
+    { id: "sync-now", title: "Sync now", keywords: "obsidian headless upload download", run: () => void invoke<SyncSnapshot>("sync_now").then(applySyncSnapshot) },
     { id: "plugins", title: "Manage plugins", keywords: "extensions permissions install browse community", run: () => void showPluginManager() },
     { id: "plugin-settings", title: "Plugin settings", keywords: "obsidian configure options addsettingtab", run: () => void showPluginSettings() },
     { id: "attachments", title: "Open attachments", keywords: "orphans images media inventory", run: () => void showAttachmentsPanel() },

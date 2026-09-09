@@ -6,6 +6,8 @@ otherwise.
 
 ## Release notes
 
+- [0.13.0](release-0.13.md) — integrated Obsidian Sync, provider-neutral sync
+  lifecycle and status, policy comparison, and portable-filename warnings.
 - [0.12.0](release-0.12.md) — dramatically improved footnotes and direct
   navigation from note-preview popups.
 - [0.11.0](release-0.11.md) — journal visibility, preview printing, faster

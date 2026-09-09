@@ -3814,6 +3814,33 @@ body.kanban-dragging * {
 .persistent-command-input:focus {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 65%, transparent);
 }
+.command-bar-sync-status {
+  flex: 0 0 2.2rem;
+  border: 0;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  padding: 0;
+  background: #090f16;
+  cursor: pointer;
+}
+.command-bar-sync-status[hidden] { display: none; }
+.command-bar-sync-status span {
+  display: inline-block;
+  width: 0.62rem;
+  height: 0.62rem;
+  border-radius: 999px;
+  background: #788493;
+  box-shadow: 0 0 0.45rem currentColor;
+}
+.command-bar-sync-status.sync-syncing span,
+.command-bar-sync-status.sync-configuring span {
+  color: #6aa6e8;
+  background: currentColor;
+  animation: nephrite-sync-pulse 1s steps(2, end) infinite;
+}
+.command-bar-sync-status.sync-synced span { color: #5ecf9a; background: currentColor; }
+.command-bar-sync-status.sync-error span { color: #f07878; background: currentColor; }
+@keyframes nephrite-sync-pulse { 50% { opacity: 0.18; } }
 .persistent-command-results {
   position: absolute;
   right: 0;
@@ -3835,6 +3862,30 @@ body.kanban-dragging * {
   white-space: pre-wrap;
 }
 .command-bar-shell-output.error { color: #ff9c9c; }
+
+.sync-settings { display: grid; gap: 0.8rem; }
+.sync-summary { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.7rem; align-items: center; }
+.sync-summary strong { color: #dff8ec; }
+.sync-summary small { color: var(--muted); }
+.sync-form { display: grid; gap: 0.65rem; }
+.sync-form fieldset { display: grid; gap: 0.35rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.65rem; }
+.sync-form legend { color: #dff8ec; padding: 0 0.25rem; }
+.sync-form label { display: grid; gap: 0.25rem; color: var(--muted); font-size: 0.78rem; }
+.sync-form label.preference-toggle { display: flex; }
+.sync-form input[type="text"], .sync-form input[type="email"], .sync-form input[type="password"], .sync-form select {
+  border: 1px solid #53677e; border-radius: 5px; padding: 0.45rem 0.5rem; background: #090e14; color: var(--text);
+}
+.sync-checks { display: flex; flex-wrap: wrap; gap: 0.35rem 0.8rem; }
+.sync-checks label { display: flex; align-items: center; gap: 0.3rem; }
+.sync-actions { display: flex; flex-wrap: wrap; gap: 0.45rem; }
+.sync-message { min-height: 1.2rem; color: var(--muted); }
+.sync-message.error { color: #ff9c9c; }
+.sync-message.success { color: #7bd88f; }
+.sync-policy-list { display: grid; gap: 0.25rem; margin-top: 0.35rem; }
+.sync-policy-list > div { display: grid; grid-template-columns: 5.5rem 1fr; gap: 0.5rem; }
+.sync-policy-list span { color: var(--muted); }
+.sync-policy-differences { margin: 0.45rem 0 0; padding-left: 1.25rem; color: #ffc875; }
+.sync-policy-differences .match { color: #7bd88f; }
 
 .attachment-panel,
 .sql-console,

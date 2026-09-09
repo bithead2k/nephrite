@@ -33,6 +33,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 ureq = "2.12"
 tempfile = "3"
+libc = "0.2"
 
 [dev-dependencies]
 

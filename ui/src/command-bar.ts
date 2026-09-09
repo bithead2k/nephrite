@@ -43,6 +43,14 @@ export type CommandBarContext = {
 export type PersistentCommandBar = {
   focus: () => void;
   refresh: () => void;
+  setSyncStatus: (status: CommandBarSyncStatus | null) => void;
+};
+
+export type CommandBarSyncStatus = {
+  phase: string;
+  message: string;
+  active: boolean;
+  synced: boolean;
 };
 
 export type CommandBarShellResult = {
@@ -71,6 +79,7 @@ export function renderPersistentCommandBar(
   host: HTMLElement,
   commands: () => AppCommand[],
   executeShell?: CommandBarShellExecutor,
+  onSyncClick?: () => void,
 ): PersistentCommandBar {
   host.replaceChildren();
   host.classList.add("command-bar", "persistent-command-bar");
@@ -99,7 +108,14 @@ export function renderPersistentCommandBar(
   input.placeholder = "Type a command, note name, or ! shell command…";
   input.autocomplete = "off";
   input.setAttribute("aria-label", "Nephrite command prompt");
-  row.append(prompt, input);
+  const syncStatus = document.createElement("button");
+  syncStatus.type = "button";
+  syncStatus.className = "command-bar-sync-status";
+  syncStatus.setAttribute("aria-label", "Sync status");
+  syncStatus.hidden = true;
+  syncStatus.innerHTML = '<span aria-hidden="true"></span>';
+  syncStatus.addEventListener("click", () => onSyncClick?.());
+  row.append(prompt, input, syncStatus);
   host.append(results, row);
 
   let catalog: AppCommand[] = [];
@@ -191,6 +207,12 @@ export function renderPersistentCommandBar(
     input.focus();
     input.select();
   };
+  const setSyncStatus = (status: CommandBarSyncStatus | null) => {
+    syncStatus.hidden = !status || status.phase === "off";
+    syncStatus.className = `command-bar-sync-status sync-${status?.phase || "off"}`;
+    syncStatus.title = status?.message || "Sync is off";
+    syncStatus.setAttribute("aria-label", `Sync: ${status?.message || "off"}`);
+  };
 
   prompt.addEventListener("click", focus);
   input.addEventListener("focus", () => {
@@ -223,7 +245,7 @@ export function renderPersistentCommandBar(
     }, 0);
   });
 
-  return { focus, refresh };
+  return { focus, refresh, setSyncStatus };
 }
 
 function commandResult(
