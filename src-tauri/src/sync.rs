@@ -492,42 +492,85 @@ fn save_settings(root: &Path, settings: &SyncSettings) -> Result<(), String> {
 }
 
 pub fn find_ob() -> Option<PathBuf> {
-    find_executable("ob").or_else(|| {
-        let root = PathBuf::from(std::env::var_os("HOME")?).join(".nvm/versions/node");
-        let mut candidates = fs::read_dir(root)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path().join("bin/ob"))
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates.pop()
-    })
+    find_executable("ob")
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(':')
-        .map(Path::new)
-        .map(|dir| dir.join(name))
+// Desktop launchers need not inherit shell initialization or a HOME variable.
+// dirs uses the OS profile API on Windows and the account database on Unix.
+fn executable_directories() -> Vec<PathBuf> {
+    let mut directories = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(home) = dirs::home_dir() {
+        directories.extend([home.join("bin"), home.join(".local/bin")]);
+        let root = std::env::var_os("NVM_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".nvm"))
+            .join("versions/node");
+        if let Ok(entries) = fs::read_dir(root) {
+            let mut versions = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            versions.sort_by_key(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .trim_start_matches('v')
+                    .split('.')
+                    .map(|part| part.parse::<u32>().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            });
+            directories.extend(versions.into_iter().rev().map(|path| path.join("bin")));
+        }
+    }
+    for name in ["NVM_SYMLINK", "NVM_HOME"] {
+        if let Some(path) = std::env::var_os(name) {
+            directories.push(PathBuf::from(path));
+        }
+    }
+    if let Some(path) = std::env::var_os("APPDATA") {
+        directories.push(PathBuf::from(path).join("npm"));
+    }
+    if let Some(path) = std::env::var_os("ProgramFiles") {
+        directories.push(PathBuf::from(path).join("nodejs"));
+    }
+    directories
+}
+
+fn find_in_directories(name: &str, directories: &[PathBuf], windows: bool) -> Option<PathBuf> {
+    let names = if windows {
+        // Prefer native executables or cmd shims over extensionless Unix wrappers.
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            format!("{name}.bat"),
+            name.to_string(),
+        ]
+    } else {
+        vec![name.to_string()]
+    };
+    directories
+        .iter()
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .find(|path| path.is_file())
 }
 
+fn find_executable(name: &str) -> Option<PathBuf> {
+    find_in_directories(name, &executable_directories(), cfg!(windows))
+}
+
 fn augment_path(command: &mut Command) {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let home = PathBuf::from(home);
-    let mut entries = vec![home.join("bin"), home.join(".local/bin")];
+    let mut entries = executable_directories();
     if let Some(ob) = find_ob().and_then(|path| path.parent().map(Path::to_path_buf)) {
         entries.insert(0, ob);
     }
-    let old = std::env::var_os("PATH").unwrap_or_default();
-    let mut path = std::env::join_paths(entries).unwrap_or_default();
-    path.push(":");
-    path.push(old);
-    command.env("PATH", path);
+    if let Ok(path) = std::env::join_paths(entries) {
+        command.env("PATH", path);
+    }
+    if let Some(home) = dirs::home_dir() {
+        command.env("HOME", home);
+    }
 }
 
 fn run_ob(args: &[&str], input: Option<&str>) -> Result<Output, String> {
@@ -582,7 +625,11 @@ fn ensure_success(output: Output, step: &str) -> Result<Output, String> {
     }
 }
 
-fn node_ready() -> bool {
+fn node_ready(provider_installed: bool) -> bool {
+    // An installed provider takes precedence over a stale GUI-launcher PATH.
+    if provider_installed {
+        return true;
+    }
     let mut command = match find_executable("node") {
         Some(path) => Command::new(path),
         None => return false,
@@ -600,7 +647,6 @@ fn node_ready() -> bool {
                 .ok()
         })
         .is_some_and(|major| major >= 22)
-        || find_ob().is_some()
 }
 
 fn remote_vaults() -> Result<Vec<RemoteVault>, String> {
@@ -688,8 +734,8 @@ pub fn snapshot(root: &Path, manager: &SyncManager) -> SyncSnapshot {
         settings,
         status,
         vault_path: root.display().to_string(),
+        node_ready: node_ready(ob_path.is_some()),
         ob_path: ob_path.map(|path| path.display().to_string()),
-        node_ready: node_ready(),
         logged_in,
         configured,
         settings_saved,
@@ -704,17 +750,24 @@ pub fn install_ob() -> Result<(), String> {
     if find_ob().is_some() {
         return Ok(());
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| "Cannot install ob because the home directory is unknown".to_string())?;
-    let nvm = PathBuf::from(&home).join(".nvm/nvm.sh");
-    let output = if nvm.is_file() {
-        Command::new("bash").args(["-lc", "source \"$HOME/.nvm/nvm.sh\" && nvm install 22 && nvm alias default 22 && npm install -g obsidian-headless"])
+    let home = dirs::home_dir();
+    let nvm = std::env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".nvm")))
+        .map(|path| path.join("nvm.sh"));
+    let output = if cfg!(unix) && nvm.as_ref().is_some_and(|path| path.is_file()) {
+        let mut command = Command::new("bash");
+        augment_path(&mut command);
+        command.env("NEPHRITE_NVM_SCRIPT", nvm.as_ref().unwrap())
+            .args(["-c", "source \"$NEPHRITE_NVM_SCRIPT\" && nvm install 22 && nvm alias default 22 && npm install -g obsidian-headless"])
             .output().map_err(|error| format!("Could not run nvm/npm: {error}"))?
     } else {
         let npm = find_executable("npm").ok_or_else(|| {
-            "Node.js 22 and npm are required. Install Node.js 22, then try again.".to_string()
+            "Nephrite could not find npm in PATH or your user installation folders. Install Node.js 22 or newer with npm, then retry installation.".to_string()
         })?;
-        Command::new(npm)
+        let mut command = Command::new(npm);
+        augment_path(&mut command);
+        command
             .args(["install", "-g", "obsidian-headless"])
             .output()
             .map_err(|error| format!("Could not run npm: {error}"))?
@@ -901,6 +954,33 @@ pub fn sync_once(app: AppHandle, root: &Path, manager: &SyncManager) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_provider_clears_node_dependency_warning() {
+        assert!(node_ready(true));
+    }
+
+    #[test]
+    fn discovers_windows_npm_shims_in_profile_paths_with_spaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("User Profile").join("npm");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("ob"), "Unix wrapper").unwrap();
+        fs::write(bin.join("ob.cmd"), "Windows wrapper").unwrap();
+        fs::write(bin.join("npm.cmd"), "npm").unwrap();
+        assert_eq!(
+            find_in_directories("ob", std::slice::from_ref(&bin), true),
+            Some(bin.join("ob.cmd"))
+        );
+        assert_eq!(
+            find_in_directories("npm", std::slice::from_ref(&bin), true),
+            Some(bin.join("npm.cmd"))
+        );
+        assert_eq!(
+            find_in_directories("ob", std::slice::from_ref(&bin), false),
+            Some(bin.join("ob"))
+        );
+    }
 
     #[test]
     fn defaults_do_not_select_large_attachments() {

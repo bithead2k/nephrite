@@ -356,3 +356,73 @@ From `AGENTS.md`, still held unless revised:
 | Date | Change |
 |------|--------|
 | 2026-08-08 | Initial compatibility & product surface from Q&A and author preferences |
+
+## Markdown table justification
+
+Table separator cells support `:---` (left), `:---:` (center), `---:` (right),
+`---` (default left), and the Nephrite extension `-:---:-` (block justified).
+The middle hyphen run may be longer, for example `-:-----------:-`.
+Block justification applies to both headers and body cells in preview, including
+print rendering; the last line is justified too.
+
+Editing a complete table automatically aligns its Markdown source columns.
+Block-justified source cells spread spaces between prose words; spaces inside
+code spans, wikilink aliases, link destinations, and HTML tags are preserved.
+Single-word cells receive padding. The formatter runs on editing transactions,
+including typing, deletion, and paste, rather than polling the vault. Formatting
+and the initiating edit share undo/redo, and carets track their cell content.
+
+Opening, reloading, or navigating a note does not format it. Malformed tables,
+fenced examples, frontmatter, indented code, and HTML blocks are left alone.
+Active IME composition is left undisturbed; subsequent editing formats the table.
+The block marker is a Nephrite extension, not standard GFM/Obsidian alignment;
+other Markdown applications may display such a table as literal source.
+
+### Source table navigation, commands, and repair
+
+In the source editor, Tab selects the next cell and Shift+Tab selects the previous
+cell, skipping the separator. Tab in the final cell adds a body row. Right-click a
+source cell for row/column insertion, duplication, movement, deletion, and column
+alignment. Column movement includes its alignment marker. Table actions are not
+added to live-preview or rendered-preview context menus.
+
+`Inspect / repair table…` opens an editor-attached proposal with Apply and Cancel.
+It can propose missing separators, malformed alignment markers, and rectangular
+rows without dropping excess cells. Literal unescaped pipes are ambiguous: the
+proposal preserves them as cells and explains how to escape them instead. Repair
+never writes without Apply, is undoable, and expires when the document changes.
+Creation stays in the editor through the existing `/table` completion. Spreadsheet paste, formatting, settings, source sorting, and cell-region selection
+are documented in
+[table-editing-design.md](table-editing-design.md).
+
+
+### Formatting, spreadsheet paste, and source sorting
+
+The command palette formats the current table, tables intersecting the selection,
+or all valid tables in the current note. Each operation is one undoable edit;
+malformed tables are reported and skipped. Formatting preserves alignment and row
+order. Preferences → Editor → Tables controls live formatting, padding, Tab
+navigation, visual source wrapping, and preview column width. Saving settings
+never reformats a document.
+
+Spreadsheet TSV or HTML paste opens a source-editor proposal before modifying the
+note. It shows replaced cells and added rows/columns, supports generated headings,
+and offers plain paste or Cancel. Multiline values use `<br>`; literal Markdown
+characters are escaped. Merged HTML cells expand to blank covered cells.
+
+Select table cells from the source context menu or palette, then extend with
+Shift-click or Shift+Arrow. Copy exports TSV; Delete clears content while retaining
+pipes and alignment. Paste starts at the rectangle's top-left and explicitly
+reports dimension mismatches. Escape exits selection mode.
+
+Source context menus and palette commands sort body rows by a column, preserving
+headers and alignment. Numeric columns sort numerically; text uses natural order;
+equal values remain stable and blanks go last. Sorting is one undoable edit.
+
+### Sync dependency discovery
+
+Provider installation resolves the home directory through platform APIs, including
+the account database fallback on Unix. Executable discovery uses platform PATH
+separators and checks user/npm/nvm installation folders and Windows command shims.
+Once `ob` is discovered, the Node.js dependency warning clears on the refreshed
+sync snapshot, even if the desktop launcher's PATH lacks `node`.

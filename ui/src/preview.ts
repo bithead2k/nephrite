@@ -1,4 +1,5 @@
 import { marked } from "marked";
+import { justifiedTableExtension } from "./markdown-tables";
 import { renderPropertiesHtml, splitFrontmatter } from "./frontmatter";
 import { blockHash, splitMarkdownBlocks } from "./preview-blocks";
 import { renderMarkdownMath } from "./math";
@@ -11,6 +12,17 @@ let footnoteHoverTimer: number | null = null;
 marked.setOptions({
   gfm: true,
   breaks: true,
+});
+marked.use({
+  extensions: [justifiedTableExtension],
+  renderer: {
+    tablecell(content, flags) {
+      const tag = flags.header ? "th" : "td";
+      // Explicit alignment must win over the preview's default left-aligned CSS.
+      const alignment = flags.align ? ` align="${flags.align}" style="text-align:${flags.align}"` : "";
+      return `<${tag}${alignment}>${content}</${tag}>\n`;
+    },
+  },
 });
 
 export type RenderPreviewOptions = {

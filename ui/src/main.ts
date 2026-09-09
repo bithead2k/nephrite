@@ -75,6 +75,10 @@ import {
   type CtxAction,
   type CtxTarget,
 } from "./context-menu";
+import { applyTablePreviewSettings, loadTableSettings, renderTableSettings, TABLE_SETTINGS_KEY, type TableSettings } from "./table-settings";
+import { tableAction, tableMenuChoices, sortSourceTable, type TableAction } from "./table-commands";
+import { beginCellSelection } from "./table-selection";
+import { openTableRepair } from "./table-repair";
 import {
   headingSectionAt,
   headingSectionByOccurrence,
@@ -322,6 +326,7 @@ let showDotfiles = localStorage.getItem(DOTFILES_KEY) === "1";
 let vimOn = localStorage.getItem(VIM_KEY) === "1";
 let externalLinksInBrowser = localStorage.getItem(EXTERNAL_BROWSER_KEY) === "1";
 let appearanceFonts = loadAppearanceFonts();
+let tableSettings = loadTableSettings();
 let viewMode: ViewMode = normalizeMode(localStorage.getItem(VIEW_KEY));
 const previewWork = new DeferredDocumentWork(PREVIEW_DELAY_MS);
 const previewRenderer = new PreviewWorkerClient();
@@ -762,6 +767,7 @@ async function renderShell() {
                 <button type="button" id="appearance-font-reset">Reset</button>
               </div>
             </section>
+            <section class="preferences-section" id="table-settings"></section>
             <section class="preferences-section">
               <strong>Task scope</strong>
               <small>Only checkboxes matching at least one configured rule appear in Tasks. Leave all fields empty to include every checkbox.</small>
@@ -902,6 +908,7 @@ async function renderShell() {
     </div>
   `;
   applyAppearanceFonts(appearanceFonts);
+  applyTablePreviewSettings(tableSettings);
   commandPrompt = renderPersistentCommandBar(
     $("persistent-command-bar"),
     () => commandCatalog(true).filter((command) => command.id !== "command"),
@@ -989,6 +996,7 @@ async function renderShell() {
   ($("task-scope-tags") as HTMLInputElement).value = taskScope.tags.join(", ");
   ($("task-scope-property") as HTMLInputElement).value = taskScope.property;
   $("task-scope-save").addEventListener("click", saveTaskScopePreferences);
+  renderTableSettings($("table-settings"), tableSettings, saveTableSettings);
   $("appearance-font-save").addEventListener("click", saveAppearanceFontPreferences);
   $("appearance-font-reset").addEventListener("click", resetAppearanceFontPreferences);
   $("preferences-plugin-reload").addEventListener("click", () => void reloadPlugins().then(renderPreferencesPlugins));
@@ -1275,10 +1283,34 @@ async function initEditor() {
     vimOn,
     userVimrc,
   );
+  editor.setTableSettings(tableSettings);
   editor.view.dom.addEventListener("contextmenu", (event) => {
     if (!editor || currentFileKind !== "markdown") return;
     const pos = editor.view.posAtCoords({ x: event.clientX, y: event.clientY });
     if (pos == null) return;
+    const tableItems = editor.view.dom.classList.contains("cm-live-preview")
+      ? [] : tableMenuChoices(editor.view.state, pos);
+    if (tableItems.length) {
+      event.preventDefault();
+      const view = editor.view;
+      const originalDoc = view.state.doc;
+      showItemMenu(event.clientX, event.clientY, tableItems, (id) => {
+        if (view.state.doc !== originalDoc) return;
+        if (id === "table-select-cells") {
+          beginCellSelection(view, pos);
+        } else if (id === "table-format") {
+          view.dispatch({ selection: { anchor: pos } });
+          editor?.formatTables("current");
+        } else if (id === "table-repair") {
+          openTableRepair(view, pos);
+        } else {
+          const spec = tableAction(view.state, pos, id.slice("table-".length) as TableAction);
+          if (spec) view.dispatch(spec);
+          view.focus();
+        }
+      });
+      return;
+    }
     const section = headingSectionAt(editor.getDoc(), pos);
     if (!section) return;
     event.preventDefault();
@@ -1377,6 +1409,21 @@ function resetAppearanceFontPreferences() {
   applyAppearanceFonts(appearanceFonts);
   loadAppearanceFontInputs();
   setTransientStatus("Appearance fonts reset", "#5ecf9a");
+}
+
+function saveTableSettings(settings: TableSettings) {
+  tableSettings = settings;
+  localStorage.setItem(TABLE_SETTINGS_KEY, JSON.stringify(settings));
+  editor?.setTableSettings(settings);
+  applyTablePreviewSettings(settings);
+  renderTableSettings($("table-settings"), settings, saveTableSettings);
+  setTransientStatus("Table settings saved", "#5ecf9a");
+}
+
+function formatEditorTables(scope: "current" | "selection" | "note") {
+  if (!editor || currentFileKind !== "markdown") return;
+  const result = editor.formatTables(scope);
+  setTransientStatus(`Formatted ${result.formatted} tables; ${result.skipped} malformed tables skipped`, "#5ecf9a");
 }
 
 function togglePreferences() {
@@ -5281,6 +5328,17 @@ function navigateFootnote(action: "next" | "previous" | "definition" | "marker")
 
 function commandCatalog(includeFiles: boolean): AppCommand[] {
   const commands: AppCommand[] = [
+    { id: "table-select-cells", title: "Select table cells", keywords: "rectangle spreadsheet copy TSV", run: () => { if (editor && currentFileKind === "markdown") beginCellSelection(editor.view); } },
+    ...([1, -1] as const).map(direction => ({ id: `table-sort-${direction}`, title: `Sort table by current column: ${direction === 1 ? "ascending" : "descending"}`, keywords: "markdown rows order", run: () => {
+      if (!editor || currentFileKind !== "markdown") return;
+      const spec = sortSourceTable(editor.view.state, editor.getCursor(), direction);
+      if (spec) editor.view.dispatch(spec);
+      editor.focus();
+    } })),
+    { id: "table-format-current", title: "Format current table", keywords: "markdown align block", run: () => formatEditorTables("current") },
+    { id: "table-format-selection", title: "Format tables in selection", keywords: "markdown align block", run: () => formatEditorTables("selection") },
+    { id: "table-format-note", title: "Format all tables in this note", keywords: "markdown align block", run: () => formatEditorTables("note") },
+    { id: "table-format-toggle", title: "Toggle live table formatting", keywords: "markdown settings", run: () => saveTableSettings({ ...tableSettings, liveFormatting: !tableSettings.liveFormatting }) },
     { id: "save", title: "Save current file", keywords: "write", run: () => saveFile(false) },
     { id: "export-pdf", title: "Export page to PDF…", keywords: "print save pdf frontmatter yaml css", run: () => void exportCurrentPagePdf() },
     { id: "command", title: "Open command bar", keywords: "palette actions", run: showCommandBar },

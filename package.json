@@ -17,7 +17,7 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "test": "npm run test:performance && npm run test:ui && npm run test:plugin-compat && npm run test:dataview && npm run test:bases && npm run test:people",
-    "test:ui": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/ui-interactions.test.ts",
+    "test:ui": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/ui-interactions.test.ts tests/table-editing.test.ts",
     "test:plugin-compat": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/plugin-compat.test.ts",
     "test:plugin-real": "node --require ./tests/node20-polyfill.cjs --import tsx tools/plugin-compat-smoke.ts",
     "test:dataview": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/dataview.test.ts",

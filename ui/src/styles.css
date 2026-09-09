@@ -1529,6 +1529,8 @@ body.resizing-panes .cm-editor {
   z-index: 10000;
   min-width: 220px;
   max-width: 320px;
+  max-height: calc(100vh - 12px);
+  overflow-y: auto;
   padding: 0.3rem 0;
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -4030,3 +4032,8 @@ iframe.plugin-settings-frame {
   font: 0.75rem var(--mono);
   white-space: pre-wrap;
 }
+
+.table-settings-form { display: grid; gap: 0.6rem; }
+.table-settings-form label { display: flex; align-items: center; gap: 0.5rem; }
+.table-settings-form input[type="number"] { width: 5rem; margin-left: auto; }
+.preview th, .preview td { max-width: var(--table-column-width, none); overflow-wrap: anywhere; }

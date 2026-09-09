@@ -51,6 +51,13 @@ import { wikilinkCompletionSource } from "./wikilink-completion";
 import { slashCompletionSource } from "./slash-commands";
 import type { FileEntry, UserVimrc } from "./types";
 import { smartPasteText } from "./smart-paste";
+import { formatTableRanges, liveTableFormatting } from "./table-editing";
+import { nextTableCell, previousTableCell, tableFormatTargets, type TableFormatScope } from "./table-commands";
+import { cellSelectionExtension, selectedCellsTsv, clearCellSelection } from "./table-selection";
+import { offerTablePaste, tablePasteState, tablePasteTheme } from "./table-paste";
+import { DEFAULT_TABLE_SETTINGS, normalizeTableSettings, type TableSettings } from "./table-settings";
+import { isolateHistory } from "@codemirror/commands";
+import { tableRepairState, tableRepairTheme } from "./table-repair";
 
 export type EditorCallbacks = {
   onDirty: (dirty: boolean) => void;
@@ -92,6 +99,8 @@ export class NephriteEditor {
   private vimCompartment = new Compartment();
   private languageCompartment = new Compartment();
   private livePreviewCompartment = new Compartment();
+  private tableWrapCompartment = new Compartment();
+  private tableOptions = { ...DEFAULT_TABLE_SETTINGS };
   private vimOn = false;
   private suppressDirty = false;
   private callbacks: EditorCallbacks;
@@ -184,6 +193,13 @@ export class NephriteEditor {
       rectangularSelection(),
       crosshairCursor(),
       history(),
+      liveTableFormatting(() => this.view?.composing ?? false, () => this.tableOptions),
+      this.tableWrapCompartment.of([]),
+      cellSelectionExtension,
+      tablePasteState,
+      tablePasteTheme,
+      tableRepairState,
+      tableRepairTheme,
       indentOnInput(),
       bracketMatching(),
       foldService.of((state, lineStart) =>
@@ -217,6 +233,10 @@ export class NephriteEditor {
         },
       ])),
       Prec.high(keymap.of(completionKeymap)),
+      Prec.high(keymap.of([
+        { key: "Tab", run: view => this.tableOptions.tabNavigation && nextTableCell(view),
+          shift: view => this.tableOptions.tabNavigation && previousTableCell(view) },
+      ])),
       keymap.of([
         {
           key: "Mod-s",
@@ -564,6 +584,14 @@ export class NephriteEditor {
   }
 
   private copySelection(view: EditorView, cut: boolean): boolean {
+    const cellText = selectedCellsTsv(view.state);
+    if (cellText !== null && navigator.clipboard) {
+      const originalDoc = view.state.doc;
+      void navigator.clipboard.writeText(cellText).then(() => {
+        if (cut && view.state.doc === originalDoc) clearCellSelection(view);
+      }).catch(() => this.callbacks.onVimMessage?.("Could not copy the selected cells", true));
+      return true;
+    }
     const selections = view.state.selection.ranges
       .filter((range) => !range.empty)
       .map((range) => view.state.sliceDoc(range.from, range.to));
@@ -573,7 +601,7 @@ export class NephriteEditor {
       return true;
     }
     void navigator.clipboard.writeText(selections.join("\n")).then(() => {
-      if (cut) view.dispatch(view.state.replaceSelection(""));
+      if (cut) view.dispatch({ ...view.state.replaceSelection(""), userEvent: "delete.cut" });
     }).catch((error) => {
       console.warn("[vimrc] system clipboard write failed", error);
       this.callbacks.onVimMessage?.("Could not write to the system clipboard", true);
@@ -593,11 +621,12 @@ export class NephriteEditor {
     const html = data.getData("text/html");
     const text = data.getData("text/plain");
     if (!html && !text) return false;
+    if (offerTablePaste(view, html, text, this.tableOptions)) { event.preventDefault(); return true; }
     const selection = view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to);
     const next = smartPasteText({ html, text, selection });
     if (next === text && !html) return false;
     event.preventDefault();
-    view.dispatch(view.state.replaceSelection(next));
+    view.dispatch({ ...view.state.replaceSelection(next), userEvent: "input.paste" });
     return true;
   }
 
@@ -633,8 +662,17 @@ export class NephriteEditor {
       this.callbacks.onVimMessage?.("System clipboard access is unavailable", true);
       return true;
     }
-    void this.readSmartClipboard().then((content) => {
-      view.dispatch(view.state.replaceSelection(content));
+    const originalDoc = view.state.doc;
+    const originalSelection = view.state.selection;
+    void this.readSmartClipboard().then(({ html, text }) => {
+      if (view.state.doc !== originalDoc || !view.state.selection.eq(originalSelection)) {
+        this.callbacks.onVimMessage?.("The paste destination changed. Paste again at the intended cell.", true);
+        return;
+      }
+      if (offerTablePaste(view, html, text, this.tableOptions)) return;
+      const selection = view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to);
+      const content = smartPasteText({ html, text, selection });
+      view.dispatch({ ...view.state.replaceSelection(content), userEvent: "input.paste" });
     }).catch((error) => {
       console.warn("[vimrc] system clipboard read failed", error);
       this.callbacks.onVimMessage?.("Could not read the system clipboard", true);
@@ -642,7 +680,7 @@ export class NephriteEditor {
     return true;
   }
 
-  private async readSmartClipboard(): Promise<string> {
+  private async readSmartClipboard(): Promise<{ html: string; text: string }> {
     let html = "";
     let text = "";
     if (navigator.clipboard.read) {
@@ -661,11 +699,7 @@ export class NephriteEditor {
       }
     }
     if (!text) text = await navigator.clipboard.readText();
-    const selection = this.view.state.sliceDoc(
-      this.view.state.selection.main.from,
-      this.view.state.selection.main.to,
-    );
-    return smartPasteText({ html, text, selection });
+    return { html, text };
   }
 
   setVim(on: boolean) {
@@ -676,6 +710,20 @@ export class NephriteEditor {
       ),
     });
     if (on) this.applyVimrcCommands();
+  }
+
+  setTableSettings(settings: TableSettings) {
+    this.tableOptions = normalizeTableSettings(settings);
+    this.view.dispatch({ effects: this.tableWrapCompartment.reconfigure(this.tableOptions.wrapSource ? EditorView.lineWrapping : []) });
+  }
+
+  formatTables(scope: TableFormatScope): { formatted: number; skipped: number } {
+    if (this.view.state.readOnly) return { formatted: 0, skipped: 0 };
+    const { ranges, skipped } = tableFormatTargets(this.view.state, scope);
+    if (ranges.length) this.view.dispatch({ effects: formatTableRanges.of(ranges),
+      userEvent: "input.table.format", annotations: isolateHistory.of("full") });
+    this.view.focus();
+    return { formatted: ranges.length, skipped };
   }
 
   setLivePreview(on: boolean) {
@@ -729,6 +777,7 @@ export class NephriteEditor {
     this.lastCursorLine = -1;
     this.lastDocumentLines = -1;
     this.view.setState(snapshot.state);
+    this.setTableSettings(this.tableOptions);
     this.suppressDirty = false;
     this.callbacks.onDirty(false);
     requestAnimationFrame(() => {
