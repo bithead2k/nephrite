@@ -35,6 +35,9 @@ ureq = "2.12"
 tempfile = "3"
 libc = "0.2"
 dirs = "6"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 

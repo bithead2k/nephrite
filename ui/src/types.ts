@@ -13,6 +13,7 @@ export type VaultInfo = {
   updated: number;
   removed: number;
   full_rebuild: boolean;
+  background_check?: boolean;
   file_count: number;
   task_count: number;
   link_count: number;

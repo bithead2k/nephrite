@@ -110,6 +110,7 @@ pub struct SyncSnapshot {
     pub configured: bool,
     pub settings_saved: bool,
     pub remotes: Vec<RemoteVault>,
+    pub remote_vaults_error: Option<String>,
     pub provider_settings: Option<ProviderSettings>,
     pub obsidian_settings: Option<ProviderSettings>,
     pub obsidian_settings_error: Option<String>,
@@ -146,6 +147,7 @@ pub struct SyncLoginRequest {
 
 #[derive(Default)]
 struct Runtime {
+    authenticated: bool,
     pid: Option<u32>,
     status: SyncStatus,
 }
@@ -156,6 +158,10 @@ pub struct SyncManager {
 }
 
 impl SyncManager {
+    pub fn record_login(&self) {
+        self.runtime.lock().authenticated = true;
+    }
+
     pub fn status(&self) -> SyncStatus {
         self.runtime.lock().status.clone()
     }
@@ -183,7 +189,7 @@ impl SyncManager {
             "Obsidian Headless is not installed. Open Sync settings and choose Install ob."
                 .to_string()
         })?;
-        let mut command = Command::new(ob);
+        let mut command = ob_command(ob);
         command.args(["sync", "--path"]).arg(&root);
         if continuous {
             command.arg("--continuous");
@@ -492,7 +498,20 @@ fn save_settings(root: &Path, settings: &SyncSettings) -> Result<(), String> {
 }
 
 pub fn find_ob() -> Option<PathBuf> {
-    find_executable("ob")
+    crate::sync_runtime::installed()
+        .map(|install| install.cli)
+        .or_else(|| find_executable("ob"))
+}
+
+fn ob_command(ob: PathBuf) -> Command {
+    if let Some(install) = crate::sync_runtime::installed() {
+        if install.cli == ob {
+            return install.command();
+        }
+    }
+    let mut command = Command::new(ob);
+    crate::sync_runtime::quiet(&mut command);
+    command
 }
 
 // Desktop launchers need not inherit shell initialization or a HOME variable.
@@ -565,6 +584,11 @@ fn augment_path(command: &mut Command) {
     if let Some(ob) = find_ob().and_then(|path| path.parent().map(Path::to_path_buf)) {
         entries.insert(0, ob);
     }
+    if let Some(install) = crate::sync_runtime::installed() {
+        if let Some(bin) = install.node.parent() {
+            entries.insert(0, bin.to_path_buf());
+        }
+    }
     if let Ok(path) = std::env::join_paths(entries) {
         command.env("PATH", path);
     }
@@ -575,11 +599,13 @@ fn augment_path(command: &mut Command) {
 
 fn run_ob(args: &[&str], input: Option<&str>) -> Result<Output, String> {
     let ob = find_ob().ok_or_else(|| "Obsidian Headless (ob) is not installed".to_string())?;
-    let mut command = Command::new(ob);
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = ob_command(ob);
+    command.args(args);
+    run_provider_command(command, input)
+}
+
+fn run_provider_command(mut command: Command, input: Option<&str>) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command.stdin(if input.is_some() {
         Stdio::piped()
     } else {
@@ -667,16 +693,30 @@ fn remote_vaults() -> Result<Vec<RemoteVault>, String> {
     Ok(response.vaults)
 }
 
+fn remote_state(
+    result: Result<Vec<RemoteVault>, String>,
+    known_login: bool,
+) -> (bool, Vec<RemoteVault>, Option<String>) {
+    match result {
+        Ok(remotes) => (true, remotes, None),
+        Err(error) => (
+            known_login && !error.contains("No account logged in"),
+            Vec::new(),
+            Some(error),
+        ),
+    }
+}
+
 pub fn snapshot(root: &Path, manager: &SyncManager) -> SyncSnapshot {
     let settings = load_settings(root);
     let settings_saved = settings_path(root).is_file();
     let ob_path = find_ob();
-    let remotes = if ob_path.is_some() {
-        remote_vaults().unwrap_or_default()
+    let (logged_in, remotes, remote_vaults_error) = if ob_path.is_some() {
+        remote_state(remote_vaults(), manager.runtime.lock().authenticated)
     } else {
-        Vec::new()
+        (false, Vec::new(), None)
     };
-    let logged_in = !remotes.is_empty();
+    manager.runtime.lock().authenticated = logged_in;
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct ExistingConfig {
@@ -740,6 +780,7 @@ pub fn snapshot(root: &Path, manager: &SyncManager) -> SyncSnapshot {
         configured,
         settings_saved,
         remotes,
+        remote_vaults_error,
         provider_settings,
         obsidian_settings,
         obsidian_settings_error,
@@ -747,51 +788,78 @@ pub fn snapshot(root: &Path, manager: &SyncManager) -> SyncSnapshot {
 }
 
 pub fn install_ob() -> Result<(), String> {
-    if find_ob().is_some() {
+    static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = INSTALL_LOCK.lock();
+    if find_ob().is_some()
+        && run_ob(&["--version"], None).is_ok_and(|output| output.status.success())
+    {
         return Ok(());
     }
-    let home = dirs::home_dir();
-    let nvm = std::env::var_os("NVM_DIR")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".nvm")))
-        .map(|path| path.join("nvm.sh"));
-    let output = if cfg!(unix) && nvm.as_ref().is_some_and(|path| path.is_file()) {
-        let mut command = Command::new("bash");
-        augment_path(&mut command);
-        command.env("NEPHRITE_NVM_SCRIPT", nvm.as_ref().unwrap())
-            .args(["-c", "source \"$NEPHRITE_NVM_SCRIPT\" && nvm install 22 && nvm alias default 22 && npm install -g obsidian-headless"])
-            .output().map_err(|error| format!("Could not run nvm/npm: {error}"))?
-    } else {
-        let npm = find_executable("npm").ok_or_else(|| {
-            "Nephrite could not find npm in PATH or your user installation folders. Install Node.js 22 or newer with npm, then retry installation.".to_string()
-        })?;
-        let mut command = Command::new(npm);
-        augment_path(&mut command);
-        command
-            .args(["install", "-g", "obsidian-headless"])
-            .output()
-            .map_err(|error| format!("Could not run npm: {error}"))?
-    };
-    ensure_success(output, "Installing Obsidian Headless")?;
-    if find_ob().is_none() {
-        return Err("ob was installed, but Nephrite could not find it. Restart Nephrite so it inherits the updated PATH.".into());
+    let root = crate::sync_runtime::root()?;
+    let mut candidates = Vec::new();
+    if let Some(install) = crate::sync_runtime::installed() {
+        candidates.push(install.node);
     }
+    for directory in executable_directories() {
+        candidates.push(directory.join(if cfg!(windows) { "node.exe" } else { "node" }));
+    }
+    crate::sync_runtime::install(&root, &candidates)?;
+    ensure_success(run_ob(&["--version"], None)?, "Checking Obsidian Headless")?;
     Ok(())
+}
+
+fn run_private_ob(args: &[&str]) -> Result<Output, String> {
+    let runtime = crate::sync_runtime::installed()
+        .or_else(|| {
+            let ob = find_executable("ob")?;
+            let adjacent = ob.parent()?.join("node_modules/obsidian-headless/cli.js");
+            let cli = if adjacent.is_file() {
+                adjacent
+            } else {
+                ob.canonicalize().ok()?
+            };
+            if cli.extension().and_then(|ext| ext.to_str()) != Some("js") {
+                return None;
+            }
+            Some(crate::sync_runtime::Installation {
+                node: find_executable("node")?,
+                cli,
+            })
+        })
+        .ok_or("Could not locate the installed Obsidian Headless entry point")?;
+    let input = serde_json::to_string(args).map_err(|error| error.to_string())?;
+    run_provider_command(runtime.private_command(), Some(&input))
 }
 
 pub fn login(request: SyncLoginRequest) -> Result<(), String> {
     if request.email.trim().is_empty() || request.password.is_empty() {
         return Err("Obsidian email and account password are required".into());
     }
-    // Prompt input keeps credentials out of the process command line and process list.
-    let answers = format!(
-        "{}\n{}\n{}\n",
+    // These arguments enter the child over stdin, never through the OS command line.
+    let mut args = vec![
+        "login",
+        "--email",
         request.email.trim(),
-        request.password,
-        request.mfa.trim()
-    );
-    ensure_success(run_ob(&["login"], Some(&answers))?, "Obsidian login")?;
+        "--password",
+        &request.password,
+    ];
+    if !request.mfa.trim().is_empty() {
+        args.extend(["--mfa", request.mfa.trim()]);
+    }
+    let output = ensure_success(run_private_ob(&args)?, "Obsidian login")?;
+    confirm_login_output(&output.stdout)?;
     Ok(())
+}
+
+fn confirm_login_output(stdout: &[u8]) -> Result<(), String> {
+    if String::from_utf8_lossy(stdout)
+        .lines()
+        .any(|line| line.starts_with("Logged in as "))
+    {
+        Ok(())
+    } else {
+        Err("Obsidian did not confirm login. If your account uses two-factor authentication, enter the current MFA code and try again.".into())
+    }
 }
 
 pub fn configure(
@@ -854,25 +922,13 @@ pub fn configure(
                 synced: false,
             },
         );
-        let answers = format!("{}\n", request.encryption_password);
-        ensure_success(
-            run_ob(
-                &[
-                    "sync-setup",
-                    "--vault",
-                    &settings.remote_vault,
-                    "--path",
-                    &root_text,
-                    "--device-name",
-                    &settings.device_name,
-                    "--config-dir",
-                    ".obsidian",
-                    "--json",
-                ],
-                Some(&answers),
-            )?,
-            "Configuring the Obsidian vault",
-        )?;
+        let args = crate::sync_runtime::setup_args(
+            &settings.remote_vault,
+            &root_text,
+            &settings.device_name,
+            &request.encryption_password,
+        );
+        ensure_success(run_private_ob(&args)?, "Configuring the Obsidian vault")?;
     }
     let file_types = settings.file_types.join(",");
     let configs = settings.configs.join(",");
@@ -954,6 +1010,26 @@ pub fn sync_once(app: AppHandle, root: &Path, manager: &SyncManager) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_remote_list_is_authenticated_and_errors_are_preserved() {
+        let (authenticated, vaults, error) = remote_state(Ok(Vec::new()), false);
+        assert!(authenticated);
+        assert!(vaults.is_empty());
+        assert!(error.is_none());
+        let (authenticated, _, error) = remote_state(Err("Network unavailable".into()), true);
+        assert!(authenticated);
+        assert_eq!(error.as_deref(), Some("Network unavailable"));
+        assert!(!remote_state(Err("No account logged in".into()), true).0);
+    }
+
+    #[test]
+    fn successful_exit_without_login_confirmation_is_not_success() {
+        assert!(confirm_login_output(b"").is_err());
+        assert!(confirm_login_output(b"Email: Password: ").is_err());
+        assert!(confirm_login_output(b"2FA code: ").is_err());
+        assert!(confirm_login_output(b"Logged in as Test (test@example.invalid)\n").is_ok());
+    }
 
     #[test]
     fn installed_provider_clears_node_dependency_warning() {

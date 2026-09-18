@@ -21,6 +21,131 @@
   --powerline-font: "PowerlineSymbols", "DejaVu Sans Mono", "Hack", var(--mono);
 }
 
+.mobile-only { display: none; }
+
+.mobile-vault-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.mobile-vault-option {
+  display: block;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-hover);
+  color: var(--text);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.mobile-vault-path {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 1rem;
+}
+
+.mobile-vault-path input {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-deep);
+  color: var(--text);
+  font: 0.85rem var(--mono);
+}
+
+@media (max-width: 600px) {
+  .mobile-app #app {
+    height: 100dvh;
+    padding-top: max(env(safe-area-inset-top), 24px);
+  }
+  .mobile-app .mobile-only { display: inline-flex; }
+  .mobile-app .topbar {
+    min-height: 3.1rem;
+    height: auto;
+    padding: 0.35rem 0.5rem;
+    gap: 0.35rem;
+  }
+  .mobile-app .brand .logo,
+  .mobile-app .brand .ver,
+  .mobile-app #btn-mobile-files,
+  .mobile-app #btn-today,
+  .mobile-app #btn-drawing,
+  .mobile-app #btn-canvas,
+  .mobile-app #btn-template,
+  .mobile-app #plugin-status-items,
+  .mobile-app .seg-btn[data-mode="source"],
+  .mobile-app .seg-btn[data-mode="split"] { display: none; }
+  .mobile-app .actions { gap: 0.3rem; margin-left: auto; }
+  .mobile-app .actions button { min-height: 2.25rem; padding-inline: 0.55rem; }
+  .mobile-app .seg { flex-shrink: 0; }
+  .mobile-app .main { position: relative; flex-direction: column; }
+  .mobile-app .index-progress { grid-template-columns: minmax(0, 1fr); }
+  .mobile-app #index-action { min-width: 0; overflow-wrap: anywhere; }
+  .mobile-app .workspace { order: 1; width: 100%; }
+  .mobile-app .activity-rail {
+    order: 2;
+    flex: 0 0 3.5rem;
+    width: 100%;
+    height: 3.5rem;
+    min-height: 0;
+    flex-direction: row;
+    padding: 0.25rem 0.6rem;
+    border-right: 0;
+    border-top: 1px solid var(--border);
+    padding-bottom: max(0.25rem, env(safe-area-inset-bottom));
+  }
+  .mobile-app .activity-rail-main { flex-direction: row; gap: 0.65rem; overflow: visible; }
+  .mobile-app .activity-button { width: 2.8rem; height: 2.8rem; }
+  .mobile-app #activity-graph,
+  .mobile-app #activity-links,
+  .mobile-app #activity-tags,
+  .mobile-app #activity-bookmarks,
+  .mobile-app #activity-git,
+  .mobile-app #activity-query-log,
+  .mobile-app #activity-attachments,
+  .mobile-app #activity-sql,
+  .mobile-app #plugin-ribbon-actions { display: none; }
+  .mobile-app .sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 3.5rem;
+    left: 0;
+    z-index: 12;
+    width: min(85vw, 23rem);
+    max-width: none;
+    min-width: 0;
+    box-shadow: 1rem 0 2rem rgba(0, 0, 0, 0.5);
+  }
+  .mobile-app .vault-label { max-height: none; overflow: visible; }
+  .mobile-app .preferences-popover {
+    position: fixed;
+    left: 0.4rem;
+    right: 0.4rem;
+    bottom: 3.9rem;
+    width: auto;
+    max-height: calc(100dvh - 4.5rem);
+  }
+  .mobile-app .preferences-section:has(#preferences-sync-status),
+  .mobile-app .preferences-section:has(#preferences-plugins),
+  .mobile-app .preferences-section:has(#preferences-automation-status) { display: none; }
+  .mobile-app .panes.mode-split,
+  .mobile-app .workspace.with-right .panes { grid-template-columns: minmax(0, 1fr); }
+  .mobile-app .pane-splitter,
+  .mobile-app .right-pane { display: none !important; }
+  .mobile-app .tab-bar { max-width: 100vw; overflow-x: auto; }
+  .mobile-app .command-footer { display: none; }
+  .mobile-app .feature-panel { padding: 0.35rem; }
+  .mobile-app .feature-card { width: 100%; max-height: calc(100dvh - 0.7rem); }
+  .mobile-app .feature-body { overflow-y: auto; }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -599,6 +724,24 @@ button:disabled {
 }
 .preferences-font-grid label { color: var(--muted); font-size: 0.7rem; }
 .preferences-font-actions { display: flex; gap: 0.4rem; }
+.reading-preferences-grid {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1fr) minmax(6rem, auto);
+  gap: 0.4rem 0.65rem;
+  align-items: center;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+.reading-preferences-grid select,
+.reading-preferences-grid input {
+  min-width: 5rem;
+  border: 1px solid #53677e;
+  border-radius: 5px;
+  padding: 0.32rem 0.4rem;
+  background: #090e14;
+  color: var(--text);
+}
+.reading-preferences-grid span { white-space: nowrap; }
 .preferences-plugins { display: grid; gap: 0.3rem; color: var(--muted); font-size: 0.72rem; }
 .preferences-plugin {
   display: grid;
@@ -1019,9 +1162,15 @@ body.tree-dragging * {
 }
 
 .fname {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.tree-file .twist,
+.tree-folder .twist {
+  flex-shrink: 0;
 }
 
 .empty {
@@ -1518,6 +1667,90 @@ body.resizing-panes .cm-editor {
   background: var(--bg);
   position: relative;
 }
+
+/* Scroll Reading Mode is an adapter over the normal rendered preview. */
+.reading-mode-active #panes {
+  grid-template-columns: 1fr !important;
+}
+
+.reading-mode-active #editor-host,
+.reading-mode-active #pane-splitter,
+.reading-mode-active #right-pane,
+.reading-mode-active #excalidraw-host,
+.reading-mode-active #canvas-workspace,
+.reading-mode-active #media-workspace,
+.reading-mode-active #kanban {
+  display: none !important;
+}
+
+.reading-mode-active #preview-host {
+  display: block !important;
+  border: 0;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.reading-mode-active #preview-host::-webkit-scrollbar { display: none; }
+.reading-mode-active #preview { pointer-events: none; user-select: none; }
+
+.reading-mode-chrome-free .topbar,
+.reading-mode-chrome-free .activity-rail,
+.reading-mode-chrome-free #sidebar,
+.reading-mode-chrome-free #index-progress,
+.reading-mode-chrome-free #tab-bar,
+.reading-mode-chrome-free #tab,
+.reading-mode-chrome-free #command-footer {
+  display: none !important;
+}
+
+.reading-mode-chrome-free #workspace {
+  width: 100%;
+  height: 100%;
+}
+
+.reading-mode-mirror {
+  transform: scaleX(-1);
+  transform-origin: center;
+}
+
+.reading-mode-overlay {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  width: 100%;
+  height: 0;
+  pointer-events: none;
+  color: color-mix(in srgb, var(--accent) 58%, transparent);
+}
+
+.reading-index {
+  position: absolute;
+  top: var(--reading-plane-y, 40vh);
+  translate: 0 -50%;
+  font-size: clamp(0.72rem, 1.2vw, 1rem);
+  line-height: 1;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
+}
+
+.reading-index-left { left: clamp(0.45rem, 1.4vw, 1.25rem); }
+.reading-index-right { right: clamp(0.45rem, 1.4vw, 1.25rem); }
+
+.reading-mode-status {
+  position: absolute;
+  top: calc(var(--reading-plane-y, 40vh) + 2.1rem);
+  left: 50%;
+  translate: -50% -50%;
+  padding: 0.35rem 0.58rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 999px;
+  background: rgba(8, 13, 19, 0.82);
+  color: var(--text);
+  font: 0.76rem var(--mono);
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.reading-mode-status.visible { opacity: 1; }
 
 .hidden {
   display: none !important;
@@ -2062,7 +2295,7 @@ body.kanban-dragging * {
 
 .preview {
   padding: 1rem 1.35rem 3rem;
-  max-width: 48rem;
+  max-width: none;
   line-height: 1.6;
   font-size: 0.97rem;
   font-family: var(--preview-font, var(--font));
@@ -4002,7 +4235,7 @@ iframe.plugin-settings-frame {
   flex: 1 1 auto;
   width: 100%;
   height: 100%;
-  min-height: 32rem;
+  min-height: 0;
   border: 0;
   background: #101820;
 }
@@ -4037,3 +4270,28 @@ iframe.plugin-settings-frame {
 .table-settings-form label { display: flex; align-items: center; gap: 0.5rem; }
 .table-settings-form input[type="number"] { width: 5rem; margin-left: auto; }
 .preview th, .preview td { max-width: var(--table-column-width, none); overflow-wrap: anywhere; }
+
+@media (max-width: 600px) {
+  .mobile-app .preview th,
+  .mobile-app .preview td { min-width: 8rem; }
+}
+
+.sync-password-field { display: flex; align-items: center; gap: 0.4rem; }
+.sync-password-field input { flex: 1; min-width: 0; }
+.sync-password-field input::-ms-reveal { display: none; }
+.sync-password-toggle { display: inline-flex; align-items: center; justify-content: center; flex: none; padding: 0.45rem; }
+
+/* Terminal reports: glyph fallback must not change the column grid. */
+.terminal-cell { display: inline-block; width: 1ch; height: 1.25em; line-height: 1.25; text-align: center; white-space: pre; vertical-align: top; }
+.terminal-wide { width: 2ch; }
+.terminal-zero { width: 0; }
+.terminal-box { position: relative; }
+.terminal-box > span { opacity: 0; }
+.terminal-box > i { position: absolute; display: block; pointer-events: none; background: currentColor; }
+.terminal-arm-l { left: -0.25px; top: 50%; width: calc(50% + 0.75px); height: 1px; }
+.terminal-arm-r { left: 50%; top: 50%; width: calc(50% + 0.25px); height: 1px; }
+.terminal-arm-u { left: 50%; top: -0.25px; width: 1px; height: calc(50% + 0.75px); }
+.terminal-arm-d { left: 50%; top: 50%; width: 1px; height: calc(50% + 0.25px); }
+
+/* Give the report its own line box; the larger pre strut otherwise leaves gaps. */
+pre > code.terminal-report { display: block; line-height: 1.25; white-space: pre; letter-spacing: 0; font-variant-ligatures: none; }

@@ -66,6 +66,9 @@ export async function installWindowStatePersistence(): Promise<void> {
     timer = globalThis.setTimeout(async () => {
       timer = null;
       try {
+        // Fullscreen presentation is transient. Never replace the user's
+        // restorable desktop geometry with the monitor-sized reading window.
+        if (await window.isFullscreen()) return;
         const maximized = await window.isMaximized();
         if (maximized) {
           const previous = localStorage.getItem(WINDOW_STATE_KEY);

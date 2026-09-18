@@ -1,6 +1,6 @@
 # Nephrite
 
-**PROJECT_VERSION 0.14** — knowledge that doesn’t fracture.
+**PROJECT_VERSION 0.15** — knowledge that doesn’t fracture.
 
 Open-source, local-first knowledge app. Markdown is storage; the SQLite index is disposable. Opens an existing Obsidian vault without import or conversion.
 
@@ -57,6 +57,9 @@ Markdown on disk is still the store. Indexes and viewers are disposable.
   are hidden from the community catalog and not loaded twice.
 - **Callouts and TOC:** Obsidian callouts in preview; table-of-contents
   hydration for notes that ask for one.
+- **Scroll Reading / teleprompter mode:** continuous WPM-paced rendered
+  preview, fixed reading markers, keyboard speed controls, fullscreen
+  chrome-free presentation, and horizontal mirroring for teleprompter glass.
 
 ## Core features
 
@@ -110,9 +113,9 @@ Markdown on disk is still the store. Indexes and viewers are disposable.
 - Attachment inventory, SQL console over the index, nested YAML properties,
   and plugin settings tabs (`addSettingTab` / `Setting`).
 
-Not in core, on purpose: mobile, a WYSIWYG/block editor,
-persisting GFM table column widths, and unsandboxed Node/Electron
-plugin APIs. Point databases at `pgsql` + Dataview, not another query language.
+Not in core, on purpose: a WYSIWYG/block editor, persisting GFM table column
+widths, and unsandboxed Node/Electron plugin APIs. Point databases at `pgsql` +
+Dataview, not another query language.
 
 ## Requirements
 

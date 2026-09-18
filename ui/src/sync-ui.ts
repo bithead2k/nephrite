@@ -36,6 +36,7 @@ export type SyncSnapshot = {
   vaultPath: string;
   obPath: string | null;
   nodeReady: boolean;
+  remoteVaultsError?: string | null;
   loggedIn: boolean;
   configured: boolean;
   settingsSaved: boolean;
@@ -59,32 +60,94 @@ function option(value: string, label: string, selected: boolean): HTMLOptionElem
   return item;
 }
 
+type SyncField = { value: string; checked?: boolean; label?: string; revealed?: boolean };
+const syncDrafts = new Map<string, Map<string, SyncField>>();
+const syncPanelVaults = new WeakMap<HTMLElement, string>();
+const syncDraftListeners = new WeakSet<HTMLElement>();
+const fieldKey = (field: HTMLInputElement | HTMLSelectElement) => field.id || `${field.name}:${field.value}`;
+
+function captureSyncDraft(host: HTMLElement) {
+  const vault = syncPanelVaults.get(host);
+  if (!vault || !host.querySelector("#sync-login-form")) return;
+  const draft = syncDrafts.get(vault) ?? new Map<string, SyncField>();
+  for (const field of host.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")) {
+    draft.set(fieldKey(field), { value: field.value,
+      revealed: field.hasAttribute("data-sync-password") ? (field as HTMLInputElement).type === "text" : undefined,
+      checked: field.tagName === "INPUT" ? (field as HTMLInputElement).checked : undefined,
+      label: field.tagName === "SELECT" ? (field as HTMLSelectElement).selectedOptions[0]?.textContent ?? undefined : undefined });
+  }
+  syncDrafts.set(vault, draft);
+}
+
+function restoreSyncDraft(host: HTMLElement, vault: string) {
+  const draft = syncDrafts.get(vault);
+  if (!draft) return;
+  for (const field of host.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")) {
+    const saved = draft.get(fieldKey(field));
+    if (!saved) continue;
+    if (field.id === "sync-remote" && saved.value && ![...(field as HTMLSelectElement).options].some(item => item.value === saved.value)) {
+      field.append(option(saved.value, saved.label || saved.value, true));
+    }
+    if (saved.revealed !== undefined) (field as HTMLInputElement).type = saved.revealed ? "text" : "password";
+    field.value = saved.value;
+    if (saved.checked !== undefined) (field as HTMLInputElement).checked = saved.checked;
+  }
+}
+
+function showSyncError(host: HTMLElement, error: unknown) {
+  const message = host.querySelector<HTMLElement>("#sync-message") ?? host.firstElementChild as HTMLElement | null;
+  if (!message) return;
+  message.classList.remove("success");
+  message.classList.add("error");
+  message.textContent = String(error);
+  message.setAttribute("role", "alert");
+  message.setAttribute("aria-live", "assertive");
+  message.tabIndex = -1;
+  host.scrollTop = 0;
+  message.focus({ preventScroll: true });
+}
+
+export function updateSyncPanelStatus(host: HTMLElement, status: SyncStatus) {
+  const label = host.querySelector<HTMLElement>("#sync-current-status");
+  if (!label) return;
+  label.textContent = status.message;
+  if (status.phase === "error") showSyncError(host, status.message);
+}
+
 export async function renderSyncPanel(
   host: HTMLElement,
   onStatus: (status: SyncStatus) => void,
 ): Promise<void> {
+  captureSyncDraft(host);
+  if (!syncDraftListeners.has(host)) {
+    host.addEventListener("input", () => captureSyncDraft(host));
+    host.addEventListener("change", () => captureSyncDraft(host));
+    syncDraftListeners.add(host);
+  }
   host.innerHTML = '<div class="feature-loading">Inspecting sync providers…</div>';
   let snapshot: SyncSnapshot;
   try {
     snapshot = await loadSyncState();
   } catch (error) {
     host.innerHTML = '<div class="feature-empty"></div>';
-    host.firstElementChild!.textContent = `Sync is unavailable: ${String(error)}`;
+    showSyncError(host, `Sync is unavailable: ${String(error)}`);
     return;
   }
   draw(snapshot);
 
   function draw(state: SyncSnapshot) {
+    captureSyncDraft(host);
+    syncPanelVaults.set(host, state.vaultPath);
     onStatus(state.status);
     host.innerHTML = `
       <div class="sync-settings">
+        <div id="sync-message" class="sync-message" role="status" aria-live="polite"></div>
         <div class="sync-summary">
           <strong>Obsidian Headless</strong><small id="sync-provider-state"></small>
           <strong>Local vault</strong><small id="sync-vault-path"></small>
           <strong>Status</strong><small id="sync-current-status"></small>
           <strong>Policy comparison</strong><small id="sync-provider-policy"></small>
         </div>
-        <div id="sync-message" class="sync-message" role="status" aria-live="polite"></div>
         <div class="sync-actions">
           <button type="button" id="sync-install">Install ob</button>
           <button type="button" id="sync-refresh">Refresh status</button>
@@ -93,9 +156,8 @@ export async function renderSyncPanel(
         <form id="sync-login-form" class="sync-form">
           <fieldset>
             <legend>Obsidian account</legend>
-            <small>Credentials are sent directly to <code>ob</code> through its prompt and are never saved by Nephrite.</small>
             <label>Email<input type="email" id="sync-email" autocomplete="username" /></label>
-            <label>Account password<input type="password" id="sync-account-password" autocomplete="current-password" /></label>
+            <label>Account password<span class="sync-password-field"><input type="password" data-sync-password id="sync-account-password" autocomplete="current-password" /><button type="button" class="sync-password-toggle" data-password-toggle="sync-account-password" data-password-name="account password"></button></span></label>
             <label>MFA code (if requested)<input type="text" id="sync-mfa" inputmode="numeric" autocomplete="one-time-code" /></label>
             <button type="submit">Log in</button>
           </fieldset>
@@ -109,7 +171,8 @@ export async function renderSyncPanel(
           <fieldset>
             <legend>Vault</legend>
             <label>Remote vault<select id="sync-remote"></select></label>
-            <label>End-to-end encryption password<input type="password" id="sync-encryption-password" autocomplete="off" placeholder="Required only for initial setup" /></label>
+            <small id="sync-remote-error" class="error" role="status"></small>
+            <label>End-to-end encryption password<span class="sync-password-field"><input type="password" data-sync-password id="sync-encryption-password" autocomplete="off" placeholder="Required only for initial setup" /><button type="button" class="sync-password-toggle" data-password-toggle="sync-encryption-password" data-password-name="encryption password"></button></span></label>
             <label>Device name<input type="text" id="sync-device-name" /></label>
             <label>Direction<select id="sync-mode"><option value="bidirectional">Bidirectional</option><option value="pull-only">Pull only</option><option value="mirror-remote">Mirror remote</option></select></label>
             <label>Conflicts<select id="sync-conflict"><option value="merge">Merge</option><option value="conflict">Create conflict copy</option></select></label>
@@ -129,16 +192,19 @@ export async function renderSyncPanel(
         </form>
       </div>`;
     const text = (id: string, value: string) => { host.querySelector<HTMLElement>(`#${id}`)!.textContent = value; };
-    text("sync-provider-state", state.obPath ? `Installed: ${state.obPath}${state.loggedIn ? " · logged in" : " · login required"}` : state.nodeReady ? "Not installed" : "Node.js 22 dependency missing");
+    text("sync-provider-state", state.obPath ? `Installed: ${state.obPath}${state.loggedIn ? " · logged in" : " · login required"}` : "Not installed — Install ob sets up its dependencies automatically");
     text("sync-vault-path", state.vaultPath);
+    text("sync-remote-error", state.remoteVaultsError || (state.loggedIn && !state.remotes.length ? "Logged in, but no remote vaults are available for this account." : ""));
     text("sync-current-status", state.status.message);
     renderPolicyComparison(host.querySelector("#sync-provider-policy")!, state);
     const install = host.querySelector<HTMLButtonElement>("#sync-install")!;
     install.disabled = !!state.obPath;
     host.querySelector<HTMLButtonElement>("#sync-now")!.disabled = !state.configured || !state.settingsSaved || state.status.active;
-    host.querySelector<HTMLFormElement>("#sync-login-form")!.hidden = state.loggedIn || !state.obPath;
+    const loginButton = host.querySelector<HTMLButtonElement>("#sync-login-form button[type=submit]")!;
+    loginButton.disabled = !state.obPath;
+    loginButton.textContent = state.loggedIn ? "Log in again" : "Log in";
     const form = host.querySelector<HTMLFormElement>("#sync-config-form")!;
-    [...form.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select, button")].forEach((control) => { control.disabled = !state.loggedIn; });
+    form.querySelector<HTMLButtonElement>("button[type=submit]")!.disabled = !state.loggedIn;
     const remote = host.querySelector<HTMLSelectElement>("#sync-remote")!;
     remote.replaceChildren(option("", state.remotes.length ? "Choose a vault…" : "No remote vaults available", !state.settings.remoteVault));
     for (const vault of state.remotes) remote.append(option(vault.id, `${vault.name}${vault.region ? ` · ${vault.region}` : ""}`, state.settings.remoteVault === vault.id || state.settings.remoteVault === vault.name));
@@ -149,6 +215,28 @@ export async function renderSyncPanel(
     host.querySelector<HTMLInputElement>("#sync-continuous")!.checked = state.settings.continuous;
     renderChecks(host.querySelector("#sync-file-types")!, "fileType", ["image", "audio", "video", "pdf", "unsupported"], state.settings.fileTypes);
     renderChecks(host.querySelector("#sync-configs")!, "config", ["app", "appearance", "appearance-data", "hotkey", "core-plugin", "core-plugin-data", "community-plugin", "community-plugin-data"], state.settings.configs);
+    restoreSyncDraft(host, state.vaultPath);
+    for (const button of host.querySelectorAll<HTMLButtonElement>("[data-password-toggle]")) {
+      const field = host.querySelector<HTMLInputElement>(`#${button.dataset.passwordToggle}`)!;
+      const update = () => {
+        const shown = field.type === "text";
+        const label = `${shown ? "Hide" : "Show"} ${button.dataset.passwordName}`;
+        button.setAttribute("aria-label", label);
+        button.setAttribute("aria-controls", field.id);
+        button.setAttribute("aria-pressed", String(shown));
+        button.title = label;
+        button.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>${shown ? '<path d="m3 3 18 18"/>' : ''}</svg>`;
+      };
+      update();
+      button.addEventListener("click", event => {
+        event.preventDefault();
+        field.type = field.type === "password" ? "text" : "password";
+        update();
+        captureSyncDraft(host);
+      });
+    }
+    if (state.status.phase === "error") showSyncError(host, state.status.message);
+    else if (state.remoteVaultsError) showSyncError(host, state.remoteVaultsError);
 
     const run = async (
       action: () => Promise<SyncSnapshot>,
@@ -156,28 +244,48 @@ export async function renderSyncPanel(
       success?: string | ((next: SyncSnapshot) => string),
     ) => {
       const message = host.querySelector<HTMLElement>("#sync-message")!;
-      message.classList.remove("error", "success"); message.textContent = pending;
+      message.classList.remove("error", "success"); message.setAttribute("role", "status"); message.setAttribute("aria-live", "polite"); message.textContent = pending;
       try {
         snapshot = await action();
         draw(snapshot);
+        if (snapshot.status.phase === "error" || snapshot.remoteVaultsError) return;
         if (success) {
           const confirmation = host.querySelector<HTMLElement>("#sync-message")!;
           confirmation.classList.add("success");
           confirmation.textContent = typeof success === "function" ? success(snapshot) : success;
         }
       }
-      catch (error) { message.classList.add("error"); message.textContent = String(error); }
+      catch (error) { showSyncError(host, error); }
     };
-    install.addEventListener("click", () => void run(() => invoke("sync_install_ob"), "Installing Node dependencies and Obsidian Headless…"));
+    install.addEventListener("click", async () => {
+      install.disabled = true;
+      const refresh = host.querySelector<HTMLButtonElement>("#sync-refresh")!;
+      refresh.disabled = true;
+      try {
+        await run(() => invoke("sync_install_ob"), "Setting up Obsidian Headless and its dependencies. This may take a few minutes…", "Obsidian Headless is ready. Log in to continue.");
+      } finally {
+        if (install.isConnected) install.disabled = false;
+        if (refresh.isConnected) refresh.disabled = false;
+      }
+    });
     host.querySelector("#sync-refresh")!.addEventListener("click", () => void run(loadSyncState, "Refreshing provider state…"));
     host.querySelector("#sync-now")!.addEventListener("click", () => void run(() => invoke("sync_now"), "Starting sync…"));
     host.querySelector<HTMLFormElement>("#sync-login-form")!.addEventListener("submit", (event) => {
       event.preventDefault();
-      void run(() => invoke("sync_login", { request: {
-        email: host.querySelector<HTMLInputElement>("#sync-email")!.value,
-        password: host.querySelector<HTMLInputElement>("#sync-account-password")!.value,
-        mfa: host.querySelector<HTMLInputElement>("#sync-mfa")!.value,
-      } }), "Logging in to Obsidian…", "Logged in to Obsidian.");
+      const button = host.querySelector<HTMLButtonElement>("#sync-login-form button[type=submit]")!;
+      if (button.disabled) return;
+      button.disabled = true;
+      void run(async () => {
+        const next = await invoke<SyncSnapshot>("sync_login", { request: {
+          email: host.querySelector<HTMLInputElement>("#sync-email")!.value,
+          password: host.querySelector<HTMLInputElement>("#sync-account-password")!.value,
+          mfa: host.querySelector<HTMLInputElement>("#sync-mfa")!.value,
+        } });
+        if (!next.loggedIn) throw new Error("Obsidian did not confirm login. Check the account details and MFA code, then retry.");
+        return next;
+      }, "Logging in to Obsidian…", "Logged in to Obsidian.").finally(() => {
+        if (button.isConnected) button.disabled = false;
+      });
     });
     form.addEventListener("submit", (event) => {
       event.preventDefault();

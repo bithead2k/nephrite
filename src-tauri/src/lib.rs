@@ -1,8 +1,11 @@
+mod mobile_storage;
 mod page_sql;
 mod plugins;
 mod postgres_compat;
 mod state;
 mod sync;
+mod sync_runtime;
+mod vault_storage;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, Weekday};
@@ -33,6 +36,7 @@ pub struct VaultInfo {
     pub updated: usize,
     pub removed: usize,
     pub full_rebuild: bool,
+    pub background_check: bool,
     pub file_count: i64,
     pub task_count: i64,
     pub link_count: i64,
@@ -616,12 +620,12 @@ fn project_version() -> String {
 }
 
 #[tauri::command]
-fn vault_open_plan(path: String) -> Result<VaultOpenPlan, String> {
+fn vault_open_plan(path: String, app: AppHandle) -> Result<VaultOpenPlan, String> {
     let root = PathBuf::from(path);
     if !root.is_dir() {
         return Err("Vault folder does not exist".into());
     }
-    let database = root.join(".nephrite").join("index.db");
+    let database = vault_storage::index_database_path(&app, &root)?;
     if !database.is_file() {
         return Ok(VaultOpenPlan {
             rebuild: true,
@@ -879,12 +883,28 @@ async fn open_vault(
     state: State<'_, AppState>,
 ) -> Result<VaultInfo, String> {
     let root = PathBuf::from(&path);
+    let database = vault_storage::index_database_path(&app, &root)?;
     let index_state = Arc::clone(&state.index);
     let watcher_generation = Arc::clone(&state.watcher_generation);
     let generation = watcher_generation.fetch_add(1, Ordering::AcqRel) + 1;
     let progress_app = app.clone();
-    let (index, stats) = tauri::async_runtime::spawn_blocking(move || {
-        VaultIndex::open_with_progress(&root, |phase, done, total, path| {
+    let (index, stats, background_check) = tauri::async_runtime::spawn_blocking(move || {
+        let cached = VaultIndex::open_cached_at(&root, &database).map_err(|e| e.to_string())?;
+        if cached.cache_is_current().map_err(|e| e.to_string())? {
+            return Ok((
+                cached,
+                nephrite_index::ReconcileStats {
+                    scanned: 0,
+                    unchanged: 0,
+                    updated: 0,
+                    removed: 0,
+                    full_rebuild: false,
+                },
+                true,
+            ));
+        }
+        drop(cached);
+        VaultIndex::open_with_progress_at(&root, &database, |phase, done, total, path| {
             let phase = match phase {
                 ProgressPhase::Scan => "scan",
                 ProgressPhase::Index => "index",
@@ -900,11 +920,16 @@ async fn open_vault(
                 },
             );
         })
+        .map(|(index, stats)| (index, stats, false))
         .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("Vault indexing task failed: {error}"))??;
-    let info = vault_info_from(&index, &stats);
+    if watcher_generation.load(Ordering::Acquire) != generation {
+        return Err("Vault open superseded".into());
+    }
+    let mut info = vault_info_from(&index, &stats);
+    info.background_check = background_check;
     *index_state.lock() = Some(index);
     start_vault_watcher(
         app,
@@ -914,6 +939,69 @@ async fn open_vault(
         generation,
     );
     Ok(info)
+}
+
+/// Verify outside the active index lock; apply candidates using current file contents.
+#[tauri::command]
+async fn check_vault_changes(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<VaultChangeEvent, String> {
+    let index = Arc::clone(&state.index);
+    let generations = Arc::clone(&state.watcher_generation);
+    let generation = generations.load(Ordering::Acquire);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, database) = {
+            let guard = index.lock();
+            let active = guard.as_ref().ok_or("No vault open")?;
+            if active.vault_root() != Path::new(&path) {
+                return Err("Vault changed".into());
+            }
+            (
+                active.vault_root().to_path_buf(),
+                active.database_path().to_path_buf(),
+            )
+        };
+        let scanner = VaultIndex::open_cached_at(&root, &database).map_err(|e| e.to_string())?;
+        let (scanned, paths) = scanner.changed_paths().map_err(|e| e.to_string())?;
+        drop(scanner);
+        let mut result = VaultChangeEvent {
+            scanned,
+            updated: 0,
+            removed: 0,
+            paths: Vec::new(),
+        };
+        for path in paths {
+            let mut guard = index.lock();
+            if generations.load(Ordering::Acquire) != generation {
+                return Err("Vault changed".into());
+            }
+            let active = guard.as_mut().ok_or("No vault open")?;
+            if active.vault_root() != root {
+                return Err("Vault changed".into());
+            }
+            let exists = root.join(&path).is_file();
+            active.index_path(&path).map_err(|e| e.to_string())?;
+            if exists {
+                result.updated += 1;
+            } else {
+                result.removed += 1;
+            }
+            result.paths.push(path);
+        }
+        if !result.paths.is_empty() {
+            let guard = index.lock();
+            if generations.load(Ordering::Acquire) != generation {
+                return Err("Vault changed".into());
+            }
+            if let Some(active) = guard.as_ref() {
+                active.resolve_all_links().map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4407,6 +4495,7 @@ fn vault_info_from(index: &VaultIndex, stats: &nephrite_index::ReconcileStats) -
         updated: stats.updated,
         removed: stats.removed,
         full_rebuild: stats.full_rebuild,
+        background_check: false,
         file_count: index.count("files").unwrap_or(0),
         task_count: index.count("tasks").unwrap_or(0),
         link_count: index.count("links").unwrap_or(0),
@@ -5217,6 +5306,9 @@ pub struct GitBranches {
 }
 
 fn git_output(root: &Path, arguments: &[&str]) -> Result<std::process::Output, String> {
+    if cfg!(target_os = "android") {
+        return Err("Git shell operations are unavailable on mobile".into());
+    }
     std::process::Command::new("git")
         .args(arguments)
         .current_dir(root)
@@ -5836,6 +5928,9 @@ async fn render_vim_powerline(
     columns: usize,
     state: State<'_, AppState>,
 ) -> Result<VimPowerlineResult, String> {
+    if cfg!(target_os = "android") {
+        return Err("Vim process integration is unavailable on mobile".into());
+    }
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
@@ -5949,6 +6044,9 @@ fn shell_command(
     timeout_ms: Option<u64>,
     state: State<'_, AppState>,
 ) -> Result<ShellResult, String> {
+    if cfg!(target_os = "android") {
+        return Err("Arbitrary shell execution is unavailable on mobile".into());
+    }
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
@@ -6052,24 +6150,32 @@ fn shell_command(
 
 #[tauri::command]
 fn sync_state(state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    ensure_desktop_sync()?;
     let root = vault_root(&state)?;
     Ok(sync::snapshot(&root, &state.sync))
 }
 
 #[tauri::command]
-fn sync_install_ob(state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+async fn sync_install_ob(state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    ensure_desktop_sync()?;
     let root = vault_root(&state)?;
-    sync::install_ob()?;
+    tauri::async_runtime::spawn_blocking(sync::install_ob)
+        .await
+        .map_err(|error| format!("Sync installer stopped: {error}"))??;
     Ok(sync::snapshot(&root, &state.sync))
 }
 
 #[tauri::command]
-fn sync_login(
+async fn sync_login(
     request: SyncLoginRequest,
     state: State<'_, AppState>,
 ) -> Result<SyncSnapshot, String> {
+    ensure_desktop_sync()?;
     let root = vault_root(&state)?;
-    sync::login(request)?;
+    tauri::async_runtime::spawn_blocking(move || sync::login(request))
+        .await
+        .map_err(|error| format!("Login stopped: {error}"))??;
+    state.sync.record_login();
     Ok(sync::snapshot(&root, &state.sync))
 }
 
@@ -6079,6 +6185,7 @@ fn sync_configure(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<SyncSnapshot, String> {
+    ensure_desktop_sync()?;
     let root = vault_root(&state)?;
     sync::configure(app, &root, &state.sync, request)?;
     Ok(sync::snapshot(&root, &state.sync))
@@ -6090,6 +6197,7 @@ fn sync_set_continuous(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<SyncSnapshot, String> {
+    ensure_desktop_sync()?;
     let root = vault_root(&state)?;
     sync::set_continuous(app, &root, &state.sync, continuous)?;
     Ok(sync::snapshot(&root, &state.sync))
@@ -6097,6 +6205,7 @@ fn sync_set_continuous(
 
 #[tauri::command]
 fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    ensure_desktop_sync()?;
     let root = vault_root(&state)?;
     sync::sync_once(app, &root, &state.sync)?;
     Ok(sync::snapshot(&root, &state.sync))
@@ -6104,6 +6213,7 @@ fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncSnapshot, 
 
 #[tauri::command]
 fn sync_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    ensure_desktop_sync()?;
     let root = vault_root(&state)?;
     state.sync.stop(Some(&app));
     let settings = sync::load_settings(&root);
@@ -6114,8 +6224,20 @@ fn sync_open_vault(app: AppHandle, state: State<'_, AppState>) -> Result<SyncSna
     Ok(sync::snapshot(&root, &state.sync))
 }
 
+fn ensure_desktop_sync() -> Result<(), String> {
+    if cfg!(target_os = "android") {
+        Err("Use the Obsidian app for Sync on mobile".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(mobile_storage::init());
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
@@ -6125,11 +6247,15 @@ pub fn run() {
             sync: SyncManager::default(),
         })
         .invoke_handler(tauri::generate_handler![
+            mobile_storage::mobile_storage_permission,
+            mobile_storage::mobile_request_storage_permission,
+            mobile_storage::mobile_vault_candidates,
             project_version,
             vault_open_plan,
             read_user_vimrc,
             templater_templates_folder,
             open_vault,
+            check_vault_changes,
             refresh_vault,
             set_visible_paths,
             vault_stats,

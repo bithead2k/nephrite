@@ -12,6 +12,7 @@ import {
   runDqlBlock,
   runScriptBlock,
   runTasksBlock,
+  executeBlocksInPreview,
   type DvPage,
   type EngineContext,
 } from "../ui/src/dv-engine";
@@ -504,4 +505,34 @@ test("today's vault journal note reproduces Obsidian Dataview results", async ()
 
   // Obsidian `DDDD` renders the long date format, not the literal token.
   assert.equal(evaluateDql('dateformat(date("2026-08-14"), "DDDD")', page, page), "Friday, August 14, 2026");
+});
+
+
+test("metadata refresh reruns INFO inline queries and preserves neighboring ANSI text", async () => {
+  const { renderPreview } = await import("../ui/src/preview");
+  const { splitMarkdownBlocks } = await import("../ui/src/preview-blocks");
+  const { refreshPreviewDynamics } = await import("../ui/src/preview-dynamics");
+  const { highlightPreviewCode } = await import("../ui/src/syntax-highlight");
+  const body = '> [!info]\n> `= this.company`\n\n```dataviewjs\ndv.paragraph(dv.current().company)\n```\n\n```text\n\x1b[33m│ ↑ 8 mph │\x1b[0m\n```\n';
+  const root = document.createElement("div");
+  root.innerHTML = renderPreview(body);
+  document.body.append(root);
+  const ctx = (company: string): EngineContext => ({ ...context(),
+    loadPages: async () => [page(brady.path, [], { company })],
+    loadPage: async () => page(brady.path, [], { company }),
+  });
+  await executeBlocksInPreview(body, root, ctx("Before"));
+  highlightPreviewCode(root);
+  assert.match(root.querySelector(".callout")!.textContent!, /Before/);
+  const weather = root.querySelector("code.language-text")!;
+  const weatherHtml = weather.innerHTML;
+  await refreshPreviewDynamics(splitMarkdownBlocks(body), root, ctx("After"), () => true,
+    async html => html.replace('class="md-block"', 'class="md-block processed"'));
+  assert.match(root.querySelector(".callout")!.textContent!, /After/);
+  assert.doesNotMatch(root.textContent!, /Before|error:/);
+  assert.match(root.querySelector(".dv-block")!.textContent!, /After/);
+  assert.equal(root.querySelector("code.language-text"), weather);
+  assert.equal(weather.innerHTML, weatherHtml);
+  assert.equal(weather.textContent, "│ ↑ 8 mph │\n");
+  root.remove();
 });

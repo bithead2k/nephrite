@@ -62,6 +62,7 @@ import { bindImmediateTreeDrag } from "../ui/src/tree-drag";
 import { createNotePreviewHeader } from "../ui/src/note-preview-header";
 import { openFootnoteComposer } from "../ui/src/footnote-composer";
 import { footnoteEditTarget } from "../ui/src/footnotes";
+import { obsidianOpenNoteUri } from "../ui/src/mobile-handoff";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -86,6 +87,28 @@ Object.defineProperties(globalThis, {
 
 dom.window.HTMLElement.prototype.scrollIntoView = () => {};
 dom.window.alert = () => {};
+
+test("mobile handoff opens an existing note by absolute path without invoking Daily Notes", () => {
+  assert.equal(
+    obsidianOpenNoteUri(
+      "/storage/emulated/0/Documents/notes",
+      "journals/2026_09_16.md",
+    ),
+    "obsidian://open?path=%2Fstorage%2Femulated%2F0%2FDocuments%2Fnotes%2Fjournals%2F2026_09_16.md",
+  );
+  assert.equal(
+    obsidianOpenNoteUri("/storage/emulated/0/Documents/My Notes", "People/María Notes.md"),
+    "obsidian://open?path=%2Fstorage%2Femulated%2F0%2FDocuments%2FMy%20Notes%2FPeople%2FMar%C3%ADa%20Notes.md",
+  );
+});
+
+test("mobile handoff refuses creation-prone or out-of-vault targets", () => {
+  assert.equal(obsidianOpenNoteUri("/storage/emulated/0/Documents/notes", null), null);
+  assert.equal(obsidianOpenNoteUri("notes", "journals/2026_09_16.md"), null);
+  assert.equal(obsidianOpenNoteUri("/storage/emulated/0/Documents/notes", "../outside.md"), null);
+  assert.equal(obsidianOpenNoteUri("/storage/emulated/0/Documents/notes", "/absolute.md"), null);
+  assert.equal(obsidianOpenNoteUri("/storage/emulated/0/Documents/notes", "journals/today"), null);
+});
 
 test("note preview header opens its underlying note from the upper-right action", () => {
   let opened = 0;
@@ -1102,4 +1125,199 @@ test("sql and sqlpostgresql fences highlight; pgsql is reserved for the engine",
   assert.match(engineCode?.className ?? "", /language-pgsql/);
   assert.notEqual(engineCode?.dataset.highlighted, "1");
   assert.doesNotMatch(engineCode?.className ?? "", /\bhljs\b/);
+});
+
+
+test("sync installation provisions dependencies, prevents duplicate clicks, refreshes status, and allows retry", async () => {
+  const { renderSyncPanel } = await import("../ui/src/sync-ui");
+  const host = document.createElement("div");
+  document.body.replaceChildren(host);
+  const state = {
+    settings: { provider: "obsidian_headless", continuous: false, remoteVault: "", mode: "bidirectional", conflictStrategy: "merge", fileTypes: [], configs: [], excludedFolders: [], deviceName: "test" },
+    status: { provider: "obsidian_headless", phase: "idle", message: "Idle", active: false, synced: false },
+    vaultPath: "/vault", obPath: null, nodeReady: false, loggedIn: false, configured: false, settingsSaved: false,
+    remotes: [], providerSettings: null, obsidianSettings: null, obsidianSettingsError: null,
+  };
+  let complete: (value: unknown) => void = () => {};
+  let fail: (reason: unknown) => void = () => {};
+  let installs = 0;
+  Object.defineProperty(dom.window, "__TAURI_INTERNALS__", { configurable: true, value: {
+    invoke: (command: string) => command === "sync_state" ? Promise.resolve(state) : new Promise((resolve, reject) => {
+      assert.equal(command, "sync_install_ob"); installs++; complete = resolve; fail = reject;
+    }),
+  } });
+  await renderSyncPanel(host, () => {});
+  assert.match(host.querySelector("#sync-provider-state")!.textContent!, /dependencies automatically/);
+  const install = host.querySelector<HTMLButtonElement>("#sync-install")!;
+  install.click(); install.click();
+  assert.equal(installs, 1);
+  assert.equal(install.disabled, true);
+  assert.equal(host.querySelector<HTMLButtonElement>("#sync-refresh")!.disabled, true);
+  fail("Download interrupted");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(install.disabled, false);
+  assert.match(host.querySelector("#sync-message")!.textContent!, /Download interrupted/);
+  install.click();
+  complete({ ...state, obPath: "/private/ob/cli.js", nodeReady: true });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(host.querySelector("#sync-provider-state")!.textContent!, /Installed:/);
+  assert.equal(host.querySelector<HTMLButtonElement>("#sync-install")!.disabled, true);
+  assert.equal(host.querySelector<HTMLFormElement>("#sync-login-form")!.hidden, false);
+});
+
+test("confirmed login enables settings without vaults; unconfirmed login never shows success", async () => {
+  const { renderSyncPanel } = await import("../ui/src/sync-ui");
+  const host = document.createElement("div");
+  document.body.replaceChildren(host);
+  const state = {
+    settings: { provider: "obsidian_headless", continuous: false, remoteVault: "", mode: "bidirectional", conflictStrategy: "merge", fileTypes: [], configs: [], excludedFolders: [], deviceName: "test" },
+    status: { provider: "obsidian_headless", phase: "idle", message: "Idle", active: false, synced: false },
+    vaultPath: "/vault", obPath: "/private/cli.js", nodeReady: true, loggedIn: false, configured: false, settingsSaved: false,
+    remotes: [], providerSettings: null, obsidianSettings: null, obsidianSettingsError: null,
+  };
+  let confirmed = true;
+  Object.defineProperty(dom.window, "__TAURI_INTERNALS__", { configurable: true, value: {
+    invoke: async (command: string) => command === "sync_state" ? state : { ...state, loggedIn: confirmed },
+  } });
+  await renderSyncPanel(host, () => {});
+  host.querySelector("#sync-login-form")!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true }));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(host.querySelector<HTMLInputElement>("#sync-device-name")!.disabled, false);
+  assert.equal(host.querySelector<HTMLFormElement>("#sync-login-form")!.hidden, false);
+  assert.match(host.querySelector("#sync-remote-error")!.textContent!, /no remote vaults/);
+  assert.equal(host.querySelector("#sync-message")!.classList.contains("success"), true);
+  confirmed = false;
+  await renderSyncPanel(host, () => {});
+  host.querySelector("#sync-login-form")!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true }));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(host.querySelector("#sync-message")!.classList.contains("success"), false);
+  assert.match(host.querySelector("#sync-message")!.textContent!, /did not confirm login/);
+  assert.equal(host.querySelector<HTMLInputElement>("#sync-device-name")!.disabled, false);
+});
+
+test("sync forms retain credentials and selections through login, failed setup, reauthentication, refresh, and reopening", async () => {
+  const { renderSyncPanel } = await import("../ui/src/sync-ui");
+  let host = document.createElement("div");
+  document.body.replaceChildren(host);
+  const base = {
+    settings: { provider: "obsidian_headless", continuous: false, remoteVault: "", mode: "bidirectional", conflictStrategy: "merge", fileTypes: [], configs: [], excludedFolders: [], deviceName: "server default" },
+    status: { provider: "obsidian_headless", phase: "idle", message: "Idle", active: false, synced: false },
+    vaultPath: "/retained-sync-draft", obPath: "/private/cli.js", nodeReady: true, loggedIn: false, configured: false, settingsSaved: false,
+    remotes: [{ id: "a", name: "First", region: "" }, { id: "b", name: "Chosen", region: "" }],
+    providerSettings: null, obsidianSettings: null, obsidianSettingsError: null,
+  };
+  let failSetup = true, emptyRemotes = false;
+  Object.defineProperty(dom.window, "__TAURI_INTERNALS__", { configurable: true, value: {
+    invoke: async (command: string, args: any) => {
+      if (command === "sync_state") return { ...base, remotes: emptyRemotes ? [] : base.remotes };
+      if (command === "sync_login") {
+        assert.equal(args.request.email, "test@example.invalid");
+        assert.equal(args.request.password, "account test password");
+        assert.equal(args.request.mfa, "123456");
+        return { ...base, loggedIn: true };
+      }
+      assert.equal(command, "sync_configure");
+      assert.equal(args.request.encryptionPassword, "encryption test password");
+      assert.equal(args.request.settings.remoteVault, "b");
+      assert.deepEqual(args.request.settings.fileTypes, ["pdf"]);
+      if (failSetup) throw new Error("Please log in again");
+      return { ...base, loggedIn: true, configured: true, settingsSaved: true };
+    },
+  } });
+  const input = (id: string) => host.querySelector<HTMLInputElement>(`#${id}`)!;
+  const submit = async (id: string) => {
+    host.querySelector(`#${id}`)!.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+  };
+  const verify = () => {
+    assert.equal(input("sync-email").value, "test@example.invalid");
+    assert.equal(input("sync-account-password").value, "account test password");
+    assert.equal(input("sync-mfa").value, "123456");
+    assert.equal(input("sync-encryption-password").value, "encryption test password");
+    assert.equal(input("sync-account-password").type, "text");
+    assert.equal(input("sync-encryption-password").type, "text");
+    assert.equal(host.querySelector('[data-password-toggle="sync-account-password"]')!.getAttribute("aria-pressed"), "true");
+    assert.equal(input("sync-remote").value, "b");
+    assert.equal(input("sync-device-name").value, "my device");
+    assert.equal(input("sync-mode").value, "pull-only");
+    assert.equal(input("sync-conflict").value, "conflict");
+    assert.equal(input("sync-excluded").value, "Archive, video");
+    assert.equal(input("sync-continuous").checked, true);
+    assert.equal(host.querySelector<HTMLInputElement>('input[name=fileType][value=pdf]')!.checked, true);
+    assert.equal(host.querySelector<HTMLInputElement>('input[name=config][value=appearance]')!.checked, true);
+    assert.equal(host.querySelector<HTMLFormElement>("#sync-login-form")!.hidden, false);
+    assert.equal(input("sync-device-name").disabled, false);
+  };
+  await renderSyncPanel(host, () => {});
+  for (const [id, value] of Object.entries({ "sync-email": "test@example.invalid", "sync-account-password": "account test password", "sync-mfa": "123456", "sync-encryption-password": "encryption test password", "sync-remote": "b", "sync-device-name": "my device", "sync-mode": "pull-only", "sync-conflict": "conflict", "sync-excluded": "Archive, video" })) input(id).value = value;
+  input("sync-continuous").checked = true;
+  host.querySelector<HTMLInputElement>('input[name=fileType][value=pdf]')!.checked = true;
+  host.querySelector<HTMLInputElement>('input[name=config][value=appearance]')!.checked = true;
+  input("sync-email").dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  assert.equal(input("sync-account-password").type, "password");
+  assert.equal(input("sync-encryption-password").type, "password");
+  host.querySelector<HTMLButtonElement>('[data-password-toggle="sync-account-password"]')!.click();
+  assert.equal(input("sync-account-password").type, "text");
+  assert.equal(input("sync-encryption-password").type, "password");
+  host.querySelector<HTMLButtonElement>('[data-password-toggle="sync-encryption-password"]')!.click();
+  await submit("sync-login-form"); verify();
+  host.scrollTop = 800;
+  await submit("sync-config-form"); verify();
+  assert.match(host.querySelector("#sync-message")!.textContent!, /Please log in again/);
+  assert.equal(host.scrollTop, 0);
+  assert.equal(host.querySelector(".sync-settings")!.firstElementChild!.id, "sync-message");
+  assert.equal(host.querySelector("#sync-message")!.getAttribute("role"), "alert");
+  assert.equal(document.activeElement, host.querySelector("#sync-message"));
+  await submit("sync-login-form"); verify();
+  failSetup = false;
+  await submit("sync-config-form"); verify();
+  emptyRemotes = true;
+  host.querySelector<HTMLButtonElement>("#sync-refresh")!.click();
+  await new Promise(resolve => setTimeout(resolve, 0)); verify();
+  host = document.createElement("div"); document.body.replaceChildren(host);
+  await renderSyncPanel(host, () => {}); verify();
+  const { updateSyncPanelStatus } = await import("../ui/src/sync-ui");
+  host.scrollTop = 900;
+  updateSyncPanelStatus(host, { ...base.status, phase: "error", message: "Background sync disconnected" });
+  verify();
+  assert.equal(host.scrollTop, 0);
+  assert.equal(host.querySelector("#sync-message")!.textContent, "Background sync disconnected");
+  host.querySelector<HTMLButtonElement>('[data-password-toggle="sync-account-password"]')!.click();
+  assert.equal(input("sync-account-password").type, "password");
+  assert.equal(input("sync-account-password").value, "account test password");
+  assert.equal(input("sync-encryption-password").type, "text");
+});
+
+test("terminal text fences preserve weather art and render ANSI colors safely", () => {
+  const source = "┌──────┐\n│ \x1b[38;5;226m☀  100°F\x1b[0m │\n`-’ <script>alert(1)</script>\n";
+  const html = highlightSource(source, "text");
+  const host = document.createElement("div");
+  host.innerHTML = renderPreview("```text\n" + source + "```\n");
+  highlightPreviewCode(host);
+  assert.equal(host.querySelector("code")?.textContent, source.replace(/\x1b\[[0-9;]*m/g, ""));
+  assert.match(html, /color:rgb\(255,255,0\)/);
+  assert.equal(host.querySelector("script"), null);
+  const first = host.innerHTML;
+  highlightPreviewCode(host);
+  assert.equal(host.innerHTML, first);
+  assert.match(highlightSource("\x1b[1;31;44mred\x1b[22;39;49mplain", "ansi"), /font-weight:bold/);
+  assert.match(highlightSource("\x1b[38;2;1;2;3mRGB\x1b[0m", "terminal"), /color:rgb\(1,2,3\)/);
+  assert.equal(highlightSource("\x1b]8;;javascript:alert(1)\x07label\x1b]8;;\x07\x1b[2K", "text"), "label");
+  assert.equal(highlightSource("plain  text\nnext", "text"), "plain  text\nnext");
+});
+
+test("terminal report arrows use one cell and box borders use CSS arms", () => {
+  const host = document.createElement("div");
+  const source = "│ ↑ 8 mph │\n│ ↖ 8 mph │\n└─────────┘\n界 e\u0301 😀";
+  host.innerHTML = highlightSource(source, "text");
+  assert.equal(host.textContent, source);
+  for (const arrow of ["↑", "↖"]) {
+    const cell = [...host.querySelectorAll(".terminal-cell")].find(c => c.textContent === arrow);
+    assert.ok(cell);
+    assert.equal(cell.className, "terminal-cell");
+  }
+  assert.equal(host.querySelectorAll(".terminal-wide").length, 2);
+  assert.ok(host.querySelector(".terminal-box .terminal-arm-u"));
+  assert.ok(host.querySelector(".terminal-box .terminal-arm-r"));
+  assert.equal([...host.querySelectorAll(".terminal-cell")].filter(c => c.textContent === "e\u0301").length, 1);
 });

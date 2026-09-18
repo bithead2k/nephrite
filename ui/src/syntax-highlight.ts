@@ -1,3 +1,4 @@
+import { renderAnsiText } from "./ansi-text";
 import hljs from "highlight.js/lib/common";
 import pgsql from "highlight.js/lib/languages/pgsql";
 import { languageFromClass, languageFromPath } from "./file-kinds";
@@ -45,8 +46,8 @@ export function resolveHighlightLanguage(language: string): string {
 
 export function highlightSource(source: string, language: string): string {
   const lang = resolveHighlightLanguage(language);
-  if (!lang || lang === "plaintext" || lang === "text" || lang === "plain") {
-    return escapeHtml(source);
+  if (!lang || lang === "plaintext" || lang === "text" || lang === "plain" || lang === "ansi" || lang === "terminal") {
+    return renderAnsiText(source);
   }
   try {
     if (hljs.getLanguage(lang)) {
@@ -73,6 +74,9 @@ export function highlightPreviewCode(root: ParentNode): void {
     if (!source.trim()) continue;
     const language = resolveHighlightLanguage(declared);
     code.innerHTML = highlightSource(source, language);
+    if (["text", "plain", "plaintext", "ansi", "terminal"].includes(language) && code.closest("pre")) {
+      code.classList.add("terminal-report");
+    }
     code.classList.add("hljs");
     code.classList.add(`language-${declared}`);
     code.dataset.highlighted = "1";

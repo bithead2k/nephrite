@@ -1,3 +1,5 @@
+import { refreshPreviewDynamics } from "./preview-dynamics";
+import { obsidianOpenNoteUri } from "./mobile-handoff";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -65,6 +67,14 @@ import {
   queryDiagnosticText,
 } from "./query-diagnostics";
 import { installWindowStatePersistence } from "./window-state";
+import {
+  ReadingModeController,
+  READING_WPM_PRESETS,
+  loadReadingPreferences,
+  saveReadingPreferences,
+  tauriReadingWindow,
+  type ReadingPreferences,
+} from "./reading-mode";
 import {
   showContextMenu,
   showItemMenu,
@@ -172,7 +182,7 @@ import {
   type PluginViewResult,
 } from "./plugin-host";
 import { renderPluginManager } from "./plugin-manager";
-import { loadSyncState, renderSyncPanel, type SyncSnapshot, type SyncStatus } from "./sync-ui";
+import { loadSyncState, renderSyncPanel, updateSyncPanelStatus, type SyncSnapshot, type SyncStatus } from "./sync-ui";
 import {
   DEFAULT_TASK_VIEW,
   DEFAULT_TASK_SCOPE,
@@ -243,6 +253,7 @@ const AUTOSAVE_DELAY_MS = 800;
 const PREVIEW_DELAY_MS = 1_000;
 
 const LAST_VAULT_KEY = "nephrite.lastVault";
+const mobileApp = /Android/i.test(navigator.userAgent);
 const VIM_KEY = "nephrite.vim";
 const PREVIEW_CSS_KEY = "nephrite.previewCss.v1";
 const DEFAULT_PREVIEW_CSS = "/* Nephrite page styles \u2014 edit in Preferences. Scoped to .preview */\n\n.preview {\n  line-height: 1.55;\n  color: var(--text);\n}\n\n.preview a {\n  color: var(--accent);\n  text-decoration: underline;\n  text-underline-offset: 2px;\n}\n\n.preview a:hover {\n  color: #9ee4c8;\n}\n\n.preview hr {\n  border: none;\n  border-top: 1px solid var(--border);\n  margin: 1.25em 0;\n}\n\n.preview ul,\n.preview ol {\n  margin: 0.55em 0 0.55em 1.35em;\n  padding: 0;\n}\n\n.preview li {\n  margin: 0.25em 0;\n}\n\n.preview li > ul,\n.preview li > ol {\n  margin-top: 0.2em;\n}\n\n.preview img {\n  max-width: 100%;\n  height: auto;\n  border-radius: 6px;\n}\n\n.preview table {\n  width: 100%;\n  border-collapse: collapse;\n  margin: 0.9em 0;\n  font-size: 0.92em;\n  display: block;\n  overflow-x: auto;\n}\n\n.preview th,\n.preview td {\n  border: 1px solid var(--border);\n  padding: 0.45em 0.7em;\n  text-align: left;\n  vertical-align: top;\n}\n\n.preview th {\n  background: #1a2330;\n  font-weight: 650;\n  color: #dff8ec;\n}\n\n.preview tr:nth-child(even) td {\n  background: color-mix(in srgb, #1a2330 55%, transparent);\n}\n\n.preview tr:hover td {\n  background: color-mix(in srgb, var(--accent) 10%, transparent);\n}\n\n.preview input[type=\"checkbox\"] {\n  margin-right: 0.4em;\n}\n";
@@ -268,6 +279,8 @@ let editor: NephriteEditor | null = null;
 let excalidrawView: import("./excalidraw-view").ExcalidrawView | null = null;
 let canvasView: CanvasView | null = null;
 let pluginManager: PluginManager | null = null;
+let readingMode: ReadingModeController | null = null;
+let readingPreferences = loadReadingPreferences();
 const shortcuts = new ShortcutRegistry();
 let taskScope: TaskScope = loadTaskScope();
 let vaultFilesAll: FileEntry[] = [];
@@ -323,11 +336,11 @@ let dailyNotesSettings: DailyNotesSettings = { ...DEFAULT_DAILY_NOTES };
 let filterQuery = "";
 let sidebarCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
 let showDotfiles = localStorage.getItem(DOTFILES_KEY) === "1";
-let vimOn = localStorage.getItem(VIM_KEY) === "1";
+let vimOn = !mobileApp && localStorage.getItem(VIM_KEY) === "1";
 let externalLinksInBrowser = localStorage.getItem(EXTERNAL_BROWSER_KEY) === "1";
 let appearanceFonts = loadAppearanceFonts();
 let tableSettings = loadTableSettings();
-let viewMode: ViewMode = normalizeMode(localStorage.getItem(VIEW_KEY));
+let viewMode: ViewMode = normalizeMode(localStorage.getItem(VIEW_KEY) ?? (mobileApp ? "live" : null));
 const previewWork = new DeferredDocumentWork(PREVIEW_DELAY_MS);
 const previewRenderer = new PreviewWorkerClient();
 const rightPreviewRenderer = new PreviewWorkerClient();
@@ -696,6 +709,7 @@ function activityIcon(name: ActivityId | "settings" | "file-search" | "panel-clo
 
 async function renderShell() {
   void installWindowStatePersistence();
+  document.documentElement.classList.toggle("mobile-app", mobileApp);
   document.getElementById("app")!.innerHTML = `
     <header class="topbar">
       <div class="brand">
@@ -703,6 +717,8 @@ async function renderShell() {
         <span class="ver" id="ver"></span>
       </div>
       <div class="actions">
+        <button type="button" id="btn-mobile-files" class="mobile-only" title="Browse notes">Files</button>
+        <button type="button" id="btn-mobile-obsidian" class="mobile-only" title="Save and open this note in Obsidian; Obsidian handles Sync" disabled>Obsidian ↗</button>
         <button type="button" id="btn-today" title="Jump to today's journal" disabled>Today</button>
         <button type="button" id="btn-save" disabled title="Save (Ctrl/Cmd+S)">Save</button>
         <div class="seg" role="group" aria-label="View mode">
@@ -711,6 +727,7 @@ async function renderShell() {
           <button type="button" data-mode="split" class="seg-btn" title="Edit + preview">Split</button>
           <button type="button" data-mode="preview" class="seg-btn" title="Preview only">Preview</button>
         </div>
+        <button type="button" id="btn-reading" title="Scroll Reading Mode" disabled>Read</button>
         <button type="button" id="btn-drawing" title="Create an Excalidraw drawing" disabled>Draw</button>
         <button type="button" id="btn-canvas" title="Create an Obsidian canvas" disabled>Canvas</button>
         <button type="button" id="btn-template" title="Apply a template (Ctrl-Y)" disabled>Template</button>
@@ -768,6 +785,32 @@ async function renderShell() {
               </div>
             </section>
             <section class="preferences-section" id="table-settings"></section>
+            <section class="preferences-section">
+              <strong>Scroll Reading Mode</strong>
+              <small>Fullscreen continuous reading. Up/Down changes speed, Space pauses, and Escape exits.</small>
+              <div class="reading-preferences-grid">
+                <label for="reading-wpm">Reading speed</label>
+                <select id="reading-wpm">
+                  ${READING_WPM_PRESETS.map((wpm) => `<option value="${wpm}"${wpm === readingPreferences.wpm ? " selected" : ""}>${wpm} WPM</option>`).join("")}
+                </select>
+                <label for="reading-code-speed">Code reading speed</label>
+                <span><input id="reading-code-speed" type="number" min="10" max="100" step="5" value="${Math.round(readingPreferences.codeMultiplier * 100)}" />%</span>
+                <label for="reading-table-speed">Table reading speed</label>
+                <span><input id="reading-table-speed" type="number" min="10" max="100" step="5" value="${Math.round(readingPreferences.tableMultiplier * 100)}" />%</span>
+              </div>
+              <label class="preference-toggle">
+                <input type="checkbox" id="reading-mirror" ${readingPreferences.mirror ? "checked" : ""} />
+                <span>Mirror horizontally for teleprompter glass</span>
+              </label>
+              <label class="preference-toggle">
+                <input type="checkbox" id="reading-chrome-free" ${readingPreferences.chromeFree ? "checked" : ""} />
+                <span>Hide all application chrome while reading</span>
+              </label>
+              <div class="preferences-font-actions">
+                <button type="button" id="reading-save">Save reading settings</button>
+                <button type="button" id="reading-start">Start reading</button>
+              </div>
+            </section>
             <section class="preferences-section">
               <strong>Task scope</strong>
               <small>Only checkboxes matching at least one configured rule appear in Tasks. Leave all fields empty to include every checkbox.</small>
@@ -909,6 +952,19 @@ async function renderShell() {
   `;
   applyAppearanceFonts(appearanceFonts);
   applyTablePreviewSettings(tableSettings);
+  readingMode = new ReadingModeController({
+    previewHost: $("preview-host"),
+    previewRoot: $("preview"),
+    presentationRoot: $("preview-host"),
+    getDocumentId: () => currentPath && currentFileKind === "markdown" ? currentPath : null,
+    getViewMode: () => viewMode,
+    showPreview: () => {
+      setViewMode("preview", false);
+      forceRenderCurrentDocument();
+    },
+    restoreViewMode: (mode) => setViewMode(mode, false),
+    readingWindow: tauriReadingWindow(),
+  });
   commandPrompt = renderPersistentCommandBar(
     $("persistent-command-bar"),
     () => commandCatalog(true).filter((command) => command.id !== "command"),
@@ -920,11 +976,20 @@ async function renderShell() {
     closePreferences();
     void openVault();
   });
+  $("btn-mobile-files").addEventListener("click", () => setSidebarCollapsed(!sidebarCollapsed, false));
+  $("btn-mobile-obsidian").addEventListener("click", () => void handoffToObsidian());
+  if (mobileApp) {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) void reconcileMobileVault();
+    });
+    window.addEventListener("focus", () => void reconcileMobileVault());
+  }
   $("activity-files").addEventListener("click", () => setSidebarCollapsed(false));
   $("btn-sidebar").addEventListener("click", () => setSidebarCollapsed(!sidebarCollapsed));
   $("btn-file-search").addEventListener("click", focusFileFilter);
   $("btn-refresh").addEventListener("click", () => void forceVaultRefresh());
   $("btn-save").addEventListener("click", () => void saveFile());
+  $("btn-reading").addEventListener("click", () => void enterReadingMode());
   $("btn-today").addEventListener("click", () => void openToday());
   $("btn-today-side").addEventListener("click", () => void showDailyCalendar());
   $("btn-drawing").addEventListener("click", () => void createDrawing());
@@ -997,6 +1062,12 @@ async function renderShell() {
   ($("task-scope-property") as HTMLInputElement).value = taskScope.property;
   $("task-scope-save").addEventListener("click", saveTaskScopePreferences);
   renderTableSettings($("table-settings"), tableSettings, saveTableSettings);
+  $("reading-save").addEventListener("click", saveReadingModePreferences);
+  $("reading-start").addEventListener("click", () => {
+    saveReadingModePreferences();
+    closePreferences();
+    void enterReadingMode();
+  });
   $("appearance-font-save").addEventListener("click", saveAppearanceFontPreferences);
   $("appearance-font-reset").addEventListener("click", resetAppearanceFontPreferences);
   $("preferences-plugin-reload").addEventListener("click", () => void reloadPlugins().then(renderPreferencesPlugins));
@@ -1236,7 +1307,10 @@ async function renderShell() {
       $("vault-label").textContent = "Vault reopen failed";
       $("index-stats").textContent = message;
       setTransientStatus(message, "#e9ad55");
+      if (mobileApp) void showMobileVaultPicker();
     });
+  } else if (mobileApp) {
+    void showMobileVaultPicker();
   }
 }
 
@@ -1420,6 +1494,37 @@ function saveTableSettings(settings: TableSettings) {
   setTransientStatus("Table settings saved", "#5ecf9a");
 }
 
+function saveReadingModePreferences() {
+  const percent = (id: string, fallback: number) => {
+    const value = Number((document.getElementById(id) as HTMLInputElement | null)?.value);
+    return Number.isFinite(value) ? value / 100 : fallback;
+  };
+  const candidate: ReadingPreferences = {
+    wpm: Number(($("reading-wpm") as HTMLSelectElement).value),
+    codeMultiplier: percent("reading-code-speed", readingPreferences.codeMultiplier),
+    tableMultiplier: percent("reading-table-speed", readingPreferences.tableMultiplier),
+    mirror: ($("reading-mirror") as HTMLInputElement).checked,
+    chromeFree: ($("reading-chrome-free") as HTMLInputElement).checked,
+  };
+  readingPreferences = saveReadingPreferences(candidate);
+  readingMode?.reloadPreferences();
+  ($("reading-code-speed") as HTMLInputElement).value = String(Math.round(readingPreferences.codeMultiplier * 100));
+  ($("reading-table-speed") as HTMLInputElement).value = String(Math.round(readingPreferences.tableMultiplier * 100));
+  setTransientStatus("Reading settings saved", "#5ecf9a");
+}
+
+async function enterReadingMode() {
+  if (!currentPath || currentFileKind !== "markdown" || !editor) {
+    setTransientStatus("Open a Markdown note to start Scroll Reading Mode", "#e9ad55");
+    return;
+  }
+  if (isKanbanSource(editor.getDoc())) {
+    setTransientStatus("Scroll Reading Mode is not available for a Kanban board", "#e9ad55");
+    return;
+  }
+  await readingMode?.enter();
+}
+
 function formatEditorTables(scope: "current" | "selection" | "note") {
   if (!editor || currentFileKind !== "markdown") return;
   const result = editor.formatTables(scope);
@@ -1452,10 +1557,10 @@ function closePreferences() {
   $("btn-preferences").classList.remove("active");
 }
 
-function setViewMode(mode: ViewMode) {
+function setViewMode(mode: ViewMode, persist = true) {
   viewMode = mode;
-  localStorage.setItem(VIEW_KEY, mode);
-  if (currentPath && currentFileKind === "markdown") {
+  if (persist) localStorage.setItem(VIEW_KEY, mode);
+  if (persist && currentPath && currentFileKind === "markdown") {
     pageViewModes.set(currentPath, mode);
     persistMap(pageViewStorageKey, pageViewModes);
   }
@@ -1708,7 +1813,7 @@ async function renderRightPane(text: string, revision: number) {
       return;
     }
     if (plan.kind === "yaml") {
-      // Frontmatter-only: refresh props; re-render + re-run fence-bearing body blocks.
+      // Frontmatter-only: refresh props and rerun both inline and fenced queries.
       const host = document.getElementById("preview-host");
       const scrollTop = host?.scrollTop ?? 0;
       const scrollLeft = host?.scrollLeft ?? 0;
@@ -1723,31 +1828,14 @@ async function renderRightPane(text: string, revision: number) {
       } else if (existingProps) {
         existingProps.remove();
       }
-      previewEl.querySelectorAll(".dv-block, .dv-inline").forEach((el) => el.remove());
-      for (let index = 0; index < plan.blocks.length; index++) {
-        const block = plan.blocks[index];
-        if (!/```(?:pgsql\b|dataview|dataviewjs|js|javascript|tasks\b)/i.test(block)) continue;
-        const node = previewEl.querySelector(
-          `:scope > .md-block[data-block-index="${index}"]`,
-        ) as HTMLElement | null;
-        if (!node) continue;
-        const tpl = document.createElement("template");
-        tpl.innerHTML = renderBlockHtml(block, index).trim();
-        const fresh = tpl.content.firstElementChild as HTMLElement | null;
-        if (!fresh) continue;
-        if (pluginManager?.hasPostProcessors() || pluginManager?.hasCodeBlockProcessors()) {
-          const processed = await applyPluginPreviewProcessors(fresh.outerHTML, path);
-          const reprocessed = document.createElement("template");
-          reprocessed.innerHTML = processed;
-          node.replaceWith(reprocessed.content.firstElementChild ?? fresh);
-        } else {
-          node.replaceWith(fresh);
-        }
-        const dynCtx = makeEngineContext(path, text, (target) => void openWikilink(target));
-        void executeBlocksInSubtree(block, fresh, dynCtx, () =>
-          isPreviewRevisionCurrent(path, revision),
-        );
-      }
+      const dynCtx = makeEngineContext(path, text, (target) => void openWikilink(target));
+      await refreshPreviewDynamics(
+        plan.blocks, previewEl, dynCtx,
+        () => isPreviewRevisionCurrent(path, revision),
+        pluginManager?.hasPostProcessors() || pluginManager?.hasCodeBlockProcessors()
+          ? (html) => applyPluginPreviewProcessors(html, path) : undefined,
+      );
+      if (!isPreviewRevisionCurrent(path, revision)) return;
       lastPreviewBody = text;
       previewEl.dataset.previewPath = path;
       if (host) {
@@ -1809,15 +1897,15 @@ async function renderRightPane(text: string, revision: number) {
         // visible. Refresh at the preview root instead of only binding the new
         // block so cross-block section state and the TOC update immediately.
         hydrateTableOfContents(previewEl);
-        // Bind only; skip full dynamic re-run unless a dirty block has code fences.
+        // Bind preserved content; rerun scripts only in changed blocks.
         bindPreviewContent(previewEl, path, revision);
-        // Scoped dynamics: only re-execute fences inside the replaced .md-block nodes.
+        // Scoped dynamics: execute inline expressions and fences in replaced blocks.
         const dynCtx = makeEngineContext(path, text, (target) => void openWikilink(target));
         for (const index of plan.changed) {
           const node = previewEl.querySelector(
             `:scope > .md-block[data-block-index="${index}"]`,
           ) as HTMLElement | null;
-          if (!node?.querySelector("pre > code")) continue;
+          if (!node?.querySelector("code")) continue;
           void executeBlocksInSubtree(plan.blocks[index], node, dynCtx, () =>
             isPreviewRevisionCurrent(path, revision),
           );
@@ -2837,6 +2925,11 @@ async function runKanbanHookScript(
 function updateChrome() {
   const save = $("btn-save") as HTMLButtonElement;
   save.disabled = !currentPath || !dirty;
+  if (mobileApp) {
+    ($("btn-mobile-obsidian") as HTMLButtonElement).disabled =
+      !vaultOpen || currentFileKind !== "markdown" ||
+      obsidianOpenNoteUri(localStorage.getItem(LAST_VAULT_KEY), currentPath) == null;
+  }
   const tab = $("tab");
   tab.textContent = editorTabTitle(
     currentPath,
@@ -2844,6 +2937,8 @@ function updateChrome() {
     openTabs.length,
     sessionPersistenceReady,
   );
+  ($("btn-reading") as HTMLButtonElement).disabled =
+    !currentPath || currentFileKind !== "markdown";
   if (dirty) return;
   const hasVault = mdFiles.length > 0 || !!localStorage.getItem(LAST_VAULT_KEY);
   ($("btn-refresh") as HTMLButtonElement).disabled = !vaultOpen || refreshInProgress;
@@ -2864,6 +2959,10 @@ function updateChrome() {
 }
 
 async function openVault() {
+  if (mobileApp) {
+    await showMobileVaultPicker();
+    return;
+  }
   const selected = await open({
     directory: true,
     multiple: false,
@@ -2873,7 +2972,131 @@ async function openVault() {
   await openVaultPath(selected as string);
 }
 
+type MobileStoragePermission = { granted: boolean };
+let mobileReconcileInFlight = false;
+
+async function showMobileVaultPicker() {
+  const body = openFeaturePanel("Open a shared vault");
+  const explanation = document.createElement("p");
+  explanation.textContent = "Nephrite opens the same local folder as Obsidian. Notes stay as Markdown; the index is kept in Nephrite's private app storage.";
+  body.append(explanation);
+  let permission: MobileStoragePermission;
+  try {
+    permission = await invoke<MobileStoragePermission>("mobile_storage_permission");
+  } catch (error) {
+    body.append(document.createTextNode(`Storage check failed: ${String(error)}`));
+    return;
+  }
+  if (!permission.granted) {
+    const grant = document.createElement("button");
+    grant.type = "button";
+    grant.className = "mobile-vault-option";
+    grant.textContent = "Allow access to local vault files…";
+    grant.addEventListener("click", () => {
+      void invoke("mobile_request_storage_permission").catch((error) => void uiAlert(String(error)));
+    });
+    const reason = document.createElement("p");
+    reason.textContent = "Android requires All files access for a direct, shared-folder vault. Grant it to Nephrite in Settings, then return here. No vault files are copied or modified by opening it.";
+    body.append(reason, grant);
+    return;
+  }
+  let candidates: string[] = [];
+  try {
+    candidates = await invoke<string[]>("mobile_vault_candidates");
+  } catch (error) {
+    body.append(document.createTextNode(`Vault discovery failed: ${String(error)}`));
+  }
+  const list = document.createElement("div");
+  list.className = "mobile-vault-list";
+  for (const candidate of candidates) {
+    const choice = document.createElement("button");
+    choice.type = "button";
+    choice.className = "mobile-vault-option";
+    choice.textContent = candidate;
+    choice.title = candidate;
+    choice.addEventListener("click", () => {
+      closeFeaturePanel();
+      void openVaultPath(candidate).catch((error) => void uiAlert(`Could not open vault: ${String(error)}`));
+    });
+    list.append(choice);
+  }
+  if (!candidates.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "No Obsidian configuration folder was found under shared Documents or Obsidian. You can enter any existing local folder below.";
+    body.append(empty);
+  }
+  body.append(list);
+  const pathLabel = document.createElement("label");
+  pathLabel.textContent = "Other local folder path";
+  pathLabel.className = "mobile-vault-path";
+  const pathInput = document.createElement("input");
+  pathInput.type = "text";
+  pathInput.autocomplete = "off";
+  pathInput.placeholder = "/storage/emulated/0/Documents/My Vault";
+  pathLabel.append(pathInput);
+  const openPath = document.createElement("button");
+  openPath.type = "button";
+  openPath.className = "mobile-vault-option";
+  openPath.textContent = "Open this folder";
+  openPath.addEventListener("click", () => {
+    const path = pathInput.value.trim();
+    if (!path.startsWith("/")) {
+      void uiAlert("Enter an absolute path to an existing local folder.");
+      return;
+    }
+    closeFeaturePanel();
+    void openVaultPath(path).catch((error) => void uiAlert(`Could not open vault: ${String(error)}`));
+  });
+  body.append(pathLabel, openPath);
+}
+
+async function handoffToObsidian() {
+  if (!mobileApp || !vaultOpen) return;
+  if (dirty) await saveFile();
+  if (dirty) {
+    void uiAlert("The note could not be saved. Resolve the save error before opening Obsidian so neither app overwrites your work.");
+    return;
+  }
+  const uri = currentFileKind === "markdown"
+    ? obsidianOpenNoteUri(localStorage.getItem(LAST_VAULT_KEY), currentPath)
+    : null;
+  if (!uri) {
+    void uiAlert("Open a Markdown note before switching to Obsidian. This lets Obsidian select the same local vault by file path.");
+    return;
+  }
+  try {
+    setTransientStatus("Opening this note in Obsidian…", "#9dc7f5");
+    await openUrl(uri);
+  } catch (error) {
+    void uiAlert(`Could not open Obsidian: ${String(error)}`);
+  }
+}
+
+async function reconcileMobileVault() {
+  if (!mobileApp || mobileReconcileInFlight) return;
+  mobileReconcileInFlight = true;
+  try {
+    if (!vaultOpen) {
+      if (!$('feature-panel').classList.contains('hidden') && $('feature-title').textContent === "Open a shared vault") {
+        await showMobileVaultPicker();
+      }
+      return;
+    }
+    const path = localStorage.getItem(LAST_VAULT_KEY);
+    if (!path) return;
+    const change = await invoke<VaultChangeEvent>("check_vault_changes", { path });
+    await applyVaultChange(change, false);
+  } catch (error) {
+    setTransientStatus(`Vault check failed: ${String(error)}`, "#e07070");
+  } finally {
+    mobileReconcileInFlight = false;
+  }
+}
+
+let vaultCheckSequence = 0;
+
 async function openVaultPath(path: string) {
+  if (readingMode?.isActive) await readingMode.exit();
   if (dirty && currentPath) {
     await saveFile(true);
     if (dirty) {
@@ -2881,6 +3104,7 @@ async function openVaultPath(path: string) {
       if (!proceed) return;
     }
   }
+  const checkSequence = ++vaultCheckSequence;
   // Preserve the old vault before entering the non-persistable loading state.
   // From this point until the final commit, unload must not serialize the
   // deliberately cleared intermediate workspace.
@@ -2910,13 +3134,13 @@ async function openVaultPath(path: string) {
     ? "Rebuilding index…"
     : isBackfill
       ? "Backfilling index…"
-      : "Indexing…";
+      : "Opening vault…";
   $("index-stats").textContent = plan.rebuild
     ? "Large vaults can take a minute on first open"
     : isBackfill
       ? "One-time re-parse; your files are unchanged"
-      : "Checking the vault for changed files";
-  showIndexProgress(plan.action);
+      : "Opening the saved index";
+  showIndexProgress(plan.rebuild || isBackfill ? plan.action : "Opening saved index…");
   // Let WebKit paint the progress UI before the synchronous index command starts.
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   let info: VaultInfo;
@@ -2959,19 +3183,36 @@ async function openVaultPath(path: string) {
   renderTabBar();
   await refreshTree();
   await loadDailyNotesSettings();
-  await reloadPlugins(info.root);
-  await reloadAutomations();
-  try {
-    applySyncSnapshot(await invoke<SyncSnapshot>("sync_open_vault"));
-  } catch (error) {
-    applySyncStatus({ provider: "obsidian_headless", phase: "error", message: `Sync startup failed: ${String(error)}`, active: false, synced: false });
+  if (!mobileApp) {
+    await reloadPlugins(info.root);
+    await reloadAutomations();
+    try {
+      applySyncSnapshot(await invoke<SyncSnapshot>("sync_open_vault"));
+    } catch (error) {
+      applySyncStatus({ provider: "obsidian_headless", phase: "error", message: `Sync startup failed: ${String(error)}`, active: false, synced: false });
+    }
   }
   // Restore tabs + active note + right pane from last session for this vault.
   await restoreSession(path);
-  await runAutomationLifecycle("onVaultOpen");
+  if (!mobileApp) await runAutomationLifecycle("onVaultOpen");
   sessionPersistenceReady = true;
   updateChrome();
   saveSession();
+  if (info.background_check) {
+    const summary = $("index-stats").textContent ?? "";
+    $("index-stats").textContent = `${summary} · Checking for changes…`;
+    void invoke<VaultChangeEvent>("check_vault_changes", { path: info.root }).then(async (change) => {
+      if (checkSequence !== vaultCheckSequence) return;
+      await applyVaultChange(change, false);
+      if (checkSequence !== vaultCheckSequence) return;
+      $("index-stats").textContent = `${summary} · ${change.updated || change.removed
+        ? `Updated ${change.updated}; removed ${change.removed}` : "No changes found"}`;
+    }).catch((error) => {
+      if (checkSequence === vaultCheckSequence) {
+        $("index-stats").textContent = `${summary} · Change check failed: ${String(error)}`;
+      }
+    });
+  }
 }
 
 function showIndexProgress(action: string) {
@@ -3050,6 +3291,7 @@ async function openVaultEntry(path: string) {
   const entry = vaultFilesAll.find((file) => file.path === path);
   if (!entry || isDocumentEntry(entry)) {
     await openNote(path);
+    if (mobileApp) setSidebarCollapsed(true, false);
   } else {
     await invoke("open_with_default_app", { path });
   }
@@ -3491,6 +3733,7 @@ async function openNote(
   path: string,
   opts?: OpenNoteOptions,
 ) {
+  if (readingMode?.isActive && path !== currentPath) await readingMode.exit();
   if (!opts?.forceReload && path === currentPath) {
     focusActiveDocumentPane();
     return;
@@ -5259,6 +5502,8 @@ function applySyncStatus(status: SyncStatus): void {
   commandPrompt?.setSyncStatus(status);
   const label = document.getElementById("preferences-sync-status");
   if (label) label.textContent = status.message;
+  const panel = document.getElementById("feature-body");
+  if (panel) updateSyncPanelStatus(panel, status);
 }
 
 function applySyncSnapshot(snapshot: SyncSnapshot): void {
@@ -5360,6 +5605,7 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     { id: "mode-live", title: "View: Live Preview", keywords: "editor rendered markdown", run: () => setViewMode("live") },
     { id: "mode-split", title: "View: Split", keywords: "editor preview", run: () => setViewMode("split") },
     { id: "mode-preview", title: "View: Preview", keywords: "render", run: () => setViewMode("preview") },
+    { id: "reading-mode", title: "Scroll Reading Mode", keywords: "read teleprompter fullscreen continuous", run: () => void enterReadingMode() },
     { id: "search", title: "Search vault", keywords: "find", run: showSearchPanel },
     { id: "graph", title: "Open graph", keywords: "links backlinks local", run: showGraphPanel },
     { id: "links", title: "Open links and outline", keywords: "backlinks outgoing unlinked mentions headings", run: () => void showNoteContextPanel() },
@@ -6780,6 +7026,7 @@ async function reopenClosedTab() {
 }
 
 async function closeTab(path: string) {
+  if (readingMode?.isActive && currentPath === path) await readingMode.exit();
   if (currentPath === path && dirty) {
     await saveFile(true);
     if (dirty) {

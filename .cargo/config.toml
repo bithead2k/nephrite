@@ -1,0 +1,4 @@
+[env]
+# libpg_query's PostgreSQL build assumes preadv/pwritev declarations. Android's
+# Bionic headers expose them under __USE_GNU (via _GNU_SOURCE).
+CFLAGS_aarch64_linux_android = "-D_GNU_SOURCE"

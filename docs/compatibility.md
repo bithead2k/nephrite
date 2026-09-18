@@ -426,3 +426,109 @@ the account database fallback on Unix. Executable discovery uses platform PATH
 separators and checks user/npm/nvm installation folders and Windows command shims.
 Once `ob` is discovered, the Node.js dependency warning clears on the refreshed
 sync snapshot, even if the desktop launcher's PATH lacks `node`.
+
+
+### Automatic sync dependency setup
+
+**Install ob** owns dependency setup on Windows, macOS, and Linux. It first checks
+an existing provider by launching it. Otherwise it reuses a compatible Node 22+
+runtime with npm, or downloads a private Node 22 runtime from nodejs.org and
+verifies the archive against the official SHA-256 manifest before extraction.
+This does not require a global npm installation, administrator access, shell
+initialization, or a change to the user's system Node installation.
+
+Private dependencies live under the platform's local application data directory
+in `Nephrite/sync-runtime`, outside the vault. Provider installation uses a staged
+npm prefix, verifies the actual `ob` entry point, then atomically records the
+runtime and entry point. Sync invokes Node directly, so npm shell shims and the
+desktop launcher's PATH are not required. Failed or interrupted provider setup
+can reuse the verified runtime on retry. Existing generations are retained so
+running processes are not damaged by a replacement.
+
+Installation runs off the UI thread. The install button blocks duplicate clicks;
+errors leave it available for retry, and successful installation refreshes provider
+status and enables login immediately. No login or sync is performed by installation.
+
+`cargo run -p nephrite --example sync-runtime-smoke` exercises a clean private
+installation, launch, repeated installation, and repair in a temporary directory,
+without reading or changing a vault. The same example can be built for Windows.
+
+
+### Sync authentication confirmation
+
+Login sends the account fields as structured input to a Node preload hook, which
+supplies them to the provider inside the child process. The provider runs as a
+normal Node script; eval mode would change Commander's argument parsing. Credentials do not appear
+in the operating system command line. This avoids the provider's non-interactive
+prompt behavior, which consumes the entire stdin stream as a single answer.
+A zero exit code alone is insufficient: Nephrite requires the provider's explicit
+login confirmation. Missing MFA confirmation is reported as incomplete login.
+
+Authentication is separate from vault availability. A successful remote-vault
+query with zero results still means the account is logged in. Confirmed login
+enables settings even if listing remote vaults temporarily fails; the list error
+is displayed separately. A provider report that no account is logged in clears
+that state. The UI never displays login success for an unconfirmed response.
+
+The private-argument smoke test invokes the real provider's version, login help,
+and remote-list help commands through the same launcher. A separate fixture
+checks password quoting and MFA transport without contacting an account service.
+Run against an existing installation with `sync-runtime-smoke --check-provider
+<node-path> <cli-path>`; this does not log in or modify provider credentials.
+
+
+### Sync form continuity
+
+Account email, password, MFA code, encryption password, remote-vault choice,
+device name, sync direction, conflicts, exclusions, and checkboxes stay in the
+interface across login, setup, failures, retries, and status refreshes. Both forms
+remain visible after login, and settings remain editable during reauthentication.
+If a remote-vault refresh fails or returns an empty list, the current selection
+is retained. Drafts are kept per local vault for the lifetime of the application,
+including closing and reopening the Sync panel. Status responses do not replace
+what the user has typed with saved defaults.
+
+Sync errors appear at the top of the pane. Failed operations and error status
+responses scroll the pane to the top and focus the error message while retaining
+all form entries.
+
+Vault setup passes the encryption password explicitly through the private argument
+launcher: the provider's JSON mode does not read password prompts from stdin.
+Both password fields have independent reveal buttons. Their values and reveal
+states survive login, setup, errors, refreshes, and reopening the Sync pane.
+
+### Terminal reports in text fences
+
+Fenced `text`, `plain`, `plaintext`, `ansi`, and `terminal` blocks display ANSI
+SGR foreground/background colors (standard, bright, 256-color and RGB), bold,
+dim, italic, underline, strikeout, inverse, and resets. Spaces, newlines and
+Unicode box drawing remain literal. HTML is escaped; terminal OSC commands and
+non-SGR CSI controls are discarded rather than executed. This renders static
+terminal reports, not an interactive terminal or cursor-motion emulator.
+The source must contain actual escape characters: colors discarded by the
+clipboard cannot be recovered. Preview rendering does not modify the note.
+
+Terminal text uses fixed-width HTML cells for non-ASCII graphemes so fallback
+fonts cannot widen wind arrows. Common wide CJK characters and emoji occupy two
+columns; combining sequences stay together. Common single-line box-drawing
+characters render with CSS line segments while retaining their original text
+for copying. This is a static display convention, not full terminal emulation.
+
+### Cached vault startup
+
+For an existing index with no required rebuild or feature backfill, startup opens
+cached results before scanning file contents. Once the workspace is restored,
+“Checking for changes…” appears in the index status while a separate database
+connection scans and hashes files without holding the active editor index lock.
+Changed candidates are applied using current disk contents, then the existing
+vault-change handler refreshes affected views. Switching vaults prevents old
+results from being applied to the new vault.
+
+The check still detects same-size edits with preserved modification timestamps.
+Until it completes, search and metadata views may reflect the cached state.
+Completion reports no changes or updated/removed counts; failures remain visible.
+First-time index creation and required migrations still initialize before opening.
+
+The preview follows its pane width rather than imposing a fixed 48rem cap.
+Prose wraps to the available space; oversized preformatted reports scroll within
+their own block. WebKit layout checks cover both 400px and 1400px viewports.

@@ -47,6 +47,7 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 pub struct VaultIndex {
     vault_root: PathBuf,
+    database_path: PathBuf,
     conn: Connection,
     resolver: RefCell<Option<LinkResolver>>,
 }
@@ -174,16 +175,46 @@ impl VaultIndex {
         vault_root: impl AsRef<Path>,
         mut progress: impl FnMut(ProgressPhase, usize, usize, Option<&str>),
     ) -> Result<(Self, ReconcileStats)> {
+        let mut idx = Self::open_cached(vault_root)?;
+        let stats = idx.reconcile_with_progress(&mut progress)?;
+        let _ = idx.resolve_link("__nephrite_warm__", None);
+        Ok((idx, stats))
+    }
+
+    /// Open with a disposable index located independently of the vault.
+    pub fn open_with_progress_at(
+        vault_root: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+        mut progress: impl FnMut(ProgressPhase, usize, usize, Option<&str>),
+    ) -> Result<(Self, ReconcileStats)> {
+        let mut idx = Self::open_cached_at(vault_root, database_path)?;
+        let stats = idx.reconcile_with_progress(&mut progress)?;
+        let _ = idx.resolve_link("__nephrite_warm__", None);
+        Ok((idx, stats))
+    }
+
+    /// Open the database without walking or reading vault files.
+    pub fn open_cached(vault_root: impl AsRef<Path>) -> Result<Self> {
+        let vault_root = vault_root.as_ref();
+        Self::open_cached_at(vault_root, vault_root.join(".nephrite").join("index.db"))
+    }
+
+    /// Open the database at an explicit location without reading vault files.
+    pub fn open_cached_at(
+        vault_root: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+    ) -> Result<Self> {
         let vault_root = vault_root.as_ref().to_path_buf();
         if !vault_root.is_dir() {
             return Err(IndexError::NotADirectory(vault_root));
         }
 
-        let nephrite_dir = vault_root.join(".nephrite");
-        fs::create_dir_all(&nephrite_dir)?;
-        let db_path = nephrite_dir.join("index.db");
+        let database_path = database_path.as_ref().to_path_buf();
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
-        let conn = Connection::open(&db_path)?;
+        let conn = Connection::open(&database_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
@@ -193,13 +224,65 @@ impl VaultIndex {
 
         let mut idx = Self {
             vault_root,
+            database_path,
             conn,
             resolver: RefCell::new(None),
         };
         idx.ensure_schema()?;
-        let stats = idx.reconcile_with_progress(&mut progress)?;
-        let _ = idx.resolve_link("__nephrite_warm__", None);
-        Ok((idx, stats))
+        Ok(idx)
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    /// Cached results are usable only after mandatory rebuilds/backfills.
+    pub fn cache_is_current(&self) -> Result<bool> {
+        Ok(self
+            .stored_project_version()?
+            .is_some_and(|v| !PROJECT_VERSION.requires_rebuild(v))
+            && self.count("files")? > 0
+            && pending_migrations(&self.conn)?.is_empty())
+    }
+
+    /// Read-only verification on a separate connection, without the UI index lock.
+    /// Returned paths are candidates: callers must read current disk contents when applying.
+    pub fn changed_paths(&self) -> Result<(usize, Vec<String>)> {
+        let disk = self.list_vault_files()?;
+        let mut known = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime_ms, size_bytes, content_hash FROM files")?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })? {
+            let (path, mtime, size, hash) = row?;
+            known.insert(path, (mtime, size, hash));
+        }
+        let mut changed = Vec::new();
+        for (path, mtime, size) in &disk {
+            let same = match known.remove(path) {
+                Some((old_mtime, old_size, hash)) if old_mtime == *mtime && old_size == *size => {
+                    match hash {
+                        Some(hash) => fs::read_to_string(abs_from_rel(&self.vault_root, path)?)
+                            .map(|text| hash_str(&text) == hash)
+                            .unwrap_or(false),
+                        None => true,
+                    }
+                }
+                _ => false,
+            };
+            if !same {
+                changed.push(path.clone());
+            }
+        }
+        changed.extend(known.into_keys());
+        Ok((disk.len(), changed))
     }
 
     pub fn vault_root(&self) -> &Path {
@@ -1589,6 +1672,90 @@ Rating:: 5
         assert!(!stats2.full_rebuild);
         assert_eq!(stats2.updated, 0);
         assert!(stats2.unchanged >= 2);
+    }
+
+    #[test]
+    fn cached_open_does_not_reconcile_and_verification_detects_offline_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("Note.md");
+        fs::write(&note, "# Alpha\n").unwrap();
+        fs::write(dir.path().join("Gone.md"), "old").unwrap();
+        let (index, _) = VaultIndex::open(dir.path()).unwrap();
+        drop(index);
+        let modified = fs::metadata(&note).unwrap().modified().unwrap();
+        fs::write(&note, "# Bravo\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&note)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::remove_file(dir.path().join("Gone.md")).unwrap();
+        fs::write(dir.path().join("New.md"), "new").unwrap();
+        let mut cached = VaultIndex::open_cached(dir.path()).unwrap();
+        assert!(cached.cache_is_current().unwrap());
+        let title = |index: &VaultIndex| -> String {
+            index
+                .connection()
+                .query_row(
+                    "SELECT text FROM headings WHERE path = 'Note.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(title(&cached), "Alpha");
+        let scanner = VaultIndex::open_cached(dir.path()).unwrap();
+        let (_, mut paths) = scanner.changed_paths().unwrap();
+        paths.sort();
+        assert_eq!(paths, ["Gone.md", "New.md", "Note.md"]);
+        assert_eq!(title(&cached), "Alpha"); // read-only scan
+        fs::write(&note, "# Latest editor save\n").unwrap();
+        for path in paths {
+            cached.index_path(&path).unwrap();
+        }
+        assert_eq!(title(&cached), "Latest editor save");
+        assert!(scanner.changed_paths().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn explicit_index_location_keeps_vault_sources_and_sidecars_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir(&vault).unwrap();
+        let note = vault.join("Note.md");
+        let source = "---\ntitle: Existing\n---\n# Original\n";
+        fs::write(&note, source).unwrap();
+        let database = dir.path().join("private").join("index.db");
+
+        let (index, _) =
+            VaultIndex::open_with_progress_at(&vault, &database, |_, _, _, _| {}).unwrap();
+        assert_eq!(index.database_path(), database.as_path());
+        assert_eq!(index.count("files").unwrap(), 1);
+        drop(index);
+
+        assert_eq!(fs::read_to_string(&note).unwrap(), source);
+        assert!(!vault.join(".nephrite").exists());
+        assert!(database.is_file());
+        let cached = VaultIndex::open_cached_at(&vault, &database).unwrap();
+        assert!(cached.cache_is_current().unwrap());
+        assert_eq!(cached.count("files").unwrap(), 1);
+    }
+
+    #[test]
+    fn empty_or_incompatible_cache_requires_foreground_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = VaultIndex::open_cached(dir.path()).unwrap();
+        assert!(!empty.cache_is_current().unwrap());
+        drop(empty);
+        fs::write(dir.path().join("Note.md"), "hello").unwrap();
+        let (index, _) = VaultIndex::open(dir.path()).unwrap();
+        assert!(index.cache_is_current().unwrap());
+        index
+            .connection()
+            .execute("DELETE FROM schema_meta", [])
+            .unwrap();
+        assert!(!index.cache_is_current().unwrap());
     }
 
     #[test]

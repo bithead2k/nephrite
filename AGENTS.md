@@ -1,5 +1,9 @@
 # Nephrite
 
+## Product Design Contracts
+
+For interface, workflow, validation, identity, and behavioral-test changes, read and apply [docs/design-principles.md](docs/design-principles.md). It records the user's 39 accepted principles, including reuse of existing flows, intentional overflow handling, preservation of user work, deliberate destructive actions, and the distinction between formatting conventions and data constraints. Keep these contracts independent of implementation changes; do not weaken them merely to make tests pass.
+
 ## Project Summary
 
 Nephrite is an open-source, local-first knowledge management application intended to be a practical drop-in alternative to Obsidian.
@@ -659,7 +663,7 @@ It is to create the open-source implementation of the mature local-first knowled
 
 ## Implementation Status (2026-08-19)
 
-AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.12` (0.12.0): minor upgrade from 0.11, not a full rebuild.
+AGPL-3.0-only. Tauri + TypeScript + CodeMirror 6; disposable SQLite index at `.nephrite/index.db` (WAL). Markdown is authoritative — never rewrite source. `PROJECT_VERSION = 0.15` (0.15.0): minor upgrade from 0.14, not a full rebuild.
 
 Implemented and verified (behavior details live in `docs/`): vault reader + metadata index + search + editor/viewer + watcher; dirty-gated editor hot path with deferred preview/index/UI reactions; latest-wins pane switching with cached editor/preview state and incremental pane chrome; native PostgreSQL SQL (`libpg_query` + `page` lowering, read-only); Dataview DQL/DataviewJS; Vim, Markdown/Obsidian rendering, Excalidraw, Tasks metadata/recurrence/query blocks/dashboard, Git, declarative automation + Templater subset; permissioned plugin host with Obsidian facades, settings/views/processors, packaged assets, bundled ESM/CJS entrypoints, and network requests.
 

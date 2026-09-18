@@ -6,6 +6,8 @@ otherwise.
 
 ## Release notes
 
+- [0.15.0](release-0.15.md) — Scroll Reading/teleprompter mode and the first
+  usable Android phone workflow over an existing Obsidian vault.
 - [0.14.0](release-0.14.md) — native Windows deployment, direct application
   launching, and transparent icons across all platform assets.
 - [0.13.0](release-0.13.md) — integrated Obsidian Sync, provider-neutral sync

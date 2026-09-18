@@ -13,8 +13,16 @@
     "core:window:allow-scale-factor",
     "core:window:allow-is-maximized",
     "core:window:allow-maximize",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-decorated",
+    "core:window:allow-set-decorations",
     "dialog:default",
     "dialog:allow-open",
-    "opener:default"
+    "opener:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "obsidian://open*" }]
+    }
   ]
 }
