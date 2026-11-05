@@ -6,6 +6,8 @@ otherwise.
 
 ## Release notes
 
+- [0.16.0](release-0.16.md) — significant performance fixes for vaults with very large numbers of objects, including typing pauses and preview refreshes.
+
 - [0.15.0](release-0.15.md) — Scroll Reading/teleprompter mode and the first
   usable Android phone workflow over an existing Obsidian vault.
 - [0.14.0](release-0.14.md) — native Windows deployment, direct application

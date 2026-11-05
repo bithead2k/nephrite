@@ -25,16 +25,19 @@ export type TreeNode = {
 /** Build a directory tree from flat file entries (markdown only). */
 export function buildTree(files: FileEntry[]): TreeNode {
   const root: TreeNode = { name: "", path: "", kind: "dir", children: [] };
+  const directories = new Map<string, TreeNode>([["", root]]);
+  const seenFiles = new Set<string>();
 
   function ensureDir(parts: string[]): TreeNode {
     let node = root;
     let acc = "";
     for (const part of parts) {
       acc = acc ? `${acc}/${part}` : part;
-      let child = node.children.find((c) => c.kind === "dir" && c.name === part);
+      let child = directories.get(acc);
       if (!child) {
         child = { name: part, path: acc, kind: "dir", children: [] };
         node.children.push(child);
+        directories.set(acc, child);
       }
       node = child;
     }
@@ -47,7 +50,8 @@ export function buildTree(files: FileEntry[]): TreeNode {
     const fileName = parts[parts.length - 1];
     const dirParts = parts.slice(0, -1);
     const parent = dirParts.length ? ensureDir(dirParts) : root;
-    if (!parent.children.some((c) => c.kind === "file" && c.path === f.path)) {
+    if (!seenFiles.has(f.path)) {
+      seenFiles.add(f.path);
       parent.children.push({
         name: fileName,
         path: f.path,
@@ -61,10 +65,12 @@ export function buildTree(files: FileEntry[]): TreeNode {
   return root;
 }
 
+const treeNameOrder = new Intl.Collator(undefined, { sensitivity: "base" });
+
 function sortTree(node: TreeNode) {
   node.children.sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
-    return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    return treeNameOrder.compare(a.name, b.name);
   });
   for (const c of node.children) {
     if (c.kind === "dir") sortTree(c);

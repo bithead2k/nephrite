@@ -2185,3 +2185,32 @@ Rating:: 5
         assert_eq!(migrated.count("canvas_nodes").unwrap(), 1);
     }
 }
+
+
+#[cfg(test)]
+mod birthday_index_tests {
+    use super::*;
+    #[test]
+    fn birthday_alias_index_lookup_updates_and_deletes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        for (i, field) in ["birthday", "DOB", "Birth Date", "date_of_birth", "birth-date"].iter().enumerate() {
+            let path = format!("{i}.md");
+            conn.execute("INSERT INTO files(path,name,stem,file_kind,mtime_ms,size_bytes,indexed_at_ms) VALUES (?1,?1,?1,'markdown',0,0,0)", [&path]).unwrap();
+            conn.execute("INSERT INTO properties(path,prop_path,prop_key,value_type,value_text) VALUES (?1,?2,?2,'text','2000-02-29')", params![path, field]).unwrap();
+        }
+        let base = "SELECT path FROM properties WHERE lower(replace(replace(replace(prop_key, ' ', ''), '_', ''), '-', '')) IN ('dob', 'birthday', 'birthdate', 'dateofbirth')";
+        let date = "CASE WHEN CAST(substr(value_text, 1, 4) AS INTEGER) BETWEEN 0 AND 99 THEN NULL ELSE strftime('%m-%d', substr(value_text, 1, 10), '+0 days') END";
+        let sql = format!("{base} AND {date} = ?1 UNION {base} AND {date} IS NULL");
+        let count = || conn.prepare(&sql).unwrap().query_map(["02-29"], |r| r.get::<_, String>(0)).unwrap().count();
+        assert_eq!(count(), 5);
+        let plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap().query_map(["02-29"], |r| r.get::<_, String>(3)).unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap().join("\n");
+        assert!(plan.contains("SEARCH properties USING INDEX idx_properties_birthday"), "{plan}");
+        conn.execute("UPDATE properties SET value_text='2000-03-01' WHERE path='0.md'", []).unwrap();
+        assert_eq!(count(), 4);
+        conn.execute("DELETE FROM files WHERE path='1.md'", []).unwrap();
+        assert_eq!(count(), 3);
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        assert_eq!(count(), 3);
+    }
+}

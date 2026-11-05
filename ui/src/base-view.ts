@@ -56,6 +56,18 @@ export function renderBaseView(
   draw();
 }
 
+export async function hydrateBaseFencesWhenNeeded(
+  root: ParentNode,
+  loadPages: () => Promise<readonly BasePage[]>,
+  live: () => boolean = () => true,
+  ...options: Parameters<typeof hydrateBaseFences> extends [unknown, unknown, ...infer R] ? R : never
+): Promise<void> {
+  if (!live() || !Array.from(root.querySelectorAll<HTMLElement>("pre > code")).some(code =>
+    /^(base|bases)$/i.test(code.className.match(/language-(\S+)/)?.[1] ?? ""))) return;
+  const pages = await loadPages();
+  if (live()) hydrateBaseFences(root, pages, ...options);
+}
+
 export function hydrateBaseFences(
   root: ParentNode,
   pages: readonly BasePage[],

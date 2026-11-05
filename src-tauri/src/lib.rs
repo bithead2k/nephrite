@@ -1384,17 +1384,21 @@ fn vault_stats(state: State<'_, AppState>) -> Result<VaultInfo, String> {
 }
 
 #[tauri::command]
-fn list_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
+fn list_files(state: State<'_, AppState>, paths: Option<Vec<String>>) -> Result<Vec<FileEntry>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
     let conn = index.connection();
+    let paths_json = paths.as_ref().map(|p| serde_json::to_string(p)).transpose().map_err(|e| e.to_string())?;
+    let sql = if paths.is_some() {
+        "SELECT path, name, parent_path, file_kind FROM files WHERE path IN (SELECT value FROM json_each(?1)) ORDER BY path COLLATE NOCASE"
+    } else {
+        "SELECT path, name, parent_path, file_kind FROM files WHERE ?1 IS NULL ORDER BY path COLLATE NOCASE"
+    };
     let mut stmt = conn
-        .prepare(
-            "SELECT path, name, parent_path, file_kind FROM files ORDER BY path COLLATE NOCASE",
-        )
+        .prepare(sql)
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([paths_json], |r| {
             Ok(FileEntry {
                 path: r.get(0)?,
                 name: r.get(1)?,
@@ -2978,8 +2982,29 @@ fn unix_group_name(gid: u32) -> String {
 }
 
 #[tauri::command]
+fn birthday_candidates(month: u32, day: u32, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err("Invalid birthday month/day".into());
+    }
+    let guard = state.index.lock();
+    let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+    let date = "CASE WHEN CAST(substr(value_text, 1, 4) AS INTEGER) BETWEEN 0 AND 99 THEN NULL ELSE strftime('%m-%d', substr(value_text, 1, 10), '+0 days') END";
+    let sql = [("properties", "prop_key"), ("inline_fields", "key")].iter().map(|(table, field)| {
+        let base = format!("SELECT path FROM {table} WHERE lower(replace(replace(replace({field}, ' ', ''), '_', ''), '-', '')) IN ('dob', 'birthday', 'birthdate', 'dateofbirth')");
+        format!("{base} AND {date} = ?1 UNION {base} AND {date} IS NULL")
+    }).collect::<Vec<_>>().join(" UNION ");
+    let mut stmt = index.connection().prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([format!("{month:02}-{day:02}")], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
 
-fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<PageRow>, String> {
+#[tauri::command]
+
+fn list_pages(
+    source: Option<String>,
+    paths: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<Vec<PageRow>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
     let conn = index.connection();
@@ -3005,6 +3030,16 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
          JOIN files f ON f.path = p.path
          WHERE 1 = 1",
     );
+    let paths_json = paths
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    if paths_json.is_some() {
+        sql.push_str(" AND p.path IN (SELECT value FROM json_each(?4))");
+    } else {
+        sql.push_str(" AND ?4 IS NULL");
+    }
     let mut rows_out = Vec::new();
 
     if !src.is_empty() {
@@ -3014,32 +3049,35 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
         let like_path = format!("{src}/%");
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let mapped = stmt
-            .query_map([src, like_folder.as_str(), like_path.as_str()], |r| {
-                let path: String = r.get(0)?;
-                let name: String = r.get(1)?;
-                let folder: String = r.get(2)?;
-                let mtime_ms: i64 = r.get(3)?;
-                let size_bytes: i64 = r.get(4)?;
-                let properties: String = r.get(5)?;
-                let tags: String = r.get(6)?;
-                let aliases: String = r.get(7)?;
-                let links: String = r.get(8)?;
-                let tasks: String = r.get(9)?;
-                let inline_fields: String = r.get(10)?;
-                Ok((
-                    path,
-                    name,
-                    folder,
-                    mtime_ms,
-                    size_bytes,
-                    properties,
-                    tags,
-                    aliases,
-                    links,
-                    tasks,
-                    inline_fields,
-                ))
-            })
+            .query_map(
+                rusqlite::params![src, like_folder, like_path, paths_json],
+                |r| {
+                    let path: String = r.get(0)?;
+                    let name: String = r.get(1)?;
+                    let folder: String = r.get(2)?;
+                    let mtime_ms: i64 = r.get(3)?;
+                    let size_bytes: i64 = r.get(4)?;
+                    let properties: String = r.get(5)?;
+                    let tags: String = r.get(6)?;
+                    let aliases: String = r.get(7)?;
+                    let links: String = r.get(8)?;
+                    let tasks: String = r.get(9)?;
+                    let inline_fields: String = r.get(10)?;
+                    Ok((
+                        path,
+                        name,
+                        folder,
+                        mtime_ms,
+                        size_bytes,
+                        properties,
+                        tags,
+                        aliases,
+                        links,
+                        tasks,
+                        inline_fields,
+                    ))
+                },
+            )
             .map_err(|e| e.to_string())?;
         for row in mapped {
             let (
@@ -3072,32 +3110,35 @@ fn list_pages(source: Option<String>, state: State<'_, AppState>) -> Result<Vec<
     } else {
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let mapped = stmt
-            .query_map([], |r| {
-                let path: String = r.get(0)?;
-                let name: String = r.get(1)?;
-                let folder: String = r.get(2)?;
-                let mtime_ms: i64 = r.get(3)?;
-                let size_bytes: i64 = r.get(4)?;
-                let properties: String = r.get(5)?;
-                let tags: String = r.get(6)?;
-                let aliases: String = r.get(7)?;
-                let links: String = r.get(8)?;
-                let tasks: String = r.get(9)?;
-                let inline_fields: String = r.get(10)?;
-                Ok((
-                    path,
-                    name,
-                    folder,
-                    mtime_ms,
-                    size_bytes,
-                    properties,
-                    tags,
-                    aliases,
-                    links,
-                    tasks,
-                    inline_fields,
-                ))
-            })
+            .query_map(
+                rusqlite::params![None::<String>, None::<String>, None::<String>, paths_json],
+                |r| {
+                    let path: String = r.get(0)?;
+                    let name: String = r.get(1)?;
+                    let folder: String = r.get(2)?;
+                    let mtime_ms: i64 = r.get(3)?;
+                    let size_bytes: i64 = r.get(4)?;
+                    let properties: String = r.get(5)?;
+                    let tags: String = r.get(6)?;
+                    let aliases: String = r.get(7)?;
+                    let links: String = r.get(8)?;
+                    let tasks: String = r.get(9)?;
+                    let inline_fields: String = r.get(10)?;
+                    Ok((
+                        path,
+                        name,
+                        folder,
+                        mtime_ms,
+                        size_bytes,
+                        properties,
+                        tags,
+                        aliases,
+                        links,
+                        tasks,
+                        inline_fields,
+                    ))
+                },
+            )
             .map_err(|e| e.to_string())?;
         for row in mapped {
             let (
@@ -6279,6 +6320,7 @@ pub fn run() {
             write_media_file,
             resolve_wikilink,
             list_pages,
+            birthday_candidates,
             note_file_meta,
             query_vault_sql,
             list_tasks,

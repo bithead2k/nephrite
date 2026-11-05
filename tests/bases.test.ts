@@ -9,7 +9,7 @@ import {
   pageFromIndexRow,
   parseBase,
 } from "../ui/src/bases";
-import { renderBaseView } from "../ui/src/base-view";
+import { renderBaseView, hydrateBaseFencesWhenNeeded } from "../ui/src/base-view";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/" });
 Object.defineProperties(globalThis, {
@@ -119,4 +119,32 @@ test("renderBaseView draws view tabs and opens a row", () => {
   assert.ok(host.querySelector(".base-view-tab"));
   host.querySelector<HTMLButtonElement>(".base-link")?.click();
   assert.deepEqual(opened, ["Inbox.md"]);
+});
+
+
+test("ordinary preview refreshes never load the vault for Bases", async () => {
+  const root = document.createElement("div");
+  root.innerHTML = '<p>Journal text</p><pre><code class="language-text">weather</code></pre><pre><code class="language-dataviewjs">dv.current()</code></pre>';
+  for (let i = 0; i < 5; i++) {
+    root.querySelector("p")!.textContent += " another edit";
+    await hydrateBaseFencesWhenNeeded(root, async () => { throw new Error("Unnecessary vault scan"); });
+  }
+  assert.match(root.textContent!, /another edit/);
+});
+
+test("Base fences load once and stale hydration leaves the preview intact", async () => {
+  const root = document.createElement("div");
+  root.innerHTML = '<pre><code class="language-BASE">views:\n  - type: table\n    name: Notes</code></pre>';
+  let calls = 0;
+  const load = async () => {calls++; return [page("Example.md")];};
+  await hydrateBaseFencesWhenNeeded(root, load);
+  assert.equal(calls, 1);
+  assert.match(root.textContent!, /Example/);
+  await hydrateBaseFencesWhenNeeded(root, load);
+  assert.equal(calls, 1);
+  root.innerHTML = '<pre><code class="language-bases">views: []</code></pre>';
+  const original = root.innerHTML;
+  let live = true;
+  await hydrateBaseFencesWhenNeeded(root, async () => {live=false; return [];}, () => live);
+  assert.equal(root.innerHTML, original);
 });

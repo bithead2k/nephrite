@@ -17,7 +17,7 @@ import {
   type EngineContext,
 } from "../ui/src/dv-engine";
 import { splitFrontmatter } from "../ui/src/frontmatter";
-import { rowToDvPage } from "../ui/src/dv-context";
+import { rowToDvPage, makeEngineContext, resetEnginePageCache, refreshEnginePageCache } from "../ui/src/dv-context";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/" });
 Object.defineProperties(globalThis, {
@@ -481,7 +481,7 @@ function inlineExpressions(body: string): string[] {
 }
 
 test("today's vault journal note reproduces Obsidian Dataview results", async () => {
-  const { row, body } = vaultRow("journals/2026_08_14.md");
+  const { row, body } = vaultRow("journals/2026/08_14.md");
   const page = rowToDvPage(row as never);
   const ctx = { ...context(), currentPath: page.path, loadPage: async () => page };
 
@@ -535,4 +535,162 @@ test("metadata refresh reruns INFO inline queries and preserves neighboring ANSI
   assert.equal(weather.innerHTML, weatherHtml);
   assert.equal(weather.textContent, "│ ↑ 8 mph │\n");
   root.remove();
+});
+
+
+test("preview contexts share metadata and apply changed-page deltas without losing other pages", async () => {
+  const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  const row = (path: string, value: number) => ({ path, name: path, folder: "", mtime_ms: 0, properties: { value }, links: [] });
+  let rows = [row("a.md", 1), row("b.md", 2)];
+  const requests: Array<string[] | undefined> = [];
+  mockIPC((command, payload: any) => {
+    assert.equal(command, "list_pages");
+    requests.push(payload.paths);
+    return payload.paths ? rows.filter(r => payload.paths.includes(r.path)) : rows;
+  });
+  try {
+    resetEnginePageCache();
+    const first = makeEngineContext("a.md", "", () => {});
+    const second = makeEngineContext("b.md", "", () => {});
+    await Promise.all([first.loadPages(), second.loadPages()]);
+    assert.equal(requests.length, 1, "switching contexts must share the initial vault fetch");
+    rows = [row("a.md", 3), row("b.md", 2)];
+    refreshEnginePageCache(["a.md"]);
+    let pages = await second.loadPages();
+    assert.deepEqual(requests[1], ["a.md"]);
+    assert.equal(pages.find(p => p.path === "a.md")?.value, 3);
+    assert.equal(pages.find(p => p.path === "b.md")?.value, 2);
+    rows = [row("b.md", 2)];
+    refreshEnginePageCache(["a.md"]);
+    pages = await first.loadPages();
+    assert.deepEqual(pages.map(p => p.path), ["b.md"]);
+    resetEnginePageCache();
+    rows = [row("other-vault.md", 4)];
+    pages = await makeEngineContext("other-vault.md", "", () => {}).loadPages();
+    assert.deepEqual(pages.map(p => p.path), ["other-vault.md"]);
+    assert.equal(requests.filter(paths => paths === undefined).length, 2);
+  } finally {
+    resetEnginePageCache();
+    clearMocks();
+  }
+});
+
+
+test("large query preparation yields to pending user-input work", async () => {
+  const mount = document.createElement("div");
+  const many = Array.from({ length: 1024 }, (_, i) => page(`people/Person ${i}.md`, []));
+  let inputHandled = false;
+  const timer = setTimeout(() => { inputHandled = true; }, 0);
+  await runDqlBlock('LIST\nFROM "people"\nLIMIT 1', mount, { ...context(), loadPages: async () => many });
+  assert.equal(inputHandled, true, "query preparation must allow pending input to run");
+  clearTimeout(timer);
+  assert.match(mount.textContent ?? "", /Person 0/);
+});
+
+
+test("page deltas maintain backlinks across edits, deletion, duplicate names, and re-creation", async () => {
+  const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  const row = (path: string, links: string[] = []) => ({ path, name: path.split("/").pop()!, folder: "", mtime_ms: 0, properties: {}, links: links.map(target => ({ target })) });
+  let rows = [row("a.md", ["Target", "Target", "folder/Target.md"]), row("folder/Target.md"), row("other/Target.md"), row("untouched.md")];
+  mockIPC((_command, payload: any) => payload.paths ? rows.filter(r => payload.paths.includes(r.path)) : rows);
+  try {
+    resetEnginePageCache();
+    const ctx = makeEngineContext("a.md", "", () => {});
+    let pages = await ctx.loadPages();
+    const target = (path: string) => pages.find(page => page.path === path)!;
+    assert.deepEqual(target("folder/Target.md").file.inlinks, ["a"]);
+    assert.deepEqual(target("other/Target.md").file.inlinks, ["a"]);
+    const untouched = target("untouched.md");
+    Object.defineProperty(untouched.file, "outlinks", { get() { throw new Error("unrelated page links were rescanned"); } });
+    const originalInlinks = untouched.file.inlinks;
+    rows[0] = row("a.md", ["folder/Target"]);
+    refreshEnginePageCache(["a.md"]);
+    pages = await ctx.loadPages();
+    assert.deepEqual(target("other/Target.md").file.inlinks, []);
+    assert.deepEqual(target("folder/Target.md").file.inlinks, ["a"]);
+    assert.equal(target("untouched.md").file.inlinks, originalInlinks);
+    rows = rows.filter(r => r.path !== "folder/Target.md");
+    refreshEnginePageCache(["folder/Target.md"]);
+    await ctx.loadPages();
+    rows.push(row("folder/Target.md"));
+    refreshEnginePageCache(["folder/Target.md"]);
+    pages = await ctx.loadPages();
+    assert.deepEqual(target("folder/Target.md").file.inlinks, ["a"]);
+    rows = rows.filter(r => r.path !== "a.md");
+    refreshEnginePageCache(["a.md"]);
+    pages = await ctx.loadPages();
+    assert.deepEqual(target("folder/Target.md").file.inlinks, []);
+  } finally { resetEnginePageCache(); clearMocks(); }
+});
+
+test("initial metadata preparation services pending input before completing", async () => {
+  const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  mockIPC(() => Array.from({ length: 2048 }, (_, i) => ({ path: `${i}.md`, name: `${i}`, folder: "", mtime_ms: 0, properties: {}, links: [] })));
+  let inputHandled = false;
+  const timer = setTimeout(() => { inputHandled = true; }, 0);
+  try {
+    resetEnginePageCache();
+    const pages = await makeEngineContext("0.md", "", () => {}).loadPages();
+    assert.equal(pages.length, 2048);
+    assert.equal(inputHandled, true);
+  } finally { clearTimeout(timer); resetEnginePageCache(); clearMocks(); }
+});
+
+
+test("scoped scripts do not prepare unrelated page properties", async () => {
+  const person = page("people/Test.md", [], { birthday: new Date(2000, 10, 4) });
+  const unrelated = page("elsewhere/Other.md", []);
+  Object.defineProperty(unrelated, "expensive", {enumerable: true, get() { throw new Error("unrelated page was prepared"); }});
+  const mount = document.createElement("div");
+  await runScriptBlock('dv.paragraph(dv.pages(\'"people"\')[0].birthday.month)', mount,
+    {...context(), loadPages: async () => [person, unrelated]});
+  assert.equal(mount.textContent, "11");
+});
+
+
+test("birthday planner preserves boolean semantics and rejects mixed fields", async () => {
+  const {planBirthday, planBirthdayScript} = await import("../ui/src/birthday-plan");
+  assert.deepEqual(planBirthday(["dob.month = 2 and dob.day = 29"], {}), {month:2, day:29});
+  for (const expression of ["dob.month = 2 or dob.day = 29", "dob.month = 2 and birthday.day = 29", "dob.month = 13 and dob.day = 1", "!dob.month = 2 and dob.day = 29"]) assert.equal(planBirthday([expression], {}), null);
+  const code = `const thisone = dv.current();
+const notes = dv.pages('"people"').filter(page => page.birthday).filter(page => page.birthday.month == thisone.date.month && page.birthday.day == thisone.date.day);
+if (notes.length) dv.paragraph("**Birthdays**");
+if (notes.length) dv.list(notes.file.link);`;
+  assert.deepEqual(planBirthdayScript(code, {date:{month:11,day:4}}), {month:11,day:4});
+  assert.equal(planBirthdayScript(code + '\ndv.list(dv.pages().file.link);', {date:{month:11,day:4}}), null);
+});
+
+test("birthday DQL uses candidates then rejects false positives", async () => {
+  const yes = page("people/Match.md", [], {birthday:new Date(2000,1,29)});
+  const no = page("people/NotToday.md", [], {birthday:new Date(2000,2,1)});
+  const mount = document.createElement("div");
+  let lookup = false;
+  await runDqlBlock('LIST\nFROM "people"\nWHERE birthday.month = 2 and birthday.day = 29', mount, {
+    ...context(), loadPages:async()=>{throw new Error("full scan");},
+    birthdayCandidates:async(month,day)=>{assert.deepEqual([month,day],[2,29]);lookup=true;return [yes.path,no.path];},
+    loadPagesByPaths:async()=>[yes,no],
+  });
+  assert.equal(lookup,true);
+  assert.match(mount.textContent!, /Match/);
+  assert.doesNotMatch(mount.textContent!, /NotToday|error/i);
+});
+
+
+test("birthday script uses indexed candidates with unchanged results", async () => {
+  const mount = document.createElement("div");
+  const person = page("people/Birthday Match.md", [], {birthday:new Date(2000,10,4)});
+  const wrong = page("people/Wrong Day.md", [], {birthday:new Date(2000,10,5)});
+  let used = false;
+  await runScriptBlock(`const thisone = dv.current();
+const notes = dv.pages('"people"').filter(page => page.birthday).filter(page => page.birthday.month == thisone.date.month && page.birthday.day == thisone.date.day);
+if (notes.length) dv.list(notes.file.link);`, mount, {
+    ...context(), currentSource: "---\ndate: 2026-11-04\n---\n",
+    loadPage:async()=>page("journal.md", [], {date:new Date(2026,10,4)}),
+    loadPages:async()=>{throw new Error("full scan");},
+    birthdayCandidates:async(month,day)=>{assert.deepEqual([month,day],[11,4]);used=true;return [person.path,wrong.path];},
+    loadPagesByPaths:async()=>[person,wrong],
+  });
+  assert.equal(used,true);
+  assert.match(mount.textContent!, /Birthday Match/);
+  assert.doesNotMatch(mount.textContent!, /Wrong Day|error/i);
 });

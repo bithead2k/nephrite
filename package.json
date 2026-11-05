@@ -1,7 +1,7 @@
 {
   "name": "nephrite",
   "private": true,
-  "version": "0.15.0",
+  "version": "0.16.0",
   "type": "module",
   "engines": {
     "node": ">=20.19.0"
@@ -16,14 +16,15 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "test": "npm run test:performance && npm run test:ui && npm run test:plugin-compat && npm run test:dataview && npm run test:bases && npm run test:people",
+    "test": "npm run test:performance && npm run test:ui && npm run test:plugin-compat && npm run test:dataview && npm run test:bases && npm run test:people && npm run test:large-vault",
     "test:ui": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/ui-interactions.test.ts tests/table-editing.test.ts tests/reading-mode.test.ts",
     "test:plugin-compat": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/plugin-compat.test.ts",
     "test:plugin-real": "node --require ./tests/node20-polyfill.cjs --import tsx tools/plugin-compat-smoke.ts",
     "test:dataview": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/dataview.test.ts",
     "test:bases": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/bases.test.ts tests/air-gaps.test.ts",
     "test:people": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/people.test.ts",
-    "test:performance": "esbuild tests/editor-performance.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/nephrite-editor-performance.test.cjs && node --test /tmp/nephrite-editor-performance.test.cjs"
+    "test:performance": "esbuild tests/editor-performance.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/nephrite-editor-performance.test.cjs && node --test /tmp/nephrite-editor-performance.test.cjs",
+    "test:large-vault": "node --require ./tests/node20-polyfill.cjs --import tsx --test tests/large-vault.test.ts"
   },
   "dependencies": {
     "22": "^0.0.0",

@@ -1,3 +1,4 @@
+import { workBudget } from "./work-budget";
 import { invoke } from "@tauri-apps/api/core";
 import {
   filterPagesBySource,
@@ -20,22 +21,61 @@ type PageRow = {
   inline_fields?: unknown[];
 };
 
+// One parsed snapshot per open vault, shared by preview/query contexts.
+let sharedPages: Promise<PageSnapshot> | null = null;
+
+export function resetEnginePageCache(): void {
+  sharedPages = null;
+}
+
+export function refreshEnginePageCache(paths: string[]): void {
+  if (!sharedPages || !paths.length) return;
+  const previous = sharedPages;
+  const next = previous.then(async (pages) => {
+    const rows = await invoke<PageRow[]>("list_pages", { source: null, paths });
+    await pages.update(paths, rows);
+    return pages;
+  });
+  sharedPages = next;
+  void next.catch(error => {
+    if (sharedPages === next) sharedPages = null;
+    console.warn("[page cache refresh]", error);
+  });
+}
+
+function loadSharedPages(): Promise<PageSnapshot> {
+  if (!sharedPages) {
+    const pending = invoke<PageRow[]>("list_pages", { source: null })
+      .then(async rows => {
+        const snapshot = new PageSnapshot();
+        await snapshot.update([], rows);
+        return snapshot;
+      });
+    sharedPages = pending;
+    void pending.catch(() => { if (sharedPages === pending) sharedPages = null; });
+  }
+  return sharedPages;
+}
+
 export function makeEngineContext(
   currentPath: string,
   currentSource: string,
   resolveLink: (target: string) => void,
 ): EngineContext {
-  let allPages: Promise<DvPage[]> | null = null;
-  const loadPages = (source?: string): Promise<DvPage[]> => {
-    allPages ??= invoke<PageRow[]>("list_pages", { source: null })
-      .then((rows) => enrichPageLinks(rows.map(rowToDvPage)));
-    return allPages.then((pages) => filterPagesBySource(pages, source, currentPath));
-  };
+  const loadPages = (source?: string): Promise<DvPage[]> =>
+    loadSharedPages().then((pages) => filterPagesBySource(pages.values(), source, currentPath));
 
   return {
     currentPath,
     currentSource,
     loadPages,
+    birthdayCandidates: (month, day) => invoke<string[]>("birthday_candidates", { month, day }),
+    loadPagesByPaths: async (paths) => {
+      if (!paths.length) return [];
+      // Preserve complete backlink metadata from the existing shared snapshot.
+      // The candidate set narrows evaluation, not the semantic page contents.
+      return (await loadSharedPages()).pick(paths);
+    },
     loadPage: async (path) => {
       const pages = await loadPages();
       return pages.find((candidate) => candidate.path === path) ?? null;
@@ -149,22 +189,91 @@ function stringArray(value: unknown): string[] {
     : [];
 }
 
-function enrichPageLinks(pages: DvPage[]): DvPage[] {
-  const byTarget = new Map<string, string[]>();
-  for (const page of pages) {
-    for (const target of page.file.outlinks ?? []) {
-      const key = normalizeLinkPath(String(target));
-      const incoming = byTarget.get(key) ?? [];
-      incoming.push(page.path.replace(/\.md$/i, ""));
-      byTarget.set(key, incoming);
+// Reverse indexes keep an ordinary note save proportional to its changed links,
+// rather than rebuilding backlinks for every page in the vault.
+class PageSnapshot {
+  private pages = new Map<string, DvPage>();
+  private incoming = new Map<string, Set<string>>();
+  private targets = new Map<string, Set<string>>();
+  private outgoing = new Map<string, Set<string>>();
+  private ordered: DvPage[] | null = null;
+
+  pick(paths: string[]): DvPage[] {
+    return paths.flatMap(path => { const page = this.pages.get(path); return page ? [page] : []; });
+  }
+
+  values(): DvPage[] {
+    return this.ordered ??= [...this.pages.values()];
+  }
+
+  async update(paths: string[], rows: PageRow[]): Promise<void> {
+    const affected = new Set<string>();
+    const changed = new Set([...paths, ...rows.map(row => row.path)]);
+    const checkpoint = workBudget();
+    let count = 0;
+    const pause = () => ++count % 256 === 0 ? checkpoint() : undefined;
+    for (const path of this.pages.size ? changed : []) {
+      const old = this.pages.get(path);
+      if (old) {
+        for (const key of this.keys(old)) {
+          this.targets.get(key)?.delete(path);
+          if (!this.targets.get(key)?.size) this.targets.delete(key);
+        }
+        for (const key of this.outgoing.get(path) ?? []) {
+          this.incoming.get(key)?.delete(path);
+          if (!this.incoming.get(key)?.size) this.incoming.delete(key);
+          affected.add(key);
+        }
+        this.outgoing.delete(path);
+        this.pages.delete(path);
+      }
+      const pending = pause();
+      if (pending) await pending;
     }
+    for (const row of rows) {
+      const page = rowToDvPage(row);
+      this.pages.set(page.path, page);
+      for (const key of this.keys(page)) {
+        this.add(this.targets, key, page.path);
+        affected.add(key);
+      }
+      const links = new Set((page.file.outlinks ?? []).map(link => normalizeLinkPath(String(link))));
+      this.outgoing.set(page.path, links);
+      for (const key of links) {
+        this.add(this.incoming, key, page.path);
+        affected.add(key);
+      }
+      const pending = pause();
+      if (pending) await pending;
+    }
+    const touched = new Set<string>();
+    for (const key of affected) {
+      for (const path of this.targets.get(key) ?? []) touched.add(path);
+      const pending = pause();
+      if (pending) await pending;
+    }
+    for (const path of touched) {
+      const page = this.pages.get(path)!;
+      const links = new Set<string>();
+      for (const key of this.keys(page)) {
+        for (const source of this.incoming.get(key) ?? []) links.add(source.replace(/\.md$/i, ""));
+      }
+      page.file.inlinks = [...links];
+      const pending = pause();
+      if (pending) await pending;
+    }
+    this.ordered = null;
   }
-  for (const page of pages) {
-    const full = normalizeLinkPath(page.path);
-    const name = normalizeLinkPath(page.file.name);
-    page.file.inlinks = [...new Set([...(byTarget.get(full) ?? []), ...(byTarget.get(name) ?? [])])];
+
+  private keys(page: DvPage): Set<string> {
+    return new Set([normalizeLinkPath(page.path), normalizeLinkPath(page.file.name)]);
   }
-  return pages;
+
+  private add(index: Map<string, Set<string>>, key: string, path: string): void {
+    let paths = index.get(key);
+    if (!paths) index.set(key, paths = new Set());
+    paths.add(path);
+  }
 }
 
 function normalizeLinkPath(path: string): string {

@@ -36,6 +36,7 @@ export type PluginStatus = PluginDescriptor & {
 };
 
 export type PluginHostServices = AppHostServices & {
+  metadataForPaths?: (paths: string[]) => Promise<readonly Record<string, unknown>[]>;
   listFiles: () => readonly FileEntry[];
   showView: (title: string, result: PluginViewResult) => void;
   readPluginData?: (id: string) => unknown | Promise<unknown>;
@@ -1169,8 +1170,13 @@ export function pluginIframeDocument(plugin: PluginDescriptor): string {
       else if (message.type === "unload") for (const handler of unloadHandlers) result = await handler();
       else if (message.type === "vault-change") {
         const previous = abstractFileSnapshot;
-        fileSnapshot = hydrateFiles(Array.isArray(message.files) ? message.files : fileSnapshot);
-        metadataSnapshot = new Map((Array.isArray(message.metadata) ? message.metadata : []).map((entry) => [entry.path, entry]));
+        if (Array.isArray(message.files)) fileSnapshot = hydrateFiles(message.files);
+        if (message.metadataDelta) {
+          for (const path of message.paths || []) metadataSnapshot.delete(path);
+          for (const entry of message.metadata || []) metadataSnapshot.set(entry.path, entry);
+        } else {
+          metadataSnapshot = new Map((Array.isArray(message.metadata) ? message.metadata : []).map((entry) => [entry.path, entry]));
+        }
         for (const path of message.paths || []) {
           const file = abstractFileSnapshot.get(path) || previous.get(path) || new TFile(path);
           const removed = !abstractFileSnapshot.has(path);
@@ -1464,8 +1470,8 @@ export class IsolatedPlugin {
     message.error ? callback.reject(new Error(message.error)) : callback.resolve(message.result);
   }
 
-  notifyVaultChange(paths: string[], files: readonly unknown[], metadata: readonly unknown[]): void {
-    this.iframe.contentWindow?.postMessage({ nephriteHost: true, pluginId: this.descriptor.id, type: "vault-change", paths, files, metadata }, "*");
+  notifyVaultChange(paths: string[], files: readonly unknown[] | undefined, metadata: readonly unknown[], metadataDelta = false): void {
+    this.iframe.contentWindow?.postMessage({ nephriteHost: true, pluginId: this.descriptor.id, type: "vault-change", paths, files, metadata, metadataDelta }, "*");
   }
 
   /**
@@ -1516,6 +1522,8 @@ export class PluginManager {
   private vaultKey = "";
   private listener = (event: MessageEvent) => this.onMessage(event);
   private metadataSnapshot: readonly unknown[] | Promise<readonly unknown[]> | null = null;
+  private lastNotifiedFiles: readonly unknown[] | null = null;
+  private vaultChangeQueue: Promise<void> = Promise.resolve();
   private postProcessors = new Set<string>();
   private codeBlockProcessors = new Map<string, string>();
 
@@ -1527,7 +1535,7 @@ export class PluginManager {
     await this.unload();
     this.descriptors = descriptors;
     this.vaultKey = vaultKey;
-    this.metadataSnapshot = this.services.metadataSnapshot?.() ?? [];
+    this.metadataSnapshot = null;
     for (const descriptor of descriptors) {
       const validation = validatePluginDescriptor(descriptor);
       if (validation) continue;
@@ -1649,13 +1657,39 @@ export class PluginManager {
     })));
   }
 
-  async notifyVaultChange(paths: string[]): Promise<void> {
-    const [files, metadata] = await Promise.all([this.services.listFiles(), this.services.metadataSnapshot?.() ?? []]);
-    for (const plugin of this.plugins.values()) {
-      if (!plugin.descriptor.permissions.includes("vault.read")) continue;
-      plugin.notifyVaultChange(paths, files, metadata);
-    }
-    this.metadataSnapshot = metadata;
+  notifyVaultChange(paths: string[]): Promise<void> {
+    const vaultKey = this.vaultKey;
+    const run = this.vaultChangeQueue.catch(() => {}).then(async () => {
+      if (vaultKey !== this.vaultKey) return;
+      const readers = [...this.plugins.values()].filter(plugin => plugin.descriptor.permissions.includes("vault.read"));
+      if (!readers.length) {
+        this.metadataSnapshot = null;
+        return;
+      }
+      const files = await this.services.listFiles();
+      const delta = Boolean(this.services.metadataForPaths);
+      const metadata = await (this.services.metadataForPaths?.(paths) ?? this.services.metadataSnapshot?.() ?? []);
+      if (vaultKey !== this.vaultKey) return;
+      if (delta) {
+        const cached = new Map(((await this.metadataSnapshot) ?? []).map(row => {
+          const entry = row as Record<string, unknown>;
+          return [entry.path, entry] as const;
+        }));
+        for (const path of paths) cached.delete(path);
+        for (const row of metadata) {
+          const entry = row as Record<string, unknown>;
+          cached.set(entry.path, entry);
+        }
+        this.metadataSnapshot = [...cached.values()];
+      } else this.metadataSnapshot = metadata;
+      for (const plugin of readers) {
+        if (this.plugins.get(plugin.descriptor.id) !== plugin) continue;
+        plugin.notifyVaultChange(paths, files === this.lastNotifiedFiles ? undefined : files, metadata, delta);
+      }
+      this.lastNotifiedFiles = files;
+    });
+    this.vaultChangeQueue = run;
+    return run;
   }
 
   hasPostProcessors(): boolean {
@@ -1768,7 +1802,7 @@ export class PluginManager {
     const dataKey = `nephrite.plugin.data:${this.vaultKey}:${descriptor.id}`;
     return {
       ...this.services,
-      metadataSnapshot: () => this.metadataSnapshot ?? [],
+      metadataSnapshot: () => this.metadataSnapshot ??= this.services.metadataSnapshot?.() ?? [],
       loadPluginData: async () => {
         if (this.services.readPluginData) return this.services.readPluginData(descriptor.id);
         try { return JSON.parse(localStorage.getItem(dataKey) ?? "null"); }

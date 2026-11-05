@@ -1,3 +1,5 @@
+import { planBirthday, planBirthdayScript } from "./birthday-plan";
+import { workBudget } from "./work-budget";
 import { marked } from "marked";
 import { DateTime, Duration } from "luxon";
 import { bindQueryUriLinks, formatQueryUri } from "./query-uri";
@@ -109,6 +111,8 @@ export type EngineContext = {
   currentPath: string;
   currentSource: string;
   loadPages: (source?: string) => Promise<DvPage[]>;
+  birthdayCandidates?: (month: number, day: number) => Promise<string[]>;
+  loadPagesByPaths?: (paths: string[]) => Promise<DvPage[]>;
   loadPage: (path: string) => Promise<DvPage | null>;
   runSql: (sql: string) => Promise<SqlQueryResult>;
   readFile?: (path: string) => Promise<string>;
@@ -431,6 +435,21 @@ function toDvDate(input: unknown): DvDate | null {
   return null;
 }
 
+/** Keep large query preparation from monopolizing the editor's event loop. */
+async function normalizeQueryPages(pages: DvPage[]): Promise<DvPage[]> {
+  const result: DvPage[] = [];
+  const checkpoint = workBudget();
+  for (let start = 0; start < pages.length; start += 256) {
+    if (start) {
+      const pause = checkpoint();
+      if (pause) await pause;
+    }
+    const end = Math.min(start + 256, pages.length);
+    for (let index = start; index < end; index++) result.push(normalizePage(pages[index]));
+  }
+  return result;
+}
+
 function normalizePage(page: DvPage): DvPage {
   for (const [key, value] of Object.entries(page)) {
     if (value instanceof Date) page[key] = toDvDate(value);
@@ -599,15 +618,20 @@ export async function runScriptBlock(
     return;
   }
 
+  // Normalize only source-selected pages. Keep ordinary page objects so
+  // Dataview clone/serialization and script mutations retain their semantics.
+  const queryPage = normalizePage;
+
   const dv: DvApi = {
     current: () => thisNote,
     pages: (source?: string) => {
       const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
-      return wrapList(filterPagesBySource(pages, source, ctx.currentPath));
+      return wrapList(filterPagesBySource(pages, source, ctx.currentPath).map(queryPage));
     },
     page: (path: string) => {
       const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
-      return pages.find((p) => p.path === path || p.path === path + ".md") ?? null;
+      const page = pages.find((p) => p.path === path || p.path === path + ".md");
+      return page ? queryPage(page) : null;
     },
     pagePaths: (source?: string) => wrapDataArray(dv.pages(source).map((page) => page.path)),
     pagesFromTags: (tags) => {
@@ -615,7 +639,7 @@ export async function runScriptBlock(
       const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
       return wrapList(pages.filter((page) =>
         wanted.some((tag) => (page.file.tags ?? []).some((candidate) =>
-          candidate.toLocaleLowerCase() === tag || candidate.toLocaleLowerCase().startsWith(`${tag}/`)))));
+          candidate.toLocaleLowerCase() === tag || candidate.toLocaleLowerCase().startsWith(`${tag}/`)))).map(queryPage));
     },
     pagesFromPath: (path) => {
       const folders = (Array.isArray(path) ? path : [path]).map((folder) =>
@@ -624,13 +648,13 @@ export async function runScriptBlock(
       return wrapList(pages.filter((page) =>
         folders.some((folder) =>
           page.file.folder.toLocaleLowerCase() === folder ||
-          page.path.toLocaleLowerCase().startsWith(`${folder}/`))));
+          page.path.toLocaleLowerCase().startsWith(`${folder}/`))).map(queryPage));
     },
     pagesFromLinks: (link) => {
       const wanted = (Array.isArray(link) ? link : [link]).map((value) => String(value).trim());
       const pages = (dv as unknown as { _pages: DvPage[] })._pages || [];
       return wrapList(pages.filter((page) =>
-        (page.file.outlinks ?? []).some((outlink) => wanted.some((target) => linksEqual(outlink, target)))));
+        (page.file.outlinks ?? []).some((outlink) => wanted.some((target) => linksEqual(outlink, target)))).map(queryPage));
     },
     array: <T>(value: T | Iterable<T> | null | undefined) => {
       if (value == null) return wrapDataArray<T>([]);
@@ -757,7 +781,15 @@ export async function runScriptBlock(
 
   // Dataview's JavaScript API is synchronous. Preload the disposable page index
   // once, then evaluate every source expression against that immutable snapshot.
-  const all = (await ctx.loadPages()).map(normalizePage);
+  let indexedPages: DvPage[] | undefined;
+  const birthdayPlan = planBirthdayScript(code, thisNote);
+  if (birthdayPlan && ctx.birthdayCandidates && ctx.loadPagesByPaths) {
+    try {
+      indexedPages = await ctx.loadPagesByPaths(await ctx.birthdayCandidates(birthdayPlan.month, birthdayPlan.day));
+      queryDiagnostic("dataviewjs.index", { index: "birthday", candidates: indexedPages.length });
+    } catch { /* Preserve normal evaluation if the index is unavailable. */ }
+  }
+  const all = indexedPages ?? await ctx.loadPages();
   (dv as unknown as { _pages: DvPage[] })._pages = all;
   const app = new ObsidianApp({
     listFiles: () => all.map((page): AppFile => ({
@@ -773,7 +805,10 @@ export async function runScriptBlock(
       return ctx.readFile(path);
     },
     queryIndex: (sql) => ctx.runSql(sql),
-    pageMetadata: (path) => all.find((page) => linksEqual(page.path, path)) ?? null,
+    pageMetadata: (path) => {
+      const page = all.find((page) => linksEqual(page.path, path));
+      return page ? queryPage(page) : null;
+    },
     resolveLink: (link, sourcePath) => {
       const page = findPage(all, link || sourcePath);
       return page ? {
@@ -893,8 +928,25 @@ export async function runDqlBlock(
       (await ctx.loadPage(ctx.currentPath)) ?? stubPage(ctx.currentPath),
     );
     const query = parseDql(code);
-    const loaded = (await ctx.loadPages()).map(normalizePage);
-    let rows: DqlRow[] = filterPagesBySource(loaded, query.source, ctx.currentPath);
+    // Only WHERE predicates before any row-shaping operation can restrict pages.
+    const predicates: string[] = [];
+    for (const operation of query.operations) {
+      if (operation.kind !== "where") break;
+      predicates.push(operation.expression);
+    }
+    const plan = query.kind !== "TASK" ? planBirthday(predicates, current) : null;
+    let candidates: DvPage[] | undefined;
+    if (plan && ctx.loadPagesByPaths && ctx.birthdayCandidates) {
+      try {
+        const found = await ctx.birthdayCandidates(plan.month, plan.day);
+        {
+          candidates = await ctx.loadPagesByPaths(found);
+          queryDiagnostic("dataview.index", { index: "birthday", candidates: candidates.length });
+        }
+      } catch { /* Older index/unsupported SQL: preserve the complete scan. */ }
+    }
+    const loaded = filterPagesBySource(candidates ?? await ctx.loadPages(), query.source, ctx.currentPath);
+    let rows: DqlRow[] = await normalizeQueryPages(loaded);
     if (query.kind === "TASK") {
       rows = rows.flatMap((page) => (page.file?.tasks ?? []).map((task) => ({
         ...page,

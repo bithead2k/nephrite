@@ -1,5 +1,5 @@
 import { isImagePath } from "./file-kinds";
-import type { VaultChangeEvent } from "./types";
+import type { FileEntry, VaultChangeEvent } from "./types";
 
 /**
  * Content edits do not change the file browser. Rebuild its potentially large
@@ -61,5 +61,57 @@ export class DeferredVaultChanges {
 
   get pending(): boolean {
     return this.value != null;
+  }
+}
+
+/** File membership is independent of editor/preview work. Read only changed
+ * paths and coalesce bursts; never reload or save the active document. */
+export class VaultFileTreeUpdates {
+  private pendingChange: VaultChangeEvent | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private running = false;
+
+  constructor(
+    private readonly readFiles: (paths: string[]) => Promise<FileEntry[]>,
+    private readonly getFiles: () => FileEntry[],
+    private readonly publish: (files: FileEntry[]) => void,
+    private readonly generation: () => number,
+    private readonly onError: (error: unknown) => void,
+  ) {}
+
+  enqueue(change: VaultChangeEvent): void {
+    this.pendingChange = mergeVaultChanges(this.pendingChange, change);
+    if (!this.timer && !this.running) {
+      this.timer = setTimeout(() => { this.timer = null; void this.flush(); }, 50);
+    }
+  }
+
+  async flush(): Promise<void> {
+    if (this.running) return;
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    this.running = true;
+    try {
+      while (this.pendingChange) {
+        const change = this.pendingChange;
+        this.pendingChange = null;
+        if (!vaultChangeTouchesFileTree(change, this.getFiles().map((file) => file.path))) continue;
+        const generation = this.generation();
+        const paths = new Set(change.paths);
+        const updated = await this.readFiles([...paths]);
+        if (generation !== this.generation()) continue;
+        // Merge into the latest snapshot, not the one from before the await.
+        this.publish([...this.getFiles().filter((file) => !paths.has(file.path)), ...updated]);
+      }
+    } catch (error) {
+      this.onError(error);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  reset(): void {
+    this.pendingChange = null;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
   }
 }

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { JSDOM } from "jsdom";
 import ts from "typescript";
-import { pluginIframeDocument, type PluginDescriptor } from "../ui/src/plugin-host";
+import { pluginIframeDocument, PluginManager, type PluginDescriptor } from "../ui/src/plugin-host";
 
 function publicRuntimeExports(): string[] {
   const source = ts.createSourceFile(
@@ -409,5 +409,71 @@ test("Bases values, collections, dates, tasks, and view configuration have worki
   assert.equal(JSON.stringify(audit.config), JSON.stringify(["Cards", "note.title", "ASC", "title"]));
   assert.equal(audit.entry, "42");
   assert.equal(audit.group, true);
+  dom.window.close();
+});
+
+
+test("vault notifications fetch only changed metadata and retain unrelated pages", async () => {
+  const dom = new JSDOM("");
+  const previousWindow = globalThis.window;
+  Object.assign(globalThis, { window: dom.window });
+  try {
+    const calls: string[][] = [];
+    const messages: unknown[][] = [];
+    const files = [{ path: "changed.md" }, { path: "untouched.md" }];
+    const manager = new PluginManager({
+      listFiles: () => files,
+      metadataSnapshot: () => { throw new Error("must not reload the vault"); },
+      metadataForPaths: async (paths: string[]) => {
+        calls.push(paths);
+        return paths.includes("changed.md") ? [{ path: "changed.md", value: "new" }] : [];
+      },
+    } as any);
+    const state = manager as any;
+    state.metadataSnapshot = [{ path: "changed.md", value: "old" }, { path: "untouched.md", value: "keep" }];
+    state.plugins.set("reader", {
+      descriptor: { id: "reader", permissions: ["vault.read"] },
+      notifyVaultChange: (...args: unknown[]) => messages.push(args),
+    });
+    await manager.notifyVaultChange(["changed.md"]);
+    await manager.notifyVaultChange(["changed.md"]);
+    assert.deepEqual(calls, [["changed.md"], ["changed.md"]]);
+    assert.equal((messages[0][2] as unknown[]).length, 1);
+    assert.equal(messages[0][3], true);
+    assert.equal(messages[1][1], undefined, "unchanged file list should not cross the bridge again");
+    assert.deepEqual(state.metadataSnapshot, [{ path: "untouched.md", value: "keep" }, { path: "changed.md", value: "new" }]);
+    await manager.notifyVaultChange(["untouched.md"]);
+    assert.deepEqual(state.metadataSnapshot, [{ path: "changed.md", value: "new" }]);
+    state.plugins.clear();
+    await manager.notifyVaultChange(["changed.md"]);
+    assert.equal(calls.length, 3, "no readers should require no metadata fetch");
+    manager.destroy();
+  } finally {
+    Object.assign(globalThis, { window: previousWindow });
+    dom.window.close();
+  }
+});
+
+test("plugin metadata deltas retain unrelated caches and remove deleted pages", async () => {
+  const dom = await boot(`
+    const { Plugin } = require("obsidian");
+    module.exports = class extends Plugin { onload() { window.testApp = this.app; } };
+  `);
+  const send = async (message: Record<string, unknown>) => {
+    dom.window.dispatchEvent(new dom.window.MessageEvent("message", { data: {
+      nephriteHost: true, pluginId: "official-api-smoke", ...message,
+    } }));
+    await new Promise(resolve => setTimeout(resolve, 10));
+  };
+  await send({ type: "load", files: [{ path: "a.md" }, { path: "b.md" }], metadata: [{ path: "a.md", value: 1 }, { path: "b.md", value: 2 }] });
+  const app = (dom.window as any).testApp;
+  await send({ type: "vault-change", paths: ["a.md"], metadata: [{ path: "a.md", value: 3 }], metadataDelta: true });
+  assert.equal(app.metadataCache.getCache("a.md").value, 3);
+  assert.equal(app.metadataCache.getCache("b.md").value, 2);
+  assert.equal(app.vault.getFiles().length, 2);
+  await send({ type: "vault-change", paths: ["a.md"], files: [{ path: "b.md" }], metadata: [], metadataDelta: true });
+  assert.equal(app.metadataCache.getCache("a.md"), null);
+  assert.equal(app.metadataCache.getCache("b.md").value, 2);
+  assert.equal(app.vault.getFiles().length, 1);
   dom.window.close();
 });

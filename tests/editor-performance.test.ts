@@ -43,6 +43,7 @@ import { RefreshGate } from "../ui/src/refresh-gate";
 import { canPersistSession, editorTabTitle } from "../ui/src/session-guard";
 import {
   DeferredVaultChanges,
+  VaultFileTreeUpdates,
   mergeVaultChanges,
   vaultChangeInvalidatesPageCache,
   vaultChangeTouchesFileTree,
@@ -810,7 +811,7 @@ test("editor transaction source contains no host or document-wide work", () => {
   const watcherStart = mainSource.indexOf("async function applyVaultChange");
   const watcherEnd = mainSource.indexOf("function flushDeferredVaultChanges", watcherStart);
   const watcher = mainSource.slice(watcherStart, watcherEnd);
-  assert.ok(watcher.indexOf("dirtyReactor.isDirty") < watcher.indexOf("refreshTree()"));
+  assert.ok(watcher.indexOf("vaultFileTreeUpdates.enqueue(change)") < watcher.indexOf("dirtyReactor.isDirty"));
   assert.match(watcher, /deferredVaultChanges\.defer\(change\)/);
 });
 
@@ -1924,4 +1925,62 @@ test("kanban hover preview is suppressed while a lane is scrolling", () => {
   assert.equal(isKanbanPreviewSuppressed(0), false);
   suppressKanbanCardPreview(250);
   assert.equal(isKanbanPreviewSuppressed(), true);
+});
+
+
+test("new PDF appears while unsaved editor changes remain deferred", async () => {
+  const entry = (path: string) => ({ path, name: path, parent_path: "", file_kind: path.endsWith(".pdf") ? "attachment" : "markdown" });
+  let files = [entry("draft.md")];
+  const dirty = new DeferredVaultChanges();
+  const calls: string[][] = [];
+  const updates = new VaultFileTreeUpdates(async (paths) => {
+    calls.push(paths);
+    return paths.map(entry);
+  }, () => files, (next) => { files = next; }, () => 1, (error) => { throw error; });
+  const change = { scanned: 1, updated: 1, removed: 0, paths: ["ntxsom/Notebook.pdf"] };
+  dirty.defer(change);
+  updates.enqueue(change);
+  updates.enqueue(change);
+  await updates.flush();
+  assert.equal(dirty.takeIfClean(true), null);
+  assert.equal(dirty.pending, true);
+  assert.deepEqual(files.map((f) => f.path), ["draft.md", "ntxsom/Notebook.pdf"]);
+  assert.deepEqual(calls, [["ntxsom/Notebook.pdf"]]);
+  updates.enqueue(change);
+  await updates.flush();
+  assert.equal(calls.length, 1, "existing attachment updates need no file-tree fetch");
+});
+
+test("file tree handles a rename and events arriving during an index read", async () => {
+  const entry = (path: string) => ({ path, name: path, parent_path: "", file_kind: "attachment" });
+  let files = [entry("old.pdf"), entry("keep.pdf")];
+  let release!: (files: typeof files) => void;
+  let calls = 0;
+  const updates = new VaultFileTreeUpdates(async (paths) => {
+    calls++;
+    if (calls === 1) return new Promise<typeof files>((resolve) => { release = resolve; });
+    return paths.map(entry);
+  }, () => files, (next) => { files = next; }, () => 1, (error) => { throw error; });
+  updates.enqueue({ scanned: 2, updated: 1, removed: 1, paths: ["old.pdf", "new.pdf"] });
+  const running = updates.flush();
+  updates.enqueue({ scanned: 1, updated: 1, removed: 0, paths: ["later.pdf"] });
+  release([entry("new.pdf")]);
+  await running;
+  assert.deepEqual(files.map((f) => f.path).sort(), ["keep.pdf", "later.pdf", "new.pdf"]);
+  assert.equal(calls, 2);
+});
+
+test("file tree discards an in-flight response after switching vaults", async () => {
+  let generation = 1;
+  let published = false;
+  let release!: (files: []) => void;
+  const updates = new VaultFileTreeUpdates(() => new Promise<[]>((resolve) => { release = resolve; }),
+    () => [], () => { published = true; }, () => generation, (error) => { throw error; });
+  updates.enqueue({ scanned: 1, updated: 1, removed: 0, paths: ["old-vault.pdf"] });
+  const running = updates.flush();
+  generation++;
+  updates.reset();
+  release([]);
+  await running;
+  assert.equal(published, false);
 });

@@ -361,3 +361,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
     tags,
     tokenize = 'unicode61'
 );
+
+-- Recurring birth dates: derived index only; original property names/values remain intact.
+CREATE INDEX IF NOT EXISTS idx_properties_birthday ON properties(CASE WHEN CAST(substr(value_text, 1, 4) AS INTEGER) BETWEEN 0 AND 99 THEN NULL ELSE strftime('%m-%d', substr(value_text, 1, 10), '+0 days') END, path) WHERE lower(replace(replace(replace(prop_key, ' ', ''), '_', ''), '-', '')) IN ('dob', 'birthday', 'birthdate', 'dateofbirth');
+CREATE INDEX IF NOT EXISTS idx_inline_fields_birthday ON inline_fields(CASE WHEN CAST(substr(value_text, 1, 4) AS INTEGER) BETWEEN 0 AND 99 THEN NULL ELSE strftime('%m-%d', substr(value_text, 1, 10), '+0 days') END, path) WHERE lower(replace(replace(replace(key, ' ', ''), '_', ''), '-', '')) IN ('dob', 'birthday', 'birthdate', 'dateofbirth');

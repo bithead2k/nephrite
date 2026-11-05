@@ -50,7 +50,7 @@ import {
   executeBlocksInPreview,
   executeBlocksInSubtree,
 } from "./dv-engine";
-import { makeEngineContext } from "./dv-context";
+import { makeEngineContext, resetEnginePageCache, refreshEnginePageCache } from "./dv-context";
 import * as hooks from "./hooks";
 import { $ as sh, $$ as shFull, shell } from "./shell";
 import {
@@ -142,11 +142,11 @@ import { clearStructuredView, renderStructuredView } from "./structured-view";
 import { renderAttachmentPanel } from "./attachment-panel";
 import { renderSqlConsole } from "./sql-console";
 import { emptyBaseSource } from "./bases";
-import { hydrateBaseFences, pagesFromListRows, renderBaseView } from "./base-view";
+import { hydrateBaseFencesWhenNeeded, pagesFromListRows, renderBaseView } from "./base-view";
 import { renderPropertiesEditor } from "./properties-editor";
 import type { SqlQueryResult } from "./dv-engine";
 import { DeferredDocumentWork } from "./edit-scheduler";
-import { claimOneTimeBinding, LatestPaneSwitch, missingAncestorPaths } from "./pane-switch";
+import { claimOneTimeBinding, LatestPaneSwitch } from "./pane-switch";
 import { PaneStateCache, type CachedPreview } from "./pane-cache";
 import { RefreshGate } from "./refresh-gate";
 import { resizedKanbanLaneWidth } from "./kanban-resize";
@@ -154,6 +154,7 @@ import { canPersistSession, editorTabTitle } from "./session-guard";
 import { bindQueryUriLinks } from "./query-uri";
 import {
   DeferredVaultChanges,
+  VaultFileTreeUpdates,
   vaultChangeInvalidatesPageCache,
   vaultChangeTouchesFileTree,
 } from "./vault-change";
@@ -302,6 +303,13 @@ let pendingCursor: { line: number; col: number; totalLines: number } | null = nu
 let pendingFolds = false;
 let pendingChrome = false;
 const deferredVaultChanges = new DeferredVaultChanges();
+const vaultFileTreeUpdates = new VaultFileTreeUpdates(
+  (paths) => invoke<FileEntry[]>("list_files", { paths }),
+  () => vaultFilesAll,
+  (files) => publishVaultFiles(files),
+  () => vaultCheckSequence,
+  (error) => console.warn("[vault file tree]", error),
+);
 const dirtyReactor = new DirtyReactor(() => {
   const idle = dirtyReactor.consumeIdle(PREVIEW_DELAY_MS, AUTOSAVE_DELAY_MS);
   const reaction = dirtyReactor.consumeReaction();
@@ -1192,10 +1200,11 @@ async function renderShell() {
     },
     queryIndex: (sql) => invoke("query_vault_sql", { sql }),
     pageMetadata: async (path) => {
-      const rows = await invoke<Array<Record<string, unknown>>>("list_pages", { source: null });
+      const rows = await invoke<Array<Record<string, unknown>>>("list_pages", { source: null, paths: [path, `${path}.md`] });
       return rows.find((row) => row.path === path || row.path === `${path}.md`) ?? null;
     },
     metadataSnapshot: () => invoke<Array<Record<string, unknown>>>("list_pages", { source: null }),
+    metadataForPaths: (paths) => invoke<Array<Record<string, unknown>>>("list_pages", { source: null, paths }),
     resolveLink: async (link, sourcePath) => {
       const path = await invoke<string | null>("resolve_wikilink", { target: link, fromPath: sourcePath });
       return path ? mdFilesAll.find((file) => file.path === path) ?? {
@@ -2098,10 +2107,7 @@ function scheduleDeferredPreviewHydration(
     if (!live()) return;
     highlightPreviewCode(root);
     hydrateCsvFences(root);
-    const bases = loadBasePages()
-      .then((pages) => {
-        if (live()) hydrateBaseFences(root, pages, (target) => void openNote(target));
-      })
+    const bases = hydrateBaseFencesWhenNeeded(root, loadBasePages, live, (target) => void openNote(target))
       .catch((error) => console.warn("[base fence]", error));
     const diagrams = hydrateMermaid(root).catch((error) => console.warn("[mermaid]", error));
     bindLinkPreviews(root, {
@@ -3105,6 +3111,7 @@ async function openVaultPath(path: string) {
     }
   }
   const checkSequence = ++vaultCheckSequence;
+  vaultFileTreeUpdates.reset();
   // Preserve the old vault before entering the non-persistable loading state.
   // From this point until the final commit, unload must not serialize the
   // deliberately cleared intermediate workspace.
@@ -3146,6 +3153,7 @@ async function openVaultPath(path: string) {
   let info: VaultInfo;
   try {
     info = await invoke<VaultInfo>("open_vault", { path });
+    resetEnginePageCache();
   } finally {
     activeOpenPlan = null;
     hideIndexProgress();
@@ -3230,6 +3238,10 @@ function hideIndexProgress() {
 
 async function refreshTree() {
   const files = await invoke<FileEntry[]>("list_files");
+  publishVaultFiles(files);
+}
+
+function publishVaultFiles(files: FileEntry[]) {
   vaultFilesAll = files.sort((a, b) => a.path.localeCompare(b.path));
   mdFilesAll = vaultFilesAll
     .filter((f) => f.file_kind === "markdown" || f.file_kind === "excalidraw" || f.file_kind === "canvas")
@@ -3331,6 +3343,7 @@ function focusActiveDocumentPane() {
 async function installVaultChangeListener() {
   await Promise.all([
     listen<VaultChangeEvent>("vault-index-changed", (event) => {
+      vaultFileTreeUpdates.enqueue(event.payload);
       vaultChangeQueue = vaultChangeQueue
         .then(() => applyVaultChange(event.payload, false))
         .catch((error) => console.warn("[vault tracker]", error));
@@ -3405,11 +3418,14 @@ async function forceVaultRefresh() {
 }
 
 async function applyVaultChange(change: VaultChangeEvent, manual: boolean) {
+  if (!manual) vaultFileTreeUpdates.enqueue(change);
   if (!manual && dirtyReactor.isDirty) {
     deferredVaultChanges.defer(change);
     return;
   }
-  if (vaultChangeTouchesFileTree(change, mdFilesAll.map((file) => file.path))) {
+  if (change.paths.length) refreshEnginePageCache(change.paths);
+  else if (change.updated || change.removed) resetEnginePageCache();
+  if (manual && vaultChangeTouchesFileTree(change, vaultFilesAll.map((file) => file.path))) {
     await refreshTree();
   }
   void pluginManager?.notifyVaultChange(change.paths).catch((error) => console.warn("[plugin vault event]", error));
@@ -3516,8 +3532,12 @@ function rebuildVisibleTree() {
   renderTree();
 }
 
+const treeBatchSize = 200;
+const treeVisibleCounts = new Map<string, number>();
+
 function renderTree() {
   const host = $("file-tree");
+  const scrollTop = host.scrollTop;
   host.innerHTML = "";
   installTreeHostListeners(host);
 
@@ -3539,6 +3559,7 @@ function renderTree() {
     frag.appendChild(renderNode(child, 0, revealForFilter));
   }
   host.appendChild(frag);
+  host.scrollTop = scrollTop;
 }
 
 function installTreeHostListeners(host: HTMLElement): void {
@@ -3646,8 +3667,23 @@ function renderNode(node: TreeNode, depth: number, revealForFilter: boolean): HT
   if (isOpen) {
     const kids = document.createElement("div");
     kids.className = "tree-children";
-    for (const c of node.children) {
+    const batchKey = `${filterQuery}\0${node.path}`;
+    const limit = treeVisibleCounts.get(batchKey) ?? treeBatchSize;
+    for (const c of node.children.slice(0, limit)) {
       kids.appendChild(renderNode(c, depth + 1, revealForFilter));
+    }
+    if (node.children.length > limit) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "tree-file tree-load-more";
+      more.style.paddingLeft = `${10 + (depth + 1) * 14}px`;
+      const next = Math.min(treeBatchSize, node.children.length - limit);
+      more.textContent = `Show ${next.toLocaleString()} more (${limit.toLocaleString()} of ${node.children.length.toLocaleString()} shown)`;
+      more.addEventListener("click", () => {
+        treeVisibleCounts.set(batchKey, limit + treeBatchSize);
+        renderTree();
+      });
+      kids.appendChild(more);
     }
     wrap.appendChild(kids);
   }
@@ -3938,14 +3974,9 @@ async function openNoteSerialized(
     if (viewMode !== "preview") editor?.focus();
   }
   if (!isCurrent()) return;
-  // Opening a note peels open only its ancestor folders (and remembers that).
-  const missingAncestors = missingAncestorPaths(path, expanded);
-  const expandedChanged = missingAncestors.length > 0;
-  for (const ancestor of missingAncestors) expanded.add(ancestor);
-  if (expandedChanged) saveExpanded();
+  // Page access preserves the user’s folder expansion and scroll state.
   updateChrome();
-  if (expandedChanged) renderTree();
-  else updateActivePaneChrome(previousPath, file.path);
+  updateActivePaneChrome(previousPath, file.path);
   if (tabAdded) renderTabBar();
   else updateActivePaneChrome(previousPath, file.path);
   let previewRestored = false;
@@ -3961,7 +3992,7 @@ async function openNoteSerialized(
     warm: Boolean(cached),
     editorRestored: Boolean(cached?.editor),
     previewRestored,
-    treeRebuilt: expandedChanged,
+    treeRebuilt: false,
     tabAdded,
     elapsedMs: Number((performance.now() - requestedAt).toFixed(1)),
   });
