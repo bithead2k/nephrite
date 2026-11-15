@@ -1,8 +1,9 @@
 import { refreshPreviewDynamics } from "./preview-dynamics";
 import { obsidianOpenNoteUri } from "./mobile-handoff";
+import { embedMarkdown, saveDroppedFiles } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { NephriteEditor, type EditorPaneSnapshot, type FoldRange } from "./editor";
 import { hydrateTableOfContents, renderBlockHtml, renderPreview } from "./preview";
@@ -174,6 +175,7 @@ import { renderNoteContext, renderTagBrowser } from "./note-context";
 import { collectPeople, renderAttendancePanel, type PersonRow } from "./people";
 import {
   renderPersistentCommandBar,
+  fuzzyScoreText,
   type AppCommand,
   type PersistentCommandBar,
 } from "./command-bar";
@@ -211,6 +213,15 @@ import {
   normalizeAppearanceFonts,
   type AppearanceFonts,
 } from "./appearance";
+import {
+  DISPLAY_PREFERENCES_KEY,
+  applyDisplayPreferences,
+  loadDisplayPreferences,
+  measureAppleSystemTextScale,
+  normalizeDisplayPreferences,
+} from "./accessibility";
+import { bindSettingsSearch, type SettingsSearchController } from "./settings-search";
+import { captureNotePath, parseMobileIntent, type MobileIntent } from "./mobile-intent";
 import type {
   AttachmentRow,
   FileEntry,
@@ -254,7 +265,8 @@ const AUTOSAVE_DELAY_MS = 800;
 const PREVIEW_DELAY_MS = 1_000;
 
 const LAST_VAULT_KEY = "nephrite.lastVault";
-const mobileApp = /Android/i.test(navigator.userAgent);
+const mobileApp = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const appleMobileApp = /iPhone|iPad|iPod/i.test(navigator.userAgent);
 const VIM_KEY = "nephrite.vim";
 const PREVIEW_CSS_KEY = "nephrite.previewCss.v1";
 const DEFAULT_PREVIEW_CSS = "/* Nephrite page styles \u2014 edit in Preferences. Scoped to .preview */\n\n.preview {\n  line-height: 1.55;\n  color: var(--text);\n}\n\n.preview a {\n  color: var(--accent);\n  text-decoration: underline;\n  text-underline-offset: 2px;\n}\n\n.preview a:hover {\n  color: #9ee4c8;\n}\n\n.preview hr {\n  border: none;\n  border-top: 1px solid var(--border);\n  margin: 1.25em 0;\n}\n\n.preview ul,\n.preview ol {\n  margin: 0.55em 0 0.55em 1.35em;\n  padding: 0;\n}\n\n.preview li {\n  margin: 0.25em 0;\n}\n\n.preview li > ul,\n.preview li > ol {\n  margin-top: 0.2em;\n}\n\n.preview img {\n  max-width: 100%;\n  height: auto;\n  border-radius: 6px;\n}\n\n.preview table {\n  width: 100%;\n  border-collapse: collapse;\n  margin: 0.9em 0;\n  font-size: 0.92em;\n  display: block;\n  overflow-x: auto;\n}\n\n.preview th,\n.preview td {\n  border: 1px solid var(--border);\n  padding: 0.45em 0.7em;\n  text-align: left;\n  vertical-align: top;\n}\n\n.preview th {\n  background: #1a2330;\n  font-weight: 650;\n  color: #dff8ec;\n}\n\n.preview tr:nth-child(even) td {\n  background: color-mix(in srgb, #1a2330 55%, transparent);\n}\n\n.preview tr:hover td {\n  background: color-mix(in srgb, var(--accent) 10%, transparent);\n}\n\n.preview input[type=\"checkbox\"] {\n  margin-right: 0.4em;\n}\n";
@@ -347,6 +359,11 @@ let showDotfiles = localStorage.getItem(DOTFILES_KEY) === "1";
 let vimOn = !mobileApp && localStorage.getItem(VIM_KEY) === "1";
 let externalLinksInBrowser = localStorage.getItem(EXTERNAL_BROWSER_KEY) === "1";
 let appearanceFonts = loadAppearanceFonts();
+let displayPreferences = loadDisplayPreferences();
+let systemTextScale = 1;
+let settingsSearch: SettingsSearchController | null = null;
+const pendingMobileIntents: MobileIntent[] = [];
+let pendingCaptureIntent: Extract<MobileIntent, { kind: "capture" }> | null = null;
 let tableSettings = loadTableSettings();
 let viewMode: ViewMode = normalizeMode(localStorage.getItem(VIEW_KEY) ?? (mobileApp ? "live" : null));
 const previewWork = new DeferredDocumentWork(PREVIEW_DELAY_MS);
@@ -727,6 +744,8 @@ async function renderShell() {
       <div class="actions">
         <button type="button" id="btn-mobile-files" class="mobile-only" title="Browse notes">Files</button>
         <button type="button" id="btn-mobile-obsidian" class="mobile-only" title="Save and open this note in Obsidian; Obsidian handles Sync" disabled>Obsidian ↗</button>
+        <button type="button" id="btn-mobile-camera" class="mobile-only" title="Take a picture and attach it" disabled>Camera</button>
+        <input id="mobile-camera-input" type="file" accept="image/*" capture="environment" hidden />
         <button type="button" id="btn-today" title="Jump to today's journal" disabled>Today</button>
         <button type="button" id="btn-save" disabled title="Save (Ctrl/Cmd+S)">Save</button>
         <div class="seg" role="group" aria-label="View mode">
@@ -765,7 +784,14 @@ async function renderShell() {
             <button type="button" id="preferences-close" class="preferences-close" title="Close preferences" aria-label="Close preferences">×</button>
           </header>
           <div class="preferences-body">
+            <label class="preferences-search-wrap" for="preferences-search">
+              <span class="sr-only">Search preferences</span>
+              <input type="search" id="preferences-search" placeholder="Search preferences…" autocomplete="off" />
+              <small id="preferences-search-status" aria-live="polite"></small>
+            </label>
             <button type="button" id="btn-open" class="preferences-action">${activityIcon("folder-open")}<span>Open a vault…</span></button>
+            <button type="button" id="btn-open-external" class="preferences-action">${activityIcon("file-search")}<span>Open Markdown outside vault…</span></button>
+            <button type="button" id="btn-quick-capture" class="preferences-action"><span>Quick Capture…</span></button>
             <label class="preference-toggle">
               <input type="checkbox" id="vim-toggle" ${vimOn ? "checked" : ""} />
               <span>Vim mode</span>
@@ -779,8 +805,18 @@ async function renderShell() {
               <span>Open external links in browser</span>
             </label>
             <section class="preferences-section">
-              <strong>Appearance fonts</strong>
-              <small>Enter a CSS font-family or fallback stack. Empty fields use Nephrite defaults; the editor then falls back to <code>guifont</code> from your Vim configuration.</small>
+              <strong>Appearance and language</strong>
+              <small>These settings stay on this device and are not written into the vault.</small>
+              <div class="preferences-font-grid">
+                <label for="appearance-base-size">Base text size</label><input type="number" id="appearance-base-size" min="12" max="24" step="1" value="${displayPreferences.baseFontSize}" />
+                <label for="appearance-direction">Interface direction</label>
+                <select id="appearance-direction">
+                  <option value="auto"${displayPreferences.direction === "auto" ? " selected" : ""}>Automatic</option>
+                  <option value="ltr"${displayPreferences.direction === "ltr" ? " selected" : ""}>Left to right</option>
+                  <option value="rtl"${displayPreferences.direction === "rtl" ? " selected" : ""}>Right to left</option>
+                </select>
+              </div>
+              <small>Font family overrides are optional. The editor falls back to <code>guifont</code> from your Vim configuration.</small>
               <div class="preferences-font-grid">
                 <label for="appearance-font-ui">Interface</label><input type="text" id="appearance-font-ui" placeholder='"Segoe UI", system-ui' />
                 <label for="appearance-font-editor">Editor/code</label><input type="text" id="appearance-font-editor" placeholder='"DejaVu Sans Mono", monospace' />
@@ -788,7 +824,7 @@ async function renderShell() {
                 <label for="appearance-font-powerline">Powerline</label><input type="text" id="appearance-font-powerline" placeholder='"DejaVu Sans Mono", "PowerlineSymbols"' />
               </div>
               <div class="preferences-font-actions">
-                <button type="button" id="appearance-font-save">Save fonts</button>
+                <button type="button" id="appearance-font-save">Save appearance</button>
                 <button type="button" id="appearance-font-reset">Reset</button>
               </div>
             </section>
@@ -826,6 +862,13 @@ async function renderShell() {
               <input type="text" id="task-scope-tags" placeholder="Tags: task, todo" />
               <input type="text" id="task-scope-property" placeholder="Frontmatter property: tasks" />
               <button type="button" id="task-scope-save">Save task scope</button>
+            </section>
+            <section class="preferences-section">
+              <strong>Mobile capture links</strong>
+              <small>Android widgets and iOS Shortcuts can open Daily Notes, existing notes, or the reviewed Quick Capture form.</small>
+              <code>nephrite://daily</code>
+              <code>nephrite://capture?location=Inbox&amp;title=Capture%20%7Bdate%7D&amp;text=...</code>
+              <small>Capture titles support <code>{date}</code> and <code>{time}</code>. The location is a vault-relative folder.</small>
             </section>
             <section class="preferences-section">
               <strong>Page CSS</strong>
@@ -959,7 +1002,14 @@ async function renderShell() {
     </div>
   `;
   applyAppearanceFonts(appearanceFonts);
+  applyDisplayPreferences(displayPreferences, systemTextScale);
   applyTablePreviewSettings(tableSettings);
+  settingsSearch?.destroy();
+  settingsSearch = bindSettingsSearch(
+    $("preferences-search") as HTMLInputElement,
+    document.querySelector<HTMLElement>(".preferences-body")!,
+    $("preferences-search-status"),
+  );
   readingMode = new ReadingModeController({
     previewHost: $("preview-host"),
     previewRoot: $("preview"),
@@ -984,13 +1034,31 @@ async function renderShell() {
     closePreferences();
     void openVault();
   });
+  $("btn-open-external").addEventListener("click", () => {
+    closePreferences();
+    void openExternalMarkdownPicker();
+  });
+  $("btn-quick-capture").addEventListener("click", () => {
+    showQuickCapture({ kind: "capture", text: "", title: "", location: "Inbox" });
+  });
   $("btn-mobile-files").addEventListener("click", () => setSidebarCollapsed(!sidebarCollapsed, false));
   $("btn-mobile-obsidian").addEventListener("click", () => void handoffToObsidian());
+  $("btn-mobile-camera").addEventListener("click", () => ($("mobile-camera-input") as HTMLInputElement).click());
+  $("mobile-camera-input").addEventListener("change", (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    void attachCapturedImages(Array.from(input.files ?? [])).finally(() => { input.value = ""; });
+  });
   if (mobileApp) {
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) void reconcileMobileVault();
+      if (!document.hidden) {
+        void reconcileMobileVault();
+        void refreshSystemTextScale();
+      }
     });
-    window.addEventListener("focus", () => void reconcileMobileVault());
+    window.addEventListener("focus", () => {
+      void reconcileMobileVault();
+      void refreshSystemTextScale();
+    });
   }
   $("activity-files").addEventListener("click", () => setSidebarCollapsed(false));
   $("btn-sidebar").addEventListener("click", () => setSidebarCollapsed(!sidebarCollapsed));
@@ -1115,6 +1183,11 @@ async function renderShell() {
     }
   });
   document.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f" && !$("preferences-popover").classList.contains("hidden")) {
+      event.preventDefault();
+      ($("preferences-search") as HTMLInputElement).focus();
+      return;
+    }
     if (event.key === "Escape" && !$("preferences-popover").classList.contains("hidden")) {
       closePreferences();
       $("btn-preferences").focus();
@@ -1174,6 +1247,7 @@ async function renderShell() {
     if (document.hidden && dirty) void saveFile(true);
   });
   await initEditor();
+  if (mobileApp) await refreshSystemTextScale();
   pluginManager = new PluginManager({
     listFiles: () => mdFilesAll,
     readFile: async (path) => (await invoke<OpenFile>("read_file", { path })).content,
@@ -1359,8 +1433,7 @@ async function initEditor() {
       },
       onSaveAttachments: async (files) => {
         if (!currentPath) return [];
-        const { saveDroppedFiles } = await import("./attachments");
-        return saveDroppedFiles(files, currentPath);
+        return saveDroppedFiles(files, currentPath, vaultFilesAll);
       },
     },
     vimOn,
@@ -1480,18 +1553,29 @@ function saveAppearanceFontPreferences() {
     ),
   );
   appearanceFonts = normalizeAppearanceFonts(candidate);
+  displayPreferences = normalizeDisplayPreferences({
+    baseFontSize: Number(($('appearance-base-size') as HTMLInputElement).value),
+    direction: ($('appearance-direction') as HTMLSelectElement).value,
+  });
   localStorage.setItem(APPEARANCE_FONTS_KEY, JSON.stringify(appearanceFonts));
+  localStorage.setItem(DISPLAY_PREFERENCES_KEY, JSON.stringify(displayPreferences));
   applyAppearanceFonts(appearanceFonts);
+  applyDisplayPreferences(displayPreferences, systemTextScale);
   loadAppearanceFontInputs();
-  setTransientStatus("Appearance fonts saved", "#5ecf9a");
+  setTransientStatus("Device appearance saved", "#5ecf9a");
 }
 
 function resetAppearanceFontPreferences() {
   appearanceFonts = { ...DEFAULT_APPEARANCE_FONTS };
+  displayPreferences = { baseFontSize: 16, direction: "auto" };
   localStorage.removeItem(APPEARANCE_FONTS_KEY);
+  localStorage.removeItem(DISPLAY_PREFERENCES_KEY);
   applyAppearanceFonts(appearanceFonts);
+  applyDisplayPreferences(displayPreferences, systemTextScale);
   loadAppearanceFontInputs();
-  setTransientStatus("Appearance fonts reset", "#5ecf9a");
+  ($('appearance-base-size') as HTMLInputElement).value = String(displayPreferences.baseFontSize);
+  ($('appearance-direction') as HTMLSelectElement).value = displayPreferences.direction;
+  setTransientStatus("Device appearance reset", "#5ecf9a");
 }
 
 function saveTableSettings(settings: TableSettings) {
@@ -2107,7 +2191,7 @@ function scheduleDeferredPreviewHydration(
     if (!live()) return;
     highlightPreviewCode(root);
     hydrateCsvFences(root);
-    const bases = hydrateBaseFencesWhenNeeded(root, loadBasePages, live, (target) => void openNote(target))
+    const bases = hydrateBaseFencesWhenNeeded(root, loadBasePages, live, (target) => void openNote(target), moveBaseCardToGroup, exportBaseCsv)
       .catch((error) => console.warn("[base fence]", error));
     const diagrams = hydrateMermaid(root).catch((error) => console.warn("[mermaid]", error));
     bindLinkPreviews(root, {
@@ -2935,6 +3019,8 @@ function updateChrome() {
     ($("btn-mobile-obsidian") as HTMLButtonElement).disabled =
       !vaultOpen || currentFileKind !== "markdown" ||
       obsidianOpenNoteUri(localStorage.getItem(LAST_VAULT_KEY), currentPath) == null;
+    ($("btn-mobile-camera") as HTMLButtonElement).disabled =
+      !vaultOpen || currentFileKind !== "markdown" || !currentPath;
   }
   const tab = $("tab");
   tab.textContent = editorTabTitle(
@@ -2976,6 +3062,71 @@ async function openVault() {
   });
   if (!selected || Array.isArray(selected)) return;
   await openVaultPath(selected as string);
+}
+
+async function openExternalMarkdownPicker() {
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    title: "Open Markdown file",
+    filters: [{ name: "Markdown", extensions: ["md", "markdown"] }],
+  });
+  if (!selected || Array.isArray(selected)) return;
+  await showExternalMarkdown(selected as string);
+}
+
+async function showExternalMarkdown(path: string) {
+  const file = await invoke<OpenFile>("read_external_markdown", { path });
+  const body = openFeaturePanel(file.path.replace(/^.*[\\/]/, ""));
+  const notice = document.createElement("div");
+  notice.className = "external-markdown-notice";
+  notice.innerHTML = `<strong>External file · read only</strong><code></code>`;
+  notice.querySelector("code")!.textContent = file.path;
+  const preview = document.createElement("article");
+  preview.className = "preview external-markdown-preview";
+  preview.innerHTML = renderPreview(file.content);
+  body.append(notice, preview);
+  hydrateTableOfContents(preview);
+  bindExternalLinks(preview);
+}
+
+async function exportBaseCsv(suggestedName: string, csv: string) {
+  const selected = await save({
+    title: "Export Base view as CSV",
+    defaultPath: suggestedName,
+    filters: [{ name: "CSV", extensions: ["csv"] }],
+  });
+  if (!selected) return;
+  await invoke("write_external_text", { path: selected, content: csv });
+  setTransientStatus(`Exported ${suggestedName}`, "#5ecf9a");
+}
+
+async function moveBaseCardToGroup(path: string, groupProperty: string, groupValue: unknown) {
+  if (groupProperty !== "file.folder") throw new Error(`Moving by ${groupProperty} is not supported yet`);
+  const folder = String(groupValue ?? "").replace(/^\/+|\/+$/g, "");
+  const destination = joinPath(folder, baseName(path));
+  if (destination === path) return;
+  const rewritten = await invoke<string[]>("rename_path", { from: path, to: destination });
+  remapOpenPaths(path, destination);
+  let refreshError: unknown = null;
+  try {
+    await refreshTree();
+    renderTabBar();
+    updateRightPane();
+    if (currentFileKind === "base" && currentPath) {
+      await openNote(currentPath, { forceReload: true, skipDirtyPrompt: true });
+    } else if (currentFileKind === "markdown") {
+      forceRenderCurrentDocument();
+    }
+  } catch (error) {
+    refreshError = error;
+  }
+  const count = rewritten?.length ?? 0;
+  const suffix = refreshError ? ` · refresh failed: ${String(refreshError)}` : "";
+  setTransientStatus(
+    (count ? `Moved ${path} → ${destination} · updated ${count} note${count === 1 ? "" : "s"}` : `Moved ${path} → ${destination}`) + suffix,
+    refreshError ? "#e0a84f" : "#5ecf9a",
+  );
 }
 
 type MobileStoragePermission = { granted: boolean };
@@ -3076,6 +3227,120 @@ async function handoffToObsidian() {
   } catch (error) {
     void uiAlert(`Could not open Obsidian: ${String(error)}`);
   }
+}
+
+async function refreshSystemTextScale() {
+  try {
+    systemTextScale = await invoke<number>("mobile_text_scale");
+  } catch {
+    systemTextScale = 1;
+  }
+  if (appleMobileApp) systemTextScale = Math.max(systemTextScale, measureAppleSystemTextScale());
+  applyDisplayPreferences(displayPreferences, systemTextScale);
+}
+
+async function attachCapturedImages(files: File[]) {
+  if (!files.length || !editor || !currentPath || currentFileKind !== "markdown") return;
+  try {
+    const paths = await saveDroppedFiles(files, currentPath, vaultFilesAll);
+    if (!paths.length) throw new Error("The camera did not return a supported image");
+    editor.replaceSelection(embedMarkdown(paths, vaultFilesAll));
+    setTransientStatus(`Attached ${paths.length} photo${paths.length === 1 ? "" : "s"}`, "#5ecf9a");
+  } catch (error) {
+    void uiAlert(`Could not attach the photo: ${String(error)}`);
+  }
+}
+
+async function handleMobileIntent(intent: MobileIntent) {
+  if (!vaultOpen) {
+    if (intent.kind === "capture") {
+      pendingCaptureIntent = intent;
+      if (!localStorage.getItem(LAST_VAULT_KEY)) await showMobileVaultPicker();
+      setTransientStatus("Quick Capture will open after the vault finishes loading", "#9dc7f5");
+    } else {
+      pendingMobileIntents.push(intent);
+      setTransientStatus("The requested note will open after the vault finishes loading", "#9dc7f5");
+    }
+    return;
+  }
+  if (intent.kind === "daily") {
+    await openToday();
+    return;
+  }
+  if (intent.kind === "open") {
+    const file = mdFilesAll.find((candidate) => candidate.path === intent.path || candidate.path === `${intent.path}.md`);
+    if (file) await openNote(file.path);
+    else setTransientStatus(`Note not found: ${intent.path}`, "#e9ad55");
+    return;
+  }
+  showQuickCapture(intent);
+}
+
+function showQuickCapture(intent: Extract<MobileIntent, { kind: "capture" }>) {
+  const body = openFeaturePanel("Quick Capture");
+  const explanation = document.createElement("p");
+  explanation.textContent = "Review the shared text and destination. Nephrite creates the note only when you press Save capture.";
+  const title = document.createElement("input");
+  title.type = "text";
+  title.placeholder = "Title (supports {date} and {time})";
+  title.value = intent.title;
+  const location = document.createElement("input");
+  location.type = "text";
+  location.placeholder = "Vault folder";
+  location.value = intent.location;
+  const content = document.createElement("textarea");
+  content.rows = 12;
+  content.placeholder = "Captured text";
+  content.value = intent.text;
+  const destination = document.createElement("code");
+  destination.className = "capture-destination";
+  const status = document.createElement("div");
+  status.setAttribute("role", "status");
+  const saveCapture = document.createElement("button");
+  saveCapture.type = "button";
+  saveCapture.textContent = "Save capture";
+  const updateDestination = () => {
+    destination.textContent = captureNotePath(location.value, title.value);
+    saveCapture.disabled = !vaultOpen;
+    status.textContent = vaultOpen ? "" : "Open a vault before saving. Your capture will remain here.";
+  };
+  title.addEventListener("input", updateDestination);
+  location.addEventListener("input", updateDestination);
+  saveCapture.addEventListener("click", () => {
+    if (!vaultOpen) return;
+    const requested = captureNotePath(location.value, title.value);
+    const existing = new Set(vaultFilesAll.map((file) => file.path));
+    const path = existing.has(requested) ? uniqueCopyName(requested, existing) : requested;
+    saveCapture.disabled = true;
+    status.textContent = "Saving capture…";
+    void invoke("create_file", { path, content: content.value.endsWith("\n") ? content.value : `${content.value}\n` })
+      .then(async () => {
+        await refreshTree();
+        closeFeaturePanel();
+        await openNote(path);
+        setTransientStatus(`Saved capture to ${path}`, "#5ecf9a");
+      })
+      .catch((error) => {
+        saveCapture.disabled = false;
+        status.textContent = `Could not save capture: ${String(error)}`;
+        status.className = "feature-error";
+      });
+  });
+  body.classList.add("quick-capture");
+  body.append(explanation, title, location, destination, content, status, saveCapture);
+  updateDestination();
+  content.focus();
+}
+
+async function installMobileIntentHandling() {
+  const consume = (urls: string[]) => {
+    for (const raw of urls) {
+      const intent = parseMobileIntent(raw);
+      if (intent) void handleMobileIntent(intent).catch((error) => void uiAlert(String(error)));
+    }
+  };
+  await listen<string[]>("deep-link://new-url", (event) => consume(event.payload));
+  consume(await invoke<string[]>("take_mobile_deep_links"));
 }
 
 async function reconcileMobileVault() {
@@ -3206,6 +3471,15 @@ async function openVaultPath(path: string) {
   sessionPersistenceReady = true;
   updateChrome();
   saveSession();
+  while (pendingMobileIntents.length) {
+    const intent = pendingMobileIntents.shift();
+    if (intent) await handleMobileIntent(intent);
+  }
+  if (pendingCaptureIntent) {
+    const capture = pendingCaptureIntent;
+    pendingCaptureIntent = null;
+    showQuickCapture(capture);
+  }
   if (info.background_check) {
     const summary = $("index-stats").textContent ?? "";
     $("index-stats").textContent = `${summary} · Checking for changes…`;
@@ -3270,7 +3544,10 @@ function renderFileFilterPopout() {
     return;
   }
   const matches = mdFiles
-    .filter((file) => file.path.toLowerCase().includes(filterQuery))
+    .map((file, index) => ({ file, index, score: fuzzyScoreText(file.path, filterQuery) }))
+    .filter((candidate) => candidate.score >= 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map((candidate) => candidate.file)
     .slice(0, 100);
   if (matches.length === 0) {
     popout.innerHTML = `<div class="file-filter-empty">No matches.</div>`;
@@ -3935,6 +4212,8 @@ async function openNoteSerialized(
         renderBaseView($("data-host"), file.content, pages, {
           path: file.path,
           onOpen: (path) => void openNote(path),
+          onMove: moveBaseCardToGroup,
+          onExport: exportBaseCsv,
         });
       } catch (error) {
         $("data-host").innerHTML = `<div class="feature-error">${escapeHtml(String(error))}</div>`;
@@ -5616,6 +5895,8 @@ function commandCatalog(includeFiles: boolean): AppCommand[] {
     { id: "table-format-note", title: "Format all tables in this note", keywords: "markdown align block", run: () => formatEditorTables("note") },
     { id: "table-format-toggle", title: "Toggle live table formatting", keywords: "markdown settings", run: () => saveTableSettings({ ...tableSettings, liveFormatting: !tableSettings.liveFormatting }) },
     { id: "save", title: "Save current file", keywords: "write", run: () => saveFile(false) },
+    { id: "open-external-markdown", title: "Open file from outside the vault…", keywords: "markdown open with external read only", run: openExternalMarkdownPicker },
+    { id: "quick-capture", title: "Quick Capture…", keywords: "share sheet shortcuts location inbox mobile", run: () => showQuickCapture({ kind: "capture", text: "", title: "", location: "Inbox" }) },
     { id: "export-pdf", title: "Export page to PDF…", keywords: "print save pdf frontmatter yaml css", run: () => void exportCurrentPagePdf() },
     { id: "command", title: "Open command bar", keywords: "palette actions", run: showCommandBar },
     { id: "file-search", title: "Search file names", keywords: "quick open", run: focusFileFilter },
@@ -7252,4 +7533,16 @@ window.addEventListener("beforeunload", (e) => {
 // Persist session periodically while running (crash safety)
 setInterval(() => saveSession(), 15_000);
 
-void renderShell();
+void renderShell().then(async () => {
+  try {
+    const requests = await invoke<string[]>("take_external_open_requests");
+    if (requests.length) await showExternalMarkdown(requests[requests.length - 1]);
+  } catch (error) {
+    console.warn("[external markdown startup]", error);
+  }
+  try {
+    await installMobileIntentHandling();
+  } catch (error) {
+    console.warn("[mobile intents]", error);
+  }
+});

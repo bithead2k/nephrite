@@ -58,6 +58,7 @@ import { offerTablePaste, tablePasteState, tablePasteTheme } from "./table-paste
 import { DEFAULT_TABLE_SETTINGS, normalizeTableSettings, type TableSettings } from "./table-settings";
 import { isolateHistory } from "@codemirror/commands";
 import { tableRepairState, tableRepairTheme } from "./table-repair";
+import { highlightCompletionSource } from "./colored-highlights";
 
 export type EditorCallbacks = {
   onDirty: (dirty: boolean) => void;
@@ -211,7 +212,8 @@ export class NephriteEditor {
       autocompletion({
         override: [
           slashCompletionSource(),
-          wikilinkCompletionSource(() => this.completionFiles),
+          wikilinkCompletionSource(),
+          highlightCompletionSource(),
         ],
         // Only pop when a source returns a result ([[ or /). Never scan the
         // vault on ordinary letters.

@@ -1,8 +1,8 @@
 # Nephrite
 
-**PROJECT_VERSION 0.16** — knowledge that doesn’t fracture.
+**PROJECT_VERSION 0.17** — knowledge that doesn’t fracture.
 
-[Release 0.16](docs/release-0.16.md) fixes significant performance issues in vaults with very large numbers of objects.
+[Release 0.17](docs/release-0.17.md) consolidates mobile capture, richer Base views, accessibility and editor enhancements, and indexed wikilink completion while retaining the large-vault performance fixes from 0.16.
 
 Open-source, local-first knowledge app. Markdown is storage; the SQLite index is disposable. Opens an existing Obsidian vault without import or conversion.
 

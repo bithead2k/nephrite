@@ -16,6 +16,12 @@ export type BaseView = {
   order: string[];
   sort: BaseSort[];
   filters: BaseFilter | null;
+  groupBy: BaseGroupBy | null;
+};
+
+export type BaseGroupBy = {
+  property: string;
+  direction: "ASC" | "DESC";
 };
 
 export type BaseFile = {
@@ -39,8 +45,13 @@ export type BasePage = {
 export type BaseTable = {
   name: string;
   columns: { id: string; label: string }[];
-  rows: { path: string; cells: unknown[] }[];
+  rows: BaseRow[];
+  groupBy: BaseGroupBy | null;
+  groups: BaseGroup[];
 };
+
+export type BaseRow = { path: string; cells: unknown[]; groupValue: unknown };
+export type BaseGroup = { key: string; label: string; value: unknown; rows: BaseRow[] };
 
 export function isBasePath(path: string): boolean {
   return /\.base$/i.test(path);
@@ -61,6 +72,7 @@ export function parseBase(source: string): BaseFile {
       order: Array.isArray(view.order) ? view.order.map((item) => String(item)) : [],
       sort: parseSort(view.sort),
       filters: parseFilter(view.filters),
+      groupBy: parseGroupBy(view.groupBy),
     }));
   const formulas: Record<string, string> = {};
   if (root.formulas && typeof root.formulas === "object" && !Array.isArray(root.formulas)) {
@@ -88,6 +100,7 @@ export function parseBase(source: string): BaseFile {
       order: ["file.name", "file.folder", "file.ext"],
       sort: [],
       filters: null,
+      groupBy: null,
     }],
   };
 }
@@ -111,9 +124,60 @@ export function evaluateBase(
   const rows = sorted.map((page) => ({
     path: page.path,
     cells: columns.map((column) => resolveProperty(page, column.id)),
+    groupValue: view.groupBy ? resolveProperty(page, view.groupBy.property) : null,
   }));
   const limited = view.limit && view.limit > 0 ? rows.slice(0, view.limit) : rows;
-  return { name: view.name, columns, rows: limited };
+  const groups = groupRows(limited, view.groupBy);
+  return { name: view.name, columns, rows: limited, groupBy: view.groupBy, groups };
+}
+
+function parseGroupBy(value: unknown): BaseGroupBy | null {
+  if (typeof value === "string" && value.trim()) {
+    return { property: value.trim(), direction: "ASC" };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const property = String(record.property ?? record.field ?? "").trim();
+  if (!property) return null;
+  return {
+    property,
+    direction: String(record.direction ?? "ASC").toUpperCase() === "DESC" ? "DESC" : "ASC",
+  };
+}
+
+function groupRows(rows: BaseRow[], groupBy: BaseGroupBy | null): BaseGroup[] {
+  if (!groupBy) return [{ key: "", label: "", value: null, rows }];
+  const grouped = new Map<string, BaseGroup>();
+  for (const row of rows) {
+    const value = row.groupValue;
+    const label = formatGroupValue(value);
+    const key = `${typeof value}:${label}`;
+    const group = grouped.get(key) ?? { key, label, value, rows: [] };
+    group.rows.push(row);
+    grouped.set(key, group);
+  }
+  const direction = groupBy.direction === "DESC" ? -1 : 1;
+  return [...grouped.values()].sort((left, right) =>
+    direction * left.label.localeCompare(right.label, undefined, { numeric: true, sensitivity: "base" }),
+  );
+}
+
+function formatGroupValue(value: unknown): string {
+  if (value == null || value === "") return "(empty)";
+  if (Array.isArray(value)) return value.map(formatGroupValue).join(", ") || "(empty)";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+export function baseTableCsv(table: BaseTable): string {
+  const quote = (value: unknown) => {
+    const text = value == null ? "" : Array.isArray(value) ? value.join(", ") : String(value);
+    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  };
+  return [
+    table.columns.map((column) => quote(column.label)).join(","),
+    ...table.rows.map((row) => row.cells.map(quote).join(",")),
+  ].join("\r\n") + "\r\n";
 }
 
 export function pageFromIndexRow(row: {

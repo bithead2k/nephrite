@@ -8,6 +8,7 @@ import {
   type ViewUpdate,
 } from "@codemirror/view";
 import { DirtyGatedWork } from "./edit-scheduler";
+import { coloredHighlightMatches } from "./colored-highlights";
 
 const headingClasses: Record<string, string> = {
   ATXHeading1: "cm-live-h1",
@@ -91,6 +92,19 @@ function buildDecorations(view: EditorView): DecorationSet {
       ranges.push(Decoration.replace({}).range(from, from + openLength));
       ranges.push(Decoration.replace({}).range(to - 2, to));
       ranges.push(Decoration.mark({ class: "cm-live-wikilink" }).range(from + openLength, to - 2));
+    }
+  }
+
+  for (const visible of view.visibleRanges) {
+    const text = state.sliceDoc(visible.from, visible.to);
+    for (const match of coloredHighlightMatches(text, visible.from)) {
+      const startLine = state.doc.lineAt(match.from).number;
+      const endLine = state.doc.lineAt(match.to).number;
+      if (sourceLines.has(startLine) || sourceLines.has(endLine)) continue;
+      const color = match.color ? ` highlight-${match.color}` : "";
+      ranges.push(Decoration.replace({}).range(match.from, match.contentFrom));
+      ranges.push(Decoration.mark({ class: `cm-live-highlight${color}` }).range(match.contentFrom, match.contentTo));
+      ranges.push(Decoration.replace({}).range(match.contentTo, match.to));
     }
   }
 

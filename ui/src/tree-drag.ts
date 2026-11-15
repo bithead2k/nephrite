@@ -1,3 +1,5 @@
+import { createDragAutoScroller } from "./drag-auto-scroll";
+
 export type ImmediateTreeDragOptions = {
   thresholdPx?: number;
   onDrop: (fromPath: string, targetFolder: string) => void;
@@ -18,6 +20,10 @@ export function bindImmediateTreeDrag(
   let acquired = false;
   let suppressClick = false;
   let target: HTMLElement | null = null;
+  const autoScroller = createDragAutoScroller(view, () => {
+    const host = source.ownerDocument.getElementById("file-tree");
+    return host ? [host] : [];
+  });
 
   source.draggable = false;
 
@@ -52,6 +58,7 @@ export function bindImmediateTreeDrag(
       try { source.setPointerCapture(event.pointerId); } catch { /* Optional in WebKit. */ }
     }
     event.preventDefault();
+    autoScroller.update(event.clientX, event.clientY);
     activateTarget(targetAt(event.clientX, event.clientY));
   };
   const finish = (event: PointerEvent, drop: boolean) => {
@@ -59,6 +66,7 @@ export function bindImmediateTreeDrag(
     const destination = target;
     if (acquired) event.preventDefault();
     clearTarget();
+    autoScroller.stop();
     source.classList.remove("dragging");
     source.ownerDocument.body.classList.remove("tree-dragging");
     try { source.releasePointerCapture(event.pointerId); } catch { /* Optional in WebKit. */ }
@@ -94,6 +102,7 @@ export function bindImmediateTreeDrag(
     source.removeEventListener("pointerdown", onDown);
     source.removeEventListener("click", onClick, true);
     clearTarget();
+    autoScroller.stop();
     view.removeEventListener("pointermove", onMove);
     view.removeEventListener("pointerup", onUp);
     view.removeEventListener("pointercancel", onCancel);

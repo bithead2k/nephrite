@@ -3,6 +3,7 @@ import test from "node:test";
 import { JSDOM } from "jsdom";
 import {
   emptyBaseSource,
+  baseTableCsv,
   evaluateBase,
   evaluateExpression,
   evaluateFormula,
@@ -28,6 +29,15 @@ function page(path: string, extra: Record<string, unknown> = {}) {
     links: extra.links ?? [],
     properties: (extra.properties as Record<string, unknown> | undefined) ?? extra,
   });
+}
+
+function pointerEvent(type: string, init: MouseEventInit = {}): PointerEvent {
+  const event = new dom.window.MouseEvent(type, { bubbles: true, ...init });
+  Object.defineProperties(event, {
+    pointerId: { value: 1 },
+    isPrimary: { value: true },
+  });
+  return event as unknown as PointerEvent;
 }
 
 test("parseBase reads filters, formulas, views, and sort", () => {
@@ -119,6 +129,101 @@ test("renderBaseView draws view tabs and opens a row", () => {
   assert.ok(host.querySelector(".base-view-tab"));
   host.querySelector<HTMLButtonElement>(".base-link")?.click();
   assert.deepEqual(opened, ["Inbox.md"]);
+});
+
+test("Bases group rows and preserve configured group direction", () => {
+  const base = parseBase(`
+views:
+  - type: cards
+    name: By status
+    groupBy:
+      property: status
+      direction: DESC
+    order:
+      - file.name
+      - status
+`);
+  const table = evaluateBase(base, [
+    page("A.md", { properties: { status: "open" } }),
+    page("B.md", { properties: { status: "closed" } }),
+    page("C.md", { properties: { status: "open" } }),
+  ]);
+  assert.equal(base.views[0].groupBy?.property, "status");
+  assert.deepEqual(table.groups.map((group) => [group.label, group.rows.length]), [
+    ["open", 2],
+    ["closed", 1],
+  ]);
+});
+
+test("Base CSV export quotes commas, quotes, and line breaks", () => {
+  const table = evaluateBase(parseBase(`
+views:
+  - type: table
+    name: Export
+    order:
+      - file.name
+      - company
+`), [page("Acme.md", { properties: { company: 'A, "B"' } })]);
+  assert.equal(baseTableCsv(table), 'name,company\r\nAcme,"A, ""B"""\r\n');
+});
+
+test("grouped Base layouts expose collapsible groups", () => {
+  const host = document.createElement("div");
+  renderBaseView(host, `
+views:
+  - type: list
+    name: Status
+    groupBy: status
+    order: [file.name]
+`, [page("A.md", { properties: { status: "open" } })]);
+  const group = host.querySelector<HTMLDetailsElement>(".base-group");
+  assert.ok(group?.open);
+  assert.match(group?.querySelector("summary")?.textContent ?? "", /open \(1\)/);
+  group?.querySelector<HTMLElement>("summary")?.click();
+  assert.equal(group?.open, false);
+});
+
+test("Base kanban renders folder columns and moves only after a completed drag", async () => {
+  const host = document.createElement("div");
+  const moves: Array<[string, string, unknown]> = [];
+  renderBaseView(host, `
+views:
+  - type: kanban
+    name: Folders
+    groupBy: file.folder
+    order: [file.name, file.folder]
+`, [page("Inbox/A.md"), page("Done/B.md")], {
+    onMove: async (...move) => { moves.push(move); },
+  });
+  const columns = host.querySelectorAll<HTMLElement>(".base-kanban-column");
+  const card = columns[0]?.querySelector<HTMLElement>(".base-kanban-card");
+  assert.equal(columns.length, 2);
+  assert.ok(card);
+  Object.defineProperty(document, "elementFromPoint", { configurable: true, value: () => columns[1] });
+  card.dispatchEvent(pointerEvent("pointerdown", { button: 0, clientX: 5, clientY: 5 }));
+  dom.window.dispatchEvent(pointerEvent("pointermove", { clientX: 12, clientY: 5 }));
+  dom.window.dispatchEvent(pointerEvent("pointerup", { clientX: 12, clientY: 5 }));
+  await Promise.resolve();
+  assert.deepEqual(moves, [["Done/B.md", "file.folder", "Inbox"]]);
+});
+
+test("Base table arrow navigation follows visual RTL column order", () => {
+  const host = document.createElement("div");
+  host.dir = "rtl";
+  document.body.appendChild(host);
+  renderBaseView(host, `
+views:
+  - type: table
+    name: RTL
+    order:
+      - file.name
+      - status
+`, [page("A.md", { properties: { status: "open" } })]);
+  const cells = host.querySelectorAll<HTMLTableCellElement>("td");
+  cells[1].focus();
+  cells[1].dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+  assert.equal(document.activeElement, cells[0].querySelector("button") ?? cells[0]);
+  host.remove();
 });
 
 

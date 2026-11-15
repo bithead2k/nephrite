@@ -40,4 +40,11 @@ class MobileStoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
         invoke.resolve(state())
     }
+
+    @Command
+    fun textScale(invoke: Invoke) {
+        invoke.resolve(JSObject().apply {
+            put("scale", activity.resources.configuration.fontScale.toDouble())
+        })
+    }
 }

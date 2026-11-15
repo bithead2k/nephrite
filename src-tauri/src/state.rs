@@ -34,4 +34,5 @@ pub struct AppState {
     /// vault without requiring a blocking thread join on the UI command.
     pub watcher_generation: Arc<AtomicU64>,
     pub sync: SyncManager,
+    pub external_open_requests: Mutex<Vec<String>>,
 }

@@ -63,6 +63,17 @@ import { createNotePreviewHeader } from "../ui/src/note-preview-header";
 import { openFootnoteComposer } from "../ui/src/footnote-composer";
 import { footnoteEditTarget } from "../ui/src/footnotes";
 import { obsidianOpenNoteUri } from "../ui/src/mobile-handoff";
+import { coloredHighlightMatches } from "../ui/src/colored-highlights";
+import { edgeScrollDelta } from "../ui/src/drag-auto-scroll";
+import {
+  applyDisplayPreferences,
+  horizontalCellDelta,
+  loadDisplayPreferences,
+  systemTextScaleForSize,
+} from "../ui/src/accessibility";
+import { bindSettingsSearch } from "../ui/src/settings-search";
+import { captureNotePath, parseMobileIntent } from "../ui/src/mobile-intent";
+import { uniqueAttachmentPath } from "../ui/src/attachments";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   pretendToBeVisual: true,
@@ -87,6 +98,71 @@ Object.defineProperties(globalThis, {
 
 dom.window.HTMLElement.prototype.scrollIntoView = () => {};
 dom.window.alert = () => {};
+
+test("colored highlights render without storing presentation-only markup", () => {
+  const html = renderPreview("Normal ==plain== and ==🔴 urgent== and `==🔵 code==`.");
+  assert.match(html, /class="markdown-highlight"[^>]*>plain<\/mark>/);
+  assert.match(html, /class="markdown-highlight highlight-red" data-highlight-color="red">urgent<\/mark>/);
+  assert.match(html, /<code>==🔵 code==<\/code>/);
+  const matches = coloredHighlightMatches("==🟢 ready== then ==plain==");
+  assert.deepEqual(matches.map((match) => [match.color, match.contentFrom, match.contentTo]), [
+    ["green", 5, 10],
+    [null, 20, 25],
+  ]);
+});
+
+test("drag auto-scroll accelerates toward either edge and stops in the center", () => {
+  assert.ok(edgeScrollDelta(2, 0, 200) < edgeScrollDelta(40, 0, 200));
+  assert.equal(edgeScrollDelta(100, 0, 200), 0);
+  assert.ok(edgeScrollDelta(198, 0, 200) > edgeScrollDelta(160, 0, 200));
+});
+
+test("device display preferences clamp text size and apply an RTL workspace", () => {
+  const storage = { getItem: () => JSON.stringify({ baseFontSize: 99, direction: "rtl" }) };
+  const preferences = loadDisplayPreferences(storage);
+  assert.deepEqual(preferences, { baseFontSize: 24, direction: "rtl" });
+  const root = document.createElement("div");
+  applyDisplayPreferences(preferences, 1.5, root, "en-US");
+  assert.equal(root.style.getPropertyValue("--base-font-size"), "24px");
+  assert.equal(root.style.getPropertyValue("--system-text-scale"), "1.5");
+  assert.equal(root.dir, "rtl");
+  assert.equal(horizontalCellDelta("ArrowRight", true), -1);
+  assert.equal(horizontalCellDelta("ArrowLeft", false), -1);
+  assert.equal(systemTextScaleForSize(25.5), 1.5);
+});
+
+test("settings search filters complete setting groups and transfers keyboard focus", () => {
+  const body = document.createElement("div");
+  body.className = "preferences-body";
+  body.innerHTML = `<section class="preferences-section"><strong>Appearance</strong><button>Save font</button></section><section class="preferences-section"><strong>Sync</strong><button>Connect</button></section>`;
+  const input = document.createElement("input");
+  const status = document.createElement("small");
+  document.body.append(input, status, body);
+  const controller = bindSettingsSearch(input, body, status);
+  assert.equal(controller.filter("font"), 1);
+  assert.equal(body.querySelectorAll<HTMLElement>(".preferences-section")[1].hidden, true);
+  input.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+  assert.equal(document.activeElement?.textContent, "Save font");
+  controller.destroy();
+  input.remove();
+  status.remove();
+  body.remove();
+});
+
+test("mobile intents route notes and sanitize explicit capture locations", () => {
+  assert.deepEqual(parseMobileIntent("nephrite://open?path=Projects%2FPlan.md"), { kind: "open", path: "Projects/Plan.md" });
+  assert.deepEqual(parseMobileIntent("nephrite://daily"), { kind: "daily" });
+  assert.equal(
+    captureNotePath("../Inbox/Shared", "Call {date}", new Date(2026, 8, 21, 13, 4, 5)),
+    "Inbox/Shared/Call 2026-09-21.md",
+  );
+});
+
+test("camera attachments choose a unique path instead of replacing vault data", () => {
+  const occupied = new Set(["Assets/photo.jpg", "Assets/photo 1.jpg"]);
+  assert.equal(uniqueAttachmentPath("Assets", "photo.jpg", occupied), "Assets/photo 2.jpg");
+  assert.equal(uniqueAttachmentPath("Assets", ".camera", occupied), "Assets/.camera");
+});
 
 test("mobile handoff opens an existing note by absolute path without invoking Daily Notes", () => {
   assert.equal(

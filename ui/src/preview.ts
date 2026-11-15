@@ -5,6 +5,7 @@ import { blockHash, splitMarkdownBlocks } from "./preview-blocks";
 import { renderMarkdownMath } from "./math";
 import { applyPandocInlineCodeAttrs } from "./pandoc-attrs";
 import { prepareFootnoteRender, type FootnoteDefinition, type FootnoteWarning } from "./footnotes";
+import { coloredHighlightExtension } from "./colored-highlights";
 
 let footnoteHover: HTMLElement | null = null;
 let footnoteHoverTimer: number | null = null;
@@ -14,7 +15,7 @@ marked.setOptions({
   breaks: true,
 });
 marked.use({
-  extensions: [justifiedTableExtension],
+  extensions: [justifiedTableExtension, ...(coloredHighlightExtension.extensions ?? [])],
   renderer: {
     tablecell(content, flags) {
       const tag = flags.header ? "th" : "td";

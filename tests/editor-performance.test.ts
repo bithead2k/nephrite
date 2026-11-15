@@ -1542,6 +1542,17 @@ test("command bar ranks direct and fuzzy matches while preserving command order"
   assert.deepEqual(filterCommands(commands, "").map((command) => command.id), ["tasks", "graph", "note"]);
 });
 
+test("command bar keeps fuzzy matching above ten thousand files", () => {
+  const commands = Array.from({ length: 10_050 }, (_, index) => ({
+    id: `note-${index}`,
+    title: index === 10_049 ? "Open: Projects/QuarterlyPlanning.md" : `Open: Archive/Note-${index}.md`,
+    keywords: "note file",
+    run: () => {},
+  }));
+  const matches = filterCommands(commands, "qtrpln");
+  assert.equal(matches[0]?.id, "note-10049");
+});
+
 test("shortcut assignments normalize cross-platform modifier aliases", () => {
   assert.equal(normalizeShortcut("control + shift + f"), "Ctrl+Shift+F");
   assert.equal(normalizeShortcut("cmd+p"), "Meta+P");

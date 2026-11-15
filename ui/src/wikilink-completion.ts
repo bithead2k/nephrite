@@ -5,8 +5,7 @@ import type {
   CompletionResult,
   CompletionSource,
 } from "@codemirror/autocomplete";
-import type { FileEntry } from "./types";
-import { shortestWikilinkTarget, shortestWikilinkTargets, wikilinkKey } from "./wikilinks";
+import { invoke } from "@tauri-apps/api/core";
 
 export type WikilinkCompletionMatch = {
   embed: boolean;
@@ -27,48 +26,29 @@ export function wikilinkCompletionMatch(
   };
 }
 
+export type LinkSuggestion = {path: string; target: string; name: string; folder: string; drawing: boolean};
 export function wikilinkCompletionSource(
-  files: () => readonly FileEntry[],
+  search: (query: string, embed: boolean) => Promise<LinkSuggestion[]> =
+    (query, embed) => invoke("complete_wikilink", {query, embed}),
 ): CompletionSource {
-  return (context: CompletionContext): CompletionResult | null => {
+  return async (context: CompletionContext): Promise<CompletionResult | null> => {
     const line = context.state.doc.lineAt(context.pos);
-    const match = wikilinkCompletionMatch(
-      context.state.sliceDoc(line.from, context.pos),
-      context.pos,
-    );
+    const match = wikilinkCompletionMatch(context.state.sliceDoc(line.from, context.pos), context.pos);
     if (!match) return null;
-
-    const catalog = files();
-    const targets = shortestWikilinkTargets(catalog);
-    const options = catalog.map((file): Completion => {
-      const target = targets.get(wikilinkKey(file.path)) ?? shortestWikilinkTarget(file.path, catalog);
-      const filename = file.path.replace(/^.*\//, "").replace(/\.md$/i, "");
-      const folder = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "vault root";
-      const drawing = file.file_kind === "excalidraw" || /\.excalidraw\.md$/i.test(file.path);
-      return {
-        label: target,
-        displayLabel: filename,
-        detail: `${drawing ? "drawing" : "note"} · ${folder}`,
-        type: drawing ? "class" : "text",
-        boost: match.embed && drawing ? 20 : 0,
-        apply(view, completion, from, to) {
-          const hasCloser = view.state.sliceDoc(to, Math.min(to + 2, view.state.doc.length)) === "]]";
-          const insert = `${completion.label}${hasCloser ? "" : "]]"}`;
-          view.dispatch({
-            changes: { from, to, insert },
-            selection: { anchor: from + completion.label.length + 2 },
-            userEvent: "input.complete",
-            annotations: pickedCompletion.of(completion),
-          });
-        },
-      };
-    });
-
-    return {
-      from: match.from,
-      to: context.pos,
-      options,
-      validFor: /^[^\]\n|#]*$/,
-    };
+    const found = await search(match.query, match.embed);
+    if (context.aborted) return null;
+    const options = found.map((item): Completion => ({
+      label: item.target, displayLabel: item.name,
+      detail: `${item.drawing ? "drawing" : "note"} · ${item.folder || "vault root"}`,
+      type: item.drawing ? "class" : "text",
+      apply(view, completion, from, to) {
+        const hasCloser = view.state.sliceDoc(to, Math.min(to + 2, view.state.doc.length)) === "]]";
+        const insert = `${completion.label}${hasCloser ? "" : "]]"}`;
+        view.dispatch({changes: {from, to, insert}, selection: {anchor: from + completion.label.length + 2},
+          userEvent: "input.complete", annotations: pickedCompletion.of(completion)});
+      },
+    }));
+    // A fresh bounded database query on each edit keeps every note reachable.
+    return {from: match.from, to: context.pos, options, filter: false};
   };
 }

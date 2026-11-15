@@ -17,14 +17,17 @@ export function isImageFile(file: File): boolean {
 export async function saveDroppedFiles(
   files: File[],
   fromPath: string,
+  existingFiles: readonly { path: string }[] = [],
 ): Promise<string[]> {
   const folder = await attachmentFolder(fromPath);
+  const occupied = new Set(existingFiles.map((file) => file.path));
   const written: string[] = [];
   for (const file of files) {
     if (!isImageFile(file)) continue;
-    const path = uniquePath(folder, fileNameFor(file));
+    const path = uniqueAttachmentPath(folder, fileNameFor(file), occupied);
     const data = await fileToBase64(file);
     await invoke("write_media_file", { path, data });
+    occupied.add(path);
     written.push(path);
   }
   return written;
@@ -60,9 +63,24 @@ function fileNameFor(file: File): string {
   return `Pasted image ${stamp}.${ext}`;
 }
 
-function uniquePath(folder: string, name: string): string {
+export function uniqueAttachmentPath(
+  folder: string,
+  name: string,
+  occupied: ReadonlySet<string>,
+): string {
   const base = folder ? `${folder}/${name}` : name;
-  return base;
+  if (!occupied.has(base)) return base;
+
+  const dot = name.lastIndexOf(".");
+  const hasExtension = dot > 0;
+  const stem = hasExtension ? name.slice(0, dot) : name;
+  const extension = hasExtension ? name.slice(dot) : "";
+  for (let suffix = 1; suffix < Number.MAX_SAFE_INTEGER; suffix += 1) {
+    const candidateName = `${stem} ${suffix}${extension}`;
+    const candidate = folder ? `${folder}/${candidateName}` : candidateName;
+    if (!occupied.has(candidate)) return candidate;
+  }
+  throw new Error(`Could not choose a unique attachment name for ${name}`);
 }
 
 function fileToBase64(file: File): Promise<string> {

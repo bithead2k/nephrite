@@ -6,6 +6,7 @@ otherwise.
 
 ## Release notes
 
+- [0.17.0](release-0.17.md) — consolidated mobile capture, Base views, accessibility, editor enhancements, and indexed wikilink completion; retains 0.16 large-vault fixes.
 - [0.16.0](release-0.16.md) — significant performance fixes for vaults with very large numbers of objects, including typing pauses and preview refreshes.
 
 - [0.15.0](release-0.15.md) — Scroll Reading/teleprompter mode and the first

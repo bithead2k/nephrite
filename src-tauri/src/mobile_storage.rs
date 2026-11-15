@@ -11,8 +11,14 @@ pub struct StoragePermission {
 }
 
 #[cfg(target_os = "android")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TextScale {
+    pub scale: f64,
+}
+
+#[cfg(target_os = "android")]
 mod android {
-    use super::StoragePermission;
+    use super::{StoragePermission, TextScale};
     use tauri::{plugin::PluginHandle, AppHandle, Manager, Runtime};
 
     pub struct MobileStorage<R: Runtime>(pub PluginHandle<R>);
@@ -33,6 +39,14 @@ mod android {
         handle
             .0
             .run_mobile_plugin(if request { "request" } else { "status" }, ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn text_scale(app: &AppHandle) -> Result<TextScale, String> {
+        let handle = app.state::<MobileStorage<tauri::Wry>>();
+        handle
+            .0
+            .run_mobile_plugin("textScale", ())
             .map_err(|error| error.to_string())
     }
 }
@@ -98,6 +112,17 @@ pub fn mobile_vault_candidates() -> Result<Vec<String>, String> {
         result.sort();
         result.dedup();
         Ok(result)
+    }
+}
+
+#[tauri::command]
+pub fn mobile_text_scale(app: tauri::AppHandle) -> Result<f64, String> {
+    #[cfg(target_os = "android")]
+    return android::text_scale(&app).map(|value| value.scale.clamp(0.75, 2.5));
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(1.0)
     }
 }
 

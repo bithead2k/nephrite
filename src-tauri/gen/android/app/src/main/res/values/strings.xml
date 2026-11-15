@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">"Nephrite"</string>
     <string name="main_activity_title">"Nephrite"</string>
+    <string name="note_widget_description">Open today’s Nephrite note</string>
 </resources>

@@ -1,3 +1,5 @@
+import { createDragAutoScroller } from "./drag-auto-scroll";
+
 export type KanbanDragOrigin = {
   fromCol: number;
   fromIdx: number;
@@ -35,6 +37,11 @@ export function bindImmediateKanbanDrag(
   let ghost: HTMLElement | null = null;
   let grabX = 0;
   let grabY = 0;
+  const autoScroller = createDragAutoScroller(view, () => {
+    const board = card.closest<HTMLElement>(".kanban-scroll, .base-kanban");
+    const lane = targetLane?.querySelector<HTMLElement>(".kanban-cards, .base-kanban-cards");
+    return [board, lane].filter((item): item is HTMLElement => Boolean(item));
+  });
 
   // Disable the competing native gesture. Pointer capture works equally well
   // when the initial press lands on the card's nested link button or cover.
@@ -94,6 +101,7 @@ export function bindImmediateKanbanDrag(
       try { card.setPointerCapture(event.pointerId); } catch { /* WebKit may already own it. */ }
     }
     event.preventDefault();
+    autoScroller.update(event.clientX, event.clientY);
     positionGhost(event.clientX, event.clientY);
     activateLane(laneAt(event.clientX, event.clientY));
   };
@@ -104,6 +112,7 @@ export function bindImmediateKanbanDrag(
     const wasAcquired = acquired;
     if (acquired) event.preventDefault();
     clearTarget();
+    autoScroller.stop();
     card.classList.remove("dragging");
     card.ownerDocument.body.classList.remove("kanban-dragging");
     ghost?.remove();
@@ -149,6 +158,7 @@ export function bindImmediateKanbanDrag(
     card.removeEventListener("click", onClick, true);
     if (pointerId != null) {
       clearTarget();
+      autoScroller.stop();
       ghost?.remove();
       ghost = null;
       view.removeEventListener("pointermove", onMove);

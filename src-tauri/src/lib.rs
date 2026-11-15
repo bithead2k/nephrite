@@ -1,3 +1,4 @@
+mod link_completion;
 mod mobile_storage;
 mod page_sql;
 mod plugins;
@@ -25,6 +26,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use sync::{SyncConfigureRequest, SyncLoginRequest, SyncManager, SyncSnapshot};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_deep_link::DeepLinkExt;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1384,19 +1386,24 @@ fn vault_stats(state: State<'_, AppState>) -> Result<VaultInfo, String> {
 }
 
 #[tauri::command]
-fn list_files(state: State<'_, AppState>, paths: Option<Vec<String>>) -> Result<Vec<FileEntry>, String> {
+fn list_files(
+    state: State<'_, AppState>,
+    paths: Option<Vec<String>>,
+) -> Result<Vec<FileEntry>, String> {
     let guard = state.index.lock();
     let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
     let conn = index.connection();
-    let paths_json = paths.as_ref().map(|p| serde_json::to_string(p)).transpose().map_err(|e| e.to_string())?;
+    let paths_json = paths
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| e.to_string())?;
     let sql = if paths.is_some() {
         "SELECT path, name, parent_path, file_kind FROM files WHERE path IN (SELECT value FROM json_each(?1)) ORDER BY path COLLATE NOCASE"
     } else {
         "SELECT path, name, parent_path, file_kind FROM files WHERE ?1 IS NULL ORDER BY path COLLATE NOCASE"
     };
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([paths_json], |r| {
             Ok(FileEntry {
@@ -2096,6 +2103,54 @@ fn read_file(path: String, state: State<'_, AppState>) -> Result<OpenFile, Strin
     Ok(OpenFile { path, content })
 }
 
+fn markdown_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn read_external_markdown(path: String) -> Result<OpenFile, String> {
+    let absolute = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !absolute.is_file() || !markdown_file(&absolute) {
+        return Err("Choose an existing Markdown file (.md or .markdown)".into());
+    }
+    let content = std::fs::read_to_string(&absolute).map_err(|error| error.to_string())?;
+    Ok(OpenFile {
+        path: absolute.to_string_lossy().into_owned(),
+        content,
+    })
+}
+
+#[tauri::command]
+fn take_external_open_requests(state: State<'_, AppState>) -> Vec<String> {
+    std::mem::take(&mut *state.external_open_requests.lock())
+}
+
+#[tauri::command]
+fn write_external_text(path: String, content: String) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    if target
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("csv"))
+    {
+        return Err("Export target must be a CSV file".into());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Export path has no parent folder".to_string())?;
+    if !parent.is_dir() {
+        return Err("Export folder does not exist".into());
+    }
+    std::fs::write(target, content).map_err(|error| error.to_string())
+}
+
 /// Read a supported vault image without exposing arbitrary host filesystem paths.
 #[tauri::command]
 fn read_media_file(path: String, state: State<'_, AppState>) -> Result<MediaFile, String> {
@@ -2243,6 +2298,32 @@ fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Create a new file atomically without replacing an existing vault file.
+fn atomic_create_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("File has no parent directory: {}", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    temporary.write_all(bytes).map_err(|e| e.to_string())?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|e| e.to_string())?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("Attachment already exists: {}", path.display())
+        } else {
+            error.error.to_string()
+        }
+    })?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
 /// Write a binary attachment (image, audio, …) from base64. Markdown is not rewritten.
 #[tauri::command]
 fn write_media_file(path: String, data: String, state: State<'_, AppState>) -> Result<(), String> {
@@ -2270,12 +2351,9 @@ fn write_media_file(path: String, data: String, state: State<'_, AppState>) -> R
         }
     }
     if abs.exists() {
-        let canonical_target = abs.canonicalize().map_err(|e| e.to_string())?;
-        if !canonical_target.starts_with(&root) {
-            return Err("Path escapes vault through a symbolic link".into());
-        }
+        return Err(format!("Attachment already exists: {}", abs.display()));
     }
-    atomic_write_file(&abs, &bytes)?;
+    atomic_create_file(&abs, &bytes)?;
     let abs_c = abs.canonicalize().map_err(|e| e.to_string())?;
     if !abs_c.starts_with(&root) {
         return Err("Path escapes vault".into());
@@ -2982,7 +3060,27 @@ fn unix_group_name(gid: u32) -> String {
 }
 
 #[tauri::command]
-fn birthday_candidates(month: u32, day: u32, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+async fn complete_wikilink(
+    query: String,
+    embed: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<link_completion::LinkSuggestion>, String> {
+    let index = state.index.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = index.lock();
+        let index = guard.as_ref().ok_or_else(|| "No vault open".to_string())?;
+        link_completion::search(index.connection(), &query, embed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn birthday_candidates(
+    month: u32,
+    day: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return Err("Invalid birthday month/day".into());
     }
@@ -2993,9 +3091,17 @@ fn birthday_candidates(month: u32, day: u32, state: State<'_, AppState>) -> Resu
         let base = format!("SELECT path FROM {table} WHERE lower(replace(replace(replace({field}, ' ', ''), '_', ''), '-', '')) IN ('dob', 'birthday', 'birthdate', 'dateofbirth')");
         format!("{base} AND {date} = ?1 UNION {base} AND {date} IS NULL")
     }).collect::<Vec<_>>().join(" UNION ");
-    let mut stmt = index.connection().prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = stmt.query_map([format!("{month:02}-{day:02}")], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    let mut stmt = index
+        .connection()
+        .prepare(&sql)
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([format!("{month:02}-{day:02}")], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -5075,7 +5181,7 @@ fn create_file(path: String, content: String, state: State<'_, AppState>) -> Res
         return Err(format!("Already exists: {path}"));
     }
     ensure_secure_parent(index.vault_root(), &abs)?;
-    atomic_write_file(&abs, content.as_bytes())?;
+    atomic_create_file(&abs, content.as_bytes())?;
     reindex_path(index, &path)?;
     Ok(())
 }
@@ -6273,12 +6379,33 @@ fn ensure_desktop_sync() -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn take_mobile_deep_links(app: AppHandle) -> Result<Vec<String>, String> {
+    app.deep_link()
+        .get_current()
+        .map(|urls| {
+            urls.unwrap_or_default()
+                .into_iter()
+                .map(|url| url.to_string())
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_external_files = std::env::args()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file() && markdown_file(path))
+        .filter_map(|path| path.canonicalize().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
     let builder = tauri::Builder::default();
     #[cfg(target_os = "android")]
     let builder = builder.plugin(mobile_storage::init());
     let app = builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
@@ -6286,11 +6413,14 @@ pub fn run() {
             visible: Arc::new(VisiblePages::new()),
             watcher_generation: Arc::new(AtomicU64::new(0)),
             sync: SyncManager::default(),
+            external_open_requests: Mutex::new(startup_external_files),
         })
         .invoke_handler(tauri::generate_handler![
             mobile_storage::mobile_storage_permission,
             mobile_storage::mobile_request_storage_permission,
             mobile_storage::mobile_vault_candidates,
+            mobile_storage::mobile_text_scale,
+            take_mobile_deep_links,
             project_version,
             vault_open_plan,
             read_user_vimrc,
@@ -6315,12 +6445,16 @@ pub fn run() {
             uninstall_community_plugin,
             set_community_plugin_enabled,
             read_file,
+            read_external_markdown,
+            take_external_open_requests,
+            write_external_text,
             read_media_file,
             write_file,
             write_media_file,
             resolve_wikilink,
             list_pages,
             birthday_candidates,
+            complete_wikilink,
             note_file_meta,
             query_vault_sql,
             list_tasks,
@@ -6380,13 +6514,25 @@ pub fn run() {
 #[cfg(test)]
 mod sql_query_tests {
     use super::{
-        atomic_write_file, discover_plugins, ensure_secure_parent, fts_query, is_conflict_status,
-        is_core_replaced_obsidian_plugin, next_recurrence_date, page_properties,
-        plugin_http_request, recurring_task_lines, rewrite_markdown_refs, run_readonly_sql,
-        search_yaml_properties, translate_page_sql, translate_page_sql_residual,
-        vault_search_terms, PluginHttpRequest,
+        atomic_create_file, atomic_write_file, discover_plugins, ensure_secure_parent, fts_query,
+        is_conflict_status, is_core_replaced_obsidian_plugin, next_recurrence_date,
+        page_properties, plugin_http_request, read_external_markdown, recurring_task_lines,
+        rewrite_markdown_refs, run_readonly_sql, search_yaml_properties, translate_page_sql,
+        translate_page_sql_residual, vault_search_terms, write_external_text, PluginHttpRequest,
     };
     use chrono::NaiveDate;
+
+    #[test]
+    fn attachment_create_never_replaces_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("photo.jpg");
+        std::fs::write(&path, b"original").unwrap();
+
+        let error = atomic_create_file(&path, b"replacement").unwrap_err();
+
+        assert!(error.contains("already exists"));
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+    }
 
     #[test]
     fn mermaid_obsidian_plugins_are_treated_as_replaced_core() {
@@ -7210,5 +7356,33 @@ mod sql_query_tests {
             result.rows,
             [[serde_json::json!("acme"), serde_json::json!(13)]]
         );
+    }
+
+    #[test]
+    fn external_markdown_reader_is_read_only_and_extension_limited() {
+        let directory = tempfile::tempdir().unwrap();
+        let markdown = directory.path().join("outside.md");
+        std::fs::write(&markdown, "# Outside\n").unwrap();
+        let opened = read_external_markdown(markdown.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(opened.content, "# Outside\n");
+        assert_eq!(std::fs::read_to_string(&markdown).unwrap(), "# Outside\n");
+
+        let text = directory.path().join("outside.txt");
+        std::fs::write(&text, "not markdown").unwrap();
+        assert!(read_external_markdown(text.to_string_lossy().into_owned()).is_err());
+    }
+
+    #[test]
+    fn external_text_writer_writes_the_explicit_export_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let csv = directory.path().join("view.csv");
+        write_external_text(csv.to_string_lossy().into_owned(), "name\r\nAda\r\n".into()).unwrap();
+        assert_eq!(std::fs::read_to_string(csv).unwrap(), "name\r\nAda\r\n");
+
+        let markdown = directory.path().join("view.md");
+        assert!(
+            write_external_text(markdown.to_string_lossy().into_owned(), "data".into()).is_err()
+        );
+        assert!(!markdown.exists());
     }
 }

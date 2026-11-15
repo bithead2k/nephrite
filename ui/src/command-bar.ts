@@ -8,9 +8,10 @@ export type AppCommand = {
   run: () => void | Promise<void>;
 };
 
-function commandScore(command: AppCommand, query: string): number {
+export function fuzzyScoreText(rawHaystack: string, rawQuery: string): number {
+  const query = rawQuery.trim().toLowerCase();
   if (!query) return 1;
-  const haystack = `${command.title} ${command.keywords || ""}`.toLowerCase();
+  const haystack = rawHaystack.toLowerCase();
   if (haystack.startsWith(query)) return 1000 - haystack.length;
   const direct = haystack.indexOf(query);
   if (direct >= 0) return 700 - direct;
@@ -23,6 +24,10 @@ function commandScore(command: AppCommand, query: string): number {
     cursor = found + 1;
   }
   return 400 - gaps;
+}
+
+function commandScore(command: AppCommand, query: string): number {
+  return fuzzyScoreText(`${command.title} ${command.keywords || ""}`, query);
 }
 
 export function filterCommands(commands: AppCommand[], rawQuery: string): AppCommand[] {
